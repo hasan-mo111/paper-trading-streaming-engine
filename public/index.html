@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+   PAPER TRADING STREAMING ENGINE — Live Chart Dashboard
+   Developed by Eng Hasan Mohamad
+   ----------------------------------------------------------------------------
+   Connects to GET /stream (Server-Sent Events):
+     • "snapshot"  → the full 100-candle history for all 16 series (drawn at once)
+     • "update"    → coalesced live updates (forming candle + closed candles)
+     • "status"    → upstream health
+   Charts rendered with TradingView Lightweight Charts (CDN).
+  ============================================================================
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Paper Trading Streaming Engine — Live Dashboard</title>
+
+  <!-- TradingView Lightweight Charts (v4 API: addCandlestickSeries / addHistogramSeries) -->
+  <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+
+  <style>
+    :root {
+      --bg: #0b0f16;
+      --panel: #131a24;
+      --panel-2: #1a2331;
+      --line: #243040;
+      --text: #e6edf6;
+      --muted: #8496ad;
+      --accent: #2b7fff;
+      --up: #26a69a;
+      --down: #ef5350;
+      --warn: #f0b429;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 "Segoe UI", Inter, system-ui, -apple-system, sans-serif;
+      display: flex; flex-direction: column;
+    }
+
+    /* ---------- header ---------- */
+    header {
+      display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+      padding: 12px 18px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+    .brand { display: flex; flex-direction: column; }
+    .brand h1 { margin: 0; font-size: 16px; letter-spacing: .3px; }
+    .brand span { color: var(--muted); font-size: 11px; }
+    .spacer { flex: 1 1 auto; }
+
+    .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    label { display: flex; flex-direction: column; gap: 3px; font-size: 10px;
+            text-transform: uppercase; letter-spacing: .8px; color: var(--muted); }
+    select {
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--line); border-radius: 7px;
+      padding: 7px 12px; font-size: 13px; min-width: 130px; cursor: pointer;
+      outline: none;
+    }
+    select:focus { border-color: var(--accent); }
+    .btn {
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--line); border-radius: 7px;
+      padding: 7px 12px; font-size: 12px; cursor: pointer;
+    }
+    .btn:hover { border-color: var(--accent); }
+
+    /* ---------- status pills ---------- */
+    .pill {
+      display: inline-flex; align-items: center; gap: 7px;
+      background: var(--panel-2); border: 1px solid var(--line);
+      border-radius: 999px; padding: 5px 12px; font-size: 12px; color: var(--muted);
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .pill.ok    .dot { background: var(--up);   box-shadow: 0 0 8px var(--up); }
+    .pill.warn  .dot { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+    .pill.error .dot { background: var(--down); box-shadow: 0 0 8px var(--down); }
+    .pill.ok    { color: var(--up); }
+    .pill.warn  { color: var(--warn); }
+    .pill.error { color: var(--down); }
+
+    /* ---------- price strip ---------- */
+    .strip {
+      display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+      padding: 10px 18px; background: var(--panel-2);
+      border-bottom: 1px solid var(--line);
+    }
+    .symbol-name { font-size: 18px; font-weight: 700; letter-spacing: .5px; }
+    .last-price { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .up   { color: var(--up); }
+    .down { color: var(--down); }
+    .ohlc { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .ohlc b { color: var(--text); font-weight: 600; }
+
+    /* ---------- chart ---------- */
+    #chart { flex: 1 1 auto; min-height: 420px; width: 100%; }
+
+    /* ---------- footer ---------- */
+    footer {
+      display: flex; gap: 20px; flex-wrap: wrap;
+      padding: 8px 18px; background: var(--panel);
+      border-top: 1px solid var(--line);
+      color: var(--muted); font-size: 11.5px;
+    }
+    footer b { color: var(--text); font-weight: 600; }
+
+    /* ---------- overlay ---------- */
+    #overlay {
+      position: fixed; inset: 0; display: none;
+      align-items: center; justify-content: center; flex-direction: column; gap: 14px;
+      background: rgba(11, 15, 22, .88); z-index: 50; text-align: center; padding: 20px;
+    }
+    #overlay.show { display: flex; }
+    .spinner {
+      width: 40px; height: 40px; border-radius: 50%;
+      border: 3px solid var(--line); border-top-color: var(--accent);
+      animation: spin 900ms linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .note { color: var(--muted); font-size: 12.5px; max-width: 460px; }
+  </style>
+</head>
+
+<body>
+  <!-- ================= HEADER ================= -->
+  <header>
+    <div class="brand">
+      <h1>📈 Paper Trading Streaming Engine</h1>
+      <span>Developed by Eng Hasan Mohamad</span>
+    </div>
+
+    <div class="controls">
+      <label>
+        Pair
+        <select id="pairSelect"></select>
+      </label>
+      <label>
+        Timeframe
+        <select id="tfSelect"></select>
+      </label>
+      <button class="btn" id="reconnectBtn" title="Force a new SSE connection">⟳ Reconnect</button>
+    </div>
+
+    <div class="spacer"></div>
+
+    <span class="pill" id="ssePill"><span class="dot"></span><span id="sseText">SSE: idle</span></span>
+    <span class="pill" id="apiPill"><span class="dot"></span><span id="apiText">API: idle</span></span>
+  </header>
+
+  <!-- ================= PRICE STRIP ================= -->
+  <div class="strip">
+    <span class="symbol-name" id="symbolName">—</span>
+    <span class="last-price" id="lastPrice">—</span>
+    <span class="ohlc" id="changeLine">—</span>
+    <span class="ohlc" id="ohlcLine"></span>
+    <span class="spacer"></span>
+    <span class="ohlc" id="candleInfo">waiting for data…</span>
+  </div>
+
+  <!-- ================= CHART ================= -->
+  <div id="chart"></div>
+
+  <!-- ================= FOOTER ================= -->
+  <footer>
+    <span>SSE frames: <b id="statFrames">0</b></span>
+    <span>Closed candles: <b id="statCandles">0</b></span>
+    <span>Candles received: <b id="statReceived">0</b></span>
+    <span>Last tick: <b id="statLast">—</b></span>
+    <span>Server time: <b id="statServer">—</b></span>
+  </footer>
+
+  <!-- ================= OVERLAY ================= -->
+  <div id="overlay" class="show">
+    <div class="spinner"></div>
+    <div>Connecting to the streaming engine…</div>
+    <div class="note" id="overlayNote">
+      Waiting for the initial 100-candle snapshot from <b>/stream</b>.
+    </div>
+  </div>
+
+  <script>
+  (() => {
+    'use strict';
+
+    /* ======================================================================
+     *  CONSTANTS
+     * ==================================================================== */
+    const DEFAULT_PAIR    = 'frxXAUUSD';   // default: XAUUSD
+    const DEFAULT_TIMEFRAME = 900;        // default: 15m
+    const FALLBACK_PAIRS = [
+      { code: 'frxXAUUSD', display: 'XAUUSD' },
+      { code: 'frxEURUSD', display: 'EURUSD' },
+      { code: 'frxUSDJPY', display: 'USDJPY' },
+      { code: 'frxGBPUSD', display: 'GBPUSD' },
+    ];
+    const FALLBACK_TFS = [
+      { seconds: 300,  label: '5m'  },
+      { seconds: 900,  label: '15m' },
+      { seconds: 3600, label: '1h'  },
+      { seconds: 14400,label: '4h'  },
+    ];
+
+    /* ======================================================================
+     *  DOM
+     * ==================================================================== */
+    const $ = (id) => document.getElementById(id);
+    const chartEl     = $('chart');
+    const pairSelect  = $('pairSelect');
+    const tfSelect    = $('tfSelect');
+    const symbolName  = $('symbolName');
+    const lastPriceEl = $('lastPrice');
+    const changeLine  = $('changeLine');
+    const ohlcLine    = $('ohlcLine');
+    const candleInfo  = $('candleInfo');
+    const ssePill     = $('ssePill');
+    const sseText     = $('sseText');
+    const apiPill     = $('apiPill');
+    const apiText     = $('apiText');
+    const overlay     = $('overlay');
+    const overlayNote = $('overlayNote');
+    const statFrames    = $('statFrames');
+    const statCandles   = $('statCandles');
+    const statReceived  = $('statReceived');
+    const statLast      = $('statLast');
+    const statServer    = $('statServer');
+
+    /* ======================================================================
+     *  STATE
+     * ==================================================================== */
+    const state = {
+      pairs: FALLBACK_PAIRS,
+      timeframes: FALLBACK_TFS,
+      maxCandles: 100,
+      /** seriesKey -> { symbol, interval, candles:[], current, ready } */
+      cache: new Map(),
+      activeKey: null,
+      source: null,
+      frames: 0,
+      received: 0,
+      gotSnapshot: false,
+    };
+
+    const keyOf = (symbol, interval) => `${symbol}|${interval}`;
+
+    /* ======================================================================
+     *  TRADINGVIEW LIGHTWEIGHT CHARTS SETUP
+     * ==================================================================== */
+    const chart = LightweightCharts.createChart(chartEl, {
+      layout: {
+        background: { color: '#0b0f16' },
+        textColor: '#8496ad',
+        fontSize: 12,
+      },
+      grid: {
+        vertLines: { color: '#1a2331' },
+        horzLines: { color: '#1a2331' },
+      },
+      crosshair: {
+        mode: LightweightCharts.CrosshairMode.Normal,
+        vertLine: { color: '#2b7fff', width: 1, style: 3, labelBackgroundColor: '#2b7fff' },
+        horzLine: { color: '#2b7fff', width: 1, style: 3, labelBackgroundColor: '#2b7fff' },
+      },
+      rightPriceScale: { borderColor: '#243040', scaleMargins: { top: 0.08, bottom: 0.28 } },
+      timeScale: {
+        borderColor: '#243040',
+        timeVisible: true,
+        secondsVisible: false,
+        rightOffset: 4,
+        barSpacing: 7,
+      },
+      localization: {
+        locale: 'en',
+        priceFormatter: (p) => p.toFixed(p < 10 ? 5 : 3),
+      },
+      handleScroll: { mouseWheel: true, pressedMouseMove: true },
+      handleScale: { mouseWheel: true, pinch: true },
+    });
+
+    const candleSeries = chart.addCandlestickSeries({
+      upColor: '#26a69a',
+      downColor: '#ef5350',
+      borderUpColor: '#26a69a',
+      borderDownColor: '#ef5350',
+      wickUpColor: '#26a69a',
+      wickDownColor: '#ef5350',
+      priceLineVisible: true,
+      priceLineColor: '#2b7fff',
+      lastValueVisible: true,
+    });
+
+    const volumeSeries = chart.addHistogramSeries({
+      priceFormat: { type: 'volume' },
+      priceScaleId: 'vol',
+      lastValueVisible: false,
+      priceLineVisible: false,
+    });
+    // Give volume its own 20%-tall pane at the bottom of the chart
+    chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+    // Crosshair → OHLC legend.
+    // NOTE: the *production* standalone build of Lightweight Charts minifies the
+    // event-subscription method names, so `subscribeCrosshairMove` is not
+    // reliably present. We feature-detect it; the legend below is always fed by
+    // the SSE stream, so the chart is fully usable either way.
+    if (typeof candleSeries.subscribeCrosshairMove === 'function') {
+      candleSeries.subscribeCrosshairMove((param) => {
+        if (!param || !param.time) return;                 // pointer left the chart
+        const c = param.seriesData.get(candleSeries);
+        if (c) ohlcLine.innerHTML = renderOhlc(c) + ' <i>(crosshair)</i>';
+      });
+    } else {
+      console.warn('[dashboard] crosshair legend unavailable in this build — ' +
+                   'using the live OHLC readout instead');
+    }
+
+    // Keep the canvas sized to its container (handles window resize)
+    const resize = () => chart.applyOptions({ width: chartEl.clientWidth, height: chartEl.clientHeight });
+    window.addEventListener('resize', resize);
+    new ResizeObserver(resize).observe(chartEl);
+    resize();
+
+    /* ======================================================================
+     *  HELPERS
+     * ==================================================================== */
+    const fmtPrice = (v) =>
+      (v == null || !isFinite(v)) ? '—' : (v < 10 ? Number(v).toFixed(5) : Number(v).toFixed(3));
+
+    /** A price *difference* wants far less precision than a price. */
+    const fmtDiff = (v) => {
+      if (v == null || !isFinite(v)) return '—';
+      const a = Math.abs(v);
+      return (a < 1 ? v.toFixed(5) : a < 100 ? v.toFixed(3) : v.toFixed(2));
+    };
+
+    const fmtTime = (epochSec) =>
+      new Date(epochSec * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'medium' });
+
+    /** Lightweight Charts wants { time, open, high, low, close, value? } */
+    const toLc = (c) => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close });
+    const toVol = (c) => ({
+      time: c.time,
+      value: c.tickVolume || 0,
+      color: c.close >= c.open ? 'rgba(38,166,154,.5)' : 'rgba(239,83,80,.5)',
+    });
+
+    function setPill(el, textEl, stateName, text) {
+      el.className = 'pill' + (stateName ? ' ' + stateName : '');
+      textEl.textContent = text;
+    }
+
+    function showOverlay(title, note) {
+      overlayNote.innerHTML = note || '';
+      overlay.querySelector('div:nth-child(2)').textContent = title;
+      overlay.classList.add('show');
+    }
+    function hideOverlay() { overlay.classList.remove('show'); }
+
+    /* ======================================================================
+     *  BUILD THE DROPDOWNS
+     * ==================================================================== */
+    function buildSelectors() {
+      pairSelect.innerHTML = state.pairs
+        .map((p) => `<option value="${p.code}">${p.display} — ${p.name || ''}</option>`)
+        .join('');
+      tfSelect.innerHTML = state.timeframes
+        .map((t) => `<option value="${t.seconds}">${t.label} — ${t.name || ''}</option>`)
+        .join('');
+
+      if (![...pairSelect.options].some((o) => o.value === DEFAULT_PAIR)) {
+        pairSelect.value = pairSelect.options[0]?.value;
+      } else {
+        pairSelect.value = DEFAULT_PAIR;
+      }
+      tfSelect.value = String(DEFAULT_TIMEFRAME);
+    }
+
+    pairSelect.addEventListener('change', () => render());
+    tfSelect.addEventListener('change', () => render());
+
+    /* ======================================================================
+     *  RENDERING
+     * ==================================================================== */
+
+    /** Redraw the chart from the local cache for the active pair/timeframe. */
+    function render() {
+      const symbol = pairSelect.value;
+      const interval = Number(tfSelect.value);
+      state.activeKey = keyOf(symbol, interval);
+
+      const s = state.cache.get(state.activeKey);
+      const display = (state.pairs.find((p) => p.code === symbol) || {}).display || symbol;
+      const tfLabel = (state.timeframes.find((t) => t.seconds === interval) || {}).label || interval;
+
+      symbolName.textContent = `${display} · ${tfLabel}`;
+
+      if (!s || (!s.candles.length && !s.current)) {
+        candleSeries.setData([]);
+        volumeSeries.setData([]);
+        lastPriceEl.textContent = '—';
+        lastPriceEl.className = 'last-price';
+        statCandles.textContent = '0';
+        candleInfo.textContent = 'no data for this series yet…';
+        return;
+      }
+
+      const rows = s.current ? [...s.candles, s.current] : [...s.candles];
+
+      // Full redraw — required when switching pair/timeframe
+      candleSeries.setData(rows.map(toLc));
+      volumeSeries.setData(rows.map(toVol));
+      chart.timeScale().fitContent();
+
+      statCandles.textContent = String(s.candles.length);
+      paintHeader(s, rows);
+    }
+
+    /** "O … H … L … C …" for the OHLC legend. */
+    const renderOhlc = (c) =>
+      `O <b>${fmtPrice(c.open)}</b> &nbsp; H <b>${fmtPrice(c.high)}</b> &nbsp; ` +
+      `L <b>${fmtPrice(c.low)}</b> &nbsp; C <b>${fmtPrice(c.close)}</b>`;
+
+    /** Update the price strip / legend for the active series. */
+    function paintHeader(s, rows) {
+      const cur = s.current || rows[rows.length - 1];
+      if (!cur) return;
+
+      lastPriceEl.textContent = fmtPrice(cur.close);
+      const rising = cur.close >= cur.open;
+      lastPriceEl.className = 'last-price ' + (rising ? 'up' : 'down');
+
+      // Change vs. the previous close
+      const prev = rows.length > 1 ? rows[rows.length - 2].close : null;
+      if (prev) {
+        const diff = cur.close - prev;
+        const pct = (diff / prev) * 100;
+        const cls = diff >= 0 ? 'up' : 'down';
+        const arrow = diff >= 0 ? '▲' : '▼';
+        changeLine.innerHTML =
+          `<span class="${cls}">${arrow} ${diff >= 0 ? '+' : ''}${fmtDiff(diff)} (${pct.toFixed(3)}%)</span>`;
+      } else {
+        changeLine.textContent = '—';
+      }
+
+      // Live OHLC of the active candle
+      ohlcLine.innerHTML = renderOhlc(cur);
+
+      // Candle timing / staleness
+      if (!s.current) {
+        candleInfo.textContent = 'market closed — showing the last closed candle';
+      } else {
+        const remaining = Math.max(0, s.interval - (Date.now() / 1000 - s.current.time));
+        const mm = Math.floor(remaining / 60);
+        const ss = String(Math.floor(remaining % 60)).padStart(2, '0');
+        candleInfo.innerHTML =
+          `open ${fmtTime(s.current.time)} · closes in <b>${mm}m ${ss}s</b>`;
+      }
+
+      statLast.textContent = new Date().toLocaleTimeString();
+    }
+
+    /* ======================================================================
+     *  SSE HANDLERS
+     * ==================================================================== */
+
+    /** 1) Initial payload: the full 100-candle history for all 16 series. */
+    function onSnapshot(msg) {
+      state.gotSnapshot = true;
+      state.maxCandles = msg.maxCandles || 100;
+      if (msg.pairs) state.pairs = msg.pairs;
+      if (msg.timeframes) state.timeframes = msg.timeframes;
+
+      // Prime the local cache
+      state.cache.clear();
+      for (const [key, series] of Object.entries(msg.series || {})) {
+        state.cache.set(key, {
+          symbol: series.symbol,
+          display: series.display,
+          interval: series.interval,
+          intervalLabel: series.intervalLabel,
+          candles: (series.candles || []).slice(),
+          current: series.current || null,
+          ready: !!series.ready,
+        });
+      }
+      state.received = [...state.cache.values()].reduce((n, s) => n + s.candles.length, 0);
+      statReceived.textContent = String(state.received);
+
+      // Upstream health from the snapshot
+      if (msg.upstream) {
+        setPill(apiPill, apiText, msg.upstream.connected ? 'ok' : 'error',
+          `API: ${msg.upstream.connected ? 'connected' : 'offline'}`);
+      }
+
+      buildSelectors();
+      render();
+      hideOverlay();
+      console.log('[dashboard] snapshot received —', state.cache.size, 'series');
+    }
+
+    /** 2) Coalesced live updates (forming candle + newly closed candle). */
+    function onUpdate(msg) {
+      state.frames += 1;
+      statFrames.textContent = String(state.frames);
+      statServer.textContent = new Date(msg.serverTime).toLocaleTimeString();
+
+      for (const item of msg.items || []) {
+        let s = state.cache.get(item.key);
+        if (!s) {
+          s = { symbol: item.symbol, interval: item.interval, candles: [], current: null };
+          state.cache.set(item.key, s);
+        }
+
+        // A candle just closed → append and trim to exactly maxCandles
+        if (item.closed) {
+          s.candles.push(item.closed);
+          if (s.candles.length > state.maxCandles) s.candles.shift();
+          state.received += 1;
+          statReceived.textContent = String(state.received);
+        }
+        s.current = item.current;
+
+        // Only the series currently on screen needs a chart write
+        if (item.key === state.activeKey) {
+          if (item.closed) candleSeries.update(toLc(item.closed));
+          if (item.current) candleSeries.update(toLc(item.current));
+          if (item.closed) volumeSeries.update(toVol(item.closed));
+          if (item.current) volumeSeries.update(toVol(item.current));
+          paintHeader(s, s.current ? [...s.candles, s.current] : s.candles);
+        }
+      }
+    }
+
+    /** 3) Upstream health. */
+    function onStatus(msg) {
+      setPill(apiPill, apiText, msg.connected ? 'ok' : 'warn',
+        `API: ${msg.connected ? 'connected' : 'reconnecting…'}`);
+    }
+
+    /* ======================================================================
+     *  SSE CONNECTION MANAGEMENT
+     * ==================================================================== */
+    function connect() {
+      if (state.source) state.source.close();
+
+      setPill(ssePill, sseText, 'warn', 'SSE: connecting…');
+      if (!state.gotSnapshot) showOverlay('Connecting to the streaming engine…',
+        'Waiting for the initial 100-candle snapshot from <b>/stream</b>.');
+
+      // EventSource reconnects on its own, but we wire it explicitly for
+      // clear logging / UI feedback.
+      const es = new EventSource('/stream');
+      state.source = es;
+
+      es.addEventListener('open', () => {
+        setPill(ssePill, sseText, 'ok', 'SSE: live');
+        console.log('[dashboard] SSE open');
+      });
+
+      es.addEventListener('snapshot', (e) => {
+        setPill(ssePill, sseText, 'ok', 'SSE: live');
+        try { onSnapshot(JSON.parse(e.data)); }
+        catch (err) { console.error('[dashboard] bad snapshot', err); }
+      });
+
+      es.addEventListener('update', (e) => {
+        try { onUpdate(JSON.parse(e.data)); }
+        catch (err) { console.error('[dashboard] bad update', err); }
+      });
+
+      es.addEventListener('status', (e) => {
+        try { onStatus(JSON.parse(e.data)); }
+        catch { /* ignore */ }
+      });
+
+      es.addEventListener('error', () => {
+        if (es.readyState === EventSource.CLOSED) {
+          setPill(ssePill, sseText, 'error', 'SSE: disconnected');
+          showOverlay('Stream disconnected',
+            'Retrying automatically… If this persists, check that the Node server is running.');
+        } else {
+          setPill(ssePill, sseText, 'warn', 'SSE: retrying…');
+        }
+      });
+    }
+
+    $('reconnectBtn').addEventListener('click', () => {
+      console.log('[dashboard] manual reconnect');
+      state.gotSnapshot = false;
+      connect();
+    });
+
+    /* ======================================================================
+     *  GO
+     * ==================================================================== */
+    buildSelectors();
+    connect();
+  })();
+  </script>
+</body>
+</html>

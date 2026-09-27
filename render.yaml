@@ -1,0 +1,43 @@
+# =============================================================================
+#  Render Blueprint  —  Paper Trading Streaming Engine
+#  Developed by Eng Hasan Mohamad
+# -----------------------------------------------------------------------------
+#  Deploy:  https://render.com  →  New  →  Blueprint  →  point at this repo
+#  Or paste the block below into render.yaml at the repo root.
+# =============================================================================
+
+services:
+  - type: web
+    name: paper-trading-streaming-engine
+    runtime: node
+
+    # ── Which plan ────────────────────────────────────────────────────────
+    #   free     → $0, but the instance SLEEPS after 15 min with no traffic.
+    #              With SSE clients attached it stays awake, yet every cold
+    #              start costs 30–60s. Fine for testing, painful for a mobile app.
+    #   starter  → $7/mo, always on, no cold start.  ← recommended for production
+    plan: starter
+
+    # frankfurt | oregon | ohio | singapore | frankfurt …
+    region: frankfurt
+
+    branch: main
+    autoDeploy: true
+
+    # Only production dependencies (express + ws) — the test folder is skipped
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+
+    # Render polls this. /health returns 200 even when Deriv is unreachable, so
+    # a Deriv outage will NOT cause Render to kill the service.
+    healthCheckPath: /health
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DERIV_APP_ID
+        value: "1089"
+      # PORT and HOST are injected by Render — do not set them here.
+      # Optional override if you prefer a different upstream host:
+      # - key: DERIV_WS_URL
+      #   value: wss://ws.derivws.com/websockets/v3
