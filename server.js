@@ -5,29 +5,31 @@
  *  -----------------------------------------------------------------------------
  *  ARCHITECTURE
  *
- *   Deriv WS API ──►  DerivFeed (auto-reconnect + exponential backoff)
- *        │  history(100 candles)      │  live ohlc / tick updates
- *        ▼                            ▼
+ *   biquote.io tick feed  ──►  BiquoteFeed (SignalR over WebSocket,
+ *        (wss://…/hubs/tick)        auto-reconnect + exponential backoff)
+ *              │  REST /ohlc (100 candles)   │  live ticks
+ *              ▼                             ▼
  *              MarketAggregator  (in-memory: exactly 100 closed candles
- *        │                       + 1 forming candle, per series)
+ *        │                    + 1 forming candle, per series)
  *        │  coalesced + throttled every 400ms
  *        ▼
  *              SSEHub ──►  GET /stream  ──►  Mobile / Web clients
- *                                                    │
- *                                                    ▼
- *                                         public/index.html
- *                              (TradingView Lightweight Charts dashboard)
+ *                                                   │
+ *                                                   ▼
+ *                                        public/index.html
+ *                             (TradingView Lightweight Charts dashboard)
  *
- *  PAIRS      : XAUUSD, EURUSD, USDJPY, GBPUSD   (Deriv "frx…" codes)
- *  TIMEFRAMES : 5m, 15m, 1h, 4h
- *  SERIES     : 4 × 4 = 16
+ *  UPSTREAM  : biquote.io — free real-time market data (MetaTrader 5 feed),
+ *              no API key required.
+ *  PAIRS     : XAUUSD, EURUSD, USDJPY, GBPUSD
+ *  TIMEFRAMES: 5m, 15m, 1h, 4h
+ *  SERIES    : 4 × 4 = 16
  * =============================================================================
  */
 
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { randomUUID } from 'node:crypto';
 import express from 'express';
 import { WebSocket } from 'ws';
 
@@ -52,18 +54,19 @@ const CONFIG = {
   // Back-pressure guard: stop writing to clients that fall this far behind
   SSE_MAX_BUFFER_BYTES: 1_000_000,
 
-  // ---- Deriv upstream -----------------------------------------------------
-  DERIV: {
-    APP_ID: process.env.DERIV_APP_ID ?? '1089',
-    URL: process.env.DERIV_WS_URL ?? 'wss://ws.derivws.com/websockets/v3',
+  // ---- biquote.io upstream -------------------------------------------------
+  BIQUOTE: {
+    API: process.env.BIQUOTE_API ?? 'https://biquote.io',
+    WS: process.env.BIQUOTE_WS ?? 'wss://biquote.io/hubs/tick',
     BACKOFF_BASE_MS: 1_000, // 1s → 2s → 4s → 8s …
     BACKOFF_MAX_MS: 30_000,
-    PING_EVERY_MS: 20_000, // application-level keepalive
-    WATCHDOG_MS: 60_000, // silence for this long ⇒ zombie socket, force reconnect
-    // Raw tick stream on top of candle updates.
-    // Candle (`ohlc`) updates already fire on every tick and carry
-    // open/high/low/close, so this is optional. Enable for extra fidelity.
-    STREAM_TICKS: true,
+    // SignalR keepalive
+    PING_EVERY_MS: 20_000,
+    // Complete silence for this long ⇒ zombie socket. Deliberately generous:
+    // forex and metals are closed at weekends, and a tight watchdog would
+    // reconnect in a loop for the whole Saturday.
+    WATCHDOG_MS: 300_000,
+    REST_TIMEOUT_MS: 15_000,
   },
 
   // ---- In-memory store ----------------------------------------------------
@@ -73,26 +76,26 @@ const CONFIG = {
 /** Ring size for closed candles. */
 const MAX_CANDLES = CONFIG.MAX_CANDLES;
 
-/** How many times to re-request history while calibrating the candle interval. */
-const HISTORY_CALIBRATION_TRIES = 3;
-
-/** The 4 traded pairs with their exact Deriv symbol codes. */
+/** The 4 traded pairs. `code` is the upstream symbol. */
 export const PAIRS = [
-  { code: 'frxXAUUSD', display: 'XAUUSD', name: 'Gold / US Dollar' },
-  { code: 'frxEURUSD', display: 'EURUSD', name: 'Euro / US Dollar' },
-  { code: 'frxUSDJPY', display: 'USDJPY', name: 'US Dollar / Japanese Yen' },
-  { code: 'frxGBPUSD', display: 'GBPUSD', name: 'British Pound / US Dollar' },
+  { code: 'XAUUSD', display: 'XAUUSD', name: 'Gold / US Dollar' },
+  { code: 'EURUSD', display: 'EURUSD', name: 'Euro / US Dollar' },
+  { code: 'USDJPY', display: 'USDJPY', name: 'US Dollar / Japanese Yen' },
+  { code: 'GBPUSD', display: 'GBPUSD', name: 'British Pound / US Dollar' },
 ];
 
-/** The 4 supported timeframes. `seconds` is the internal unit. */
+/**
+ * The 4 supported timeframes.
+ * `seconds` is the internal unit, `api` is the upstream interval string.
+ */
 export const TIMEFRAMES = [
-  { seconds: 300, label: '5m', name: '5 Minutes' },
-  { seconds: 900, label: '15m', name: '15 Minutes' },
-  { seconds: 3600, label: '1h', name: '1 Hour' },
-  { seconds: 14400, label: '4h', name: '4 Hours' },
+  { seconds: 300, api: '5m', label: '5m', name: '5 Minutes' },
+  { seconds: 900, api: '15m', label: '15m', name: '15 Minutes' },
+  { seconds: 3600, api: '1h', label: '1h', name: '1 Hour' },
+  { seconds: 14400, api: '4h', label: '4h', name: '4 Hours' },
 ];
 
-/** Stable composite key used everywhere: `frxXAUUSD|900` */
+/** Stable composite key used everywhere: `XAUUSD|900` */
 export const seriesKey = (symbol, interval) => `${symbol}|${interval}`;
 
 /** All 16 series the engine maintains, pre-declared. */
@@ -103,13 +106,14 @@ export const SERIES = PAIRS.flatMap((p) =>
     display: p.display,
     pairName: p.name,
     interval: t.seconds,
+    intervalApi: t.api,
     intervalLabel: t.label,
     intervalName: t.name,
   }))
 );
 
 /* ---------------------------------------------------------------------------
- * 2) LOGGING HELPERS
+ * 2) SMALL HELPERS
  * ------------------------------------------------------------------------- */
 
 const stamp = () => new Date().toISOString().replace('T', ' ').slice(0, 23);
@@ -121,44 +125,68 @@ const err = (...a) => console.error(`[${stamp()}] ✖ `, ...a);
 const floorEpoch = (epochSeconds, interval) =>
   Math.floor(epochSeconds / interval) * interval;
 
-/** Deriv sends numbers as strings — normalise. */
-const toNum = (v) => (typeof v === 'number' ? v : parseFloat(v));
+/** Upstream sends numbers as strings in some places — normalise. */
+const toNum = (v) => (v == null || v === '' ? NaN : typeof v === 'number' ? v : parseFloat(v));
+
+/** Short, readable id for log lines and SSE clients. */
+const randomId = () => Math.random().toString(36).slice(2, 10);
+
+/** fetch() with a timeout, so a hanging upstream cannot stall the boot. */
+const fetchWithTimeout = async (url, timeoutMs) => {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: ctl.signal, headers: { accept: 'application/json' } });
+  } finally {
+    clearTimeout(timer);
+  }
+};
 
 /* ---------------------------------------------------------------------------
- * 3) DERIV FEED  —  upstream WebSocket with exponential-backoff reconnects
+ * 3) BIQUOTE FEED  —  upstream WebSocket (SignalR) with exponential reconnects
  * ------------------------------------------------------------------------- */
 
+/** SignalR's record separator (0x1E) — every frame is suffixed with it. */
+const RS = '\u001e';
+
 /**
- * A resilient, auto-reconnecting Deriv WebSocket client.
+ * A resilient, auto-reconnecting client for the biquote.io tick hub.
  *
- *  - Correlates one-shot request/response pairs with `req_id`.
- *  - On every (re)connect it calls `onOpen` so the app can re-backfill and
- *    re-subscribe automatically.
- *  - Forwards every other message to `onMessage`.
+ * Protocol: SignalR over a raw WebSocket.
+ *   1. send handshake   {"protocol":"json","version":1}
+ *   2. receive ack      {}
+ *   3. invoke           Subscribe with our symbol list
+ *   4. receive          ReceiveTick / ReceiveSubscriptionState messages
+ *   5. ping             {"type":6}  ↔  {"type":6}
+ *
+ * Emits only one thing upstream: `onTick(symbol, tick)`.
  */
-class DerivFeed {
-  constructor({ onOpen, onClose, onMessage, onError } = {}) {
-    this.url = `${CONFIG.DERIV.URL}?app_id=${CONFIG.DERIV.APP_ID}`;
+class BiquoteFeed {
+  constructor({ symbols = [], onTick = () => {}, onOpen = () => {}, onClose = () => {}, onError = () => {} } = {}) {
+    this.url = CONFIG.BIQUOTE.WS;
+    this.symbols = symbols;
+    this.onTick = onTick;
     this.onOpen = onOpen;
     this.onClose = onClose;
-    this.onMessage = onMessage;
     this.onError = onError;
 
     /** @type {WebSocket|null} */
     this.ws = null;
     this.connected = false;
-    this.reqId = 0;
     this.attempt = 0; // drives the exponential backoff
     this.lastMessageAt = 0;
     this.lastOpenAt = 0;
     this.stopped = false;
-
-    /** @type {Map<number, (msg:object)=>void>} req_id → resolver */
-    this.pending = new Map();
+    this.invocationId = 0;
+    this.subscribed = false;
 
     this.pingTimer = null;
     this.watchdogTimer = null;
     this.reconnectTimer = null;
+
+    // Last failure seen — surfaced on /health so faults are diagnosable
+    // at a glance without digging through the log.
+    this.lastError = null;
   }
 
   /* ---------- public API ---------- */
@@ -166,45 +194,6 @@ class DerivFeed {
   start() {
     this.stopped = false;
     this.connect();
-  }
-
-  /** Fire-and-forget request (subscribe / forget / ping). Returns the req_id. */
-  send(payload) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return null;
-    const reqId = ++this.reqId;
-    this.ws.send(JSON.stringify({ ...payload, req_id: reqId }));
-    return reqId;
-  }
-
-  /** Request → resolves with the first reply carrying the same `req_id`. */
-  request(payload, timeoutMs = 15_000) {
-    return new Promise((resolve, reject) => {
-      const reqId = this.send(payload);
-      if (reqId === null) return reject(new Error('Deriv socket is not connected'));
-
-      const timer = setTimeout(() => {
-        this.pending.delete(reqId);
-        reject(new Error(`Deriv request timed out (req_id=${reqId})`));
-      }, timeoutMs);
-
-      this.pending.set(reqId, (msg) => {
-        clearTimeout(timer);
-        if (msg.error) reject(new Error(`${msg.error.code}: ${msg.error.message}`));
-        else resolve(msg);
-      });
-    });
-  }
-
-  status() {
-    return {
-      connected: this.connected,
-      url: this.url,
-      reconnectAttempts: this.attempt,
-      uptimeMs: this.lastOpenAt ? Date.now() - this.lastOpenAt : 0,
-      secondsSinceLastMessage: this.lastMessageAt
-        ? Math.round((Date.now() - this.lastMessageAt) / 1000)
-        : null,
-    };
   }
 
   stop() {
@@ -216,6 +205,21 @@ class DerivFeed {
     } catch {
       /* ignore */
     }
+  }
+
+  status() {
+    return {
+      connected: this.connected,
+      subscribed: this.subscribed,
+      url: this.url,
+      reconnectAttempts: this.attempt,
+      uptimeMs: this.lastOpenAt ? Date.now() - this.lastOpenAt : 0,
+      secondsSinceLastTick: this.lastMessageAt
+        ? Math.round((Date.now() - this.lastMessageAt) / 1000)
+        : null,
+      // Set when the upstream could not be reached
+      lastError: this.lastError,
+    };
   }
 
   /* ---------- internals ---------- */
@@ -235,70 +239,120 @@ class DerivFeed {
       return; // already open / opening
     }
 
-    log(`→ Connecting to Deriv API … (attempt #${this.attempt + 1})`);
+    log(`→ Connecting to biquote tick feed … (attempt #${this.attempt + 1})`);
 
     let ws;
     try {
       ws = new WebSocket(this.url, { handshakeTimeout: 15_000 });
     } catch (e) {
+      this.lastError = `construct: ${e.message}`;
       err('WebSocket construction failed:', e.message);
+      this.onError?.(e);
       return this.#scheduleReconnect();
     }
     this.ws = ws;
+    this.subscribed = false;
 
     ws.on('open', () => {
-      this.connected = true;
-      this.attempt = 0; // a successful handshake resets the backoff
-      this.lastOpenAt = Date.now();
-      this.lastMessageAt = Date.now();
-      log('✔ Connected to Deriv API');
-      this.#startTimers();
-      // Fire-and-forget: bootstrap failures are logged inside the handler
-      Promise.resolve(this.onOpen?.()).catch((e) => err('onOpen failed:', e.message));
+      // Step 1 — SignalR handshake
+      ws.send(JSON.stringify({ protocol: 'json', version: 1 }) + RS);
     });
 
     ws.on('message', (raw) => {
       this.lastMessageAt = Date.now();
-
-      let msg;
-      try {
-        msg = JSON.parse(raw.toString());
-      } catch {
-        return warn('Received a non-JSON frame from Deriv — ignored.');
+      for (const frame of raw.toString().split(RS)) {
+        if (!frame) continue;
+        let msg;
+        try {
+          msg = JSON.parse(frame);
+        } catch {
+          warn('Unparseable frame from biquote — ignored.');
+          continue;
+        }
+        this.#handle(msg);
       }
-
-      // One-shot request replies are terminal for that req_id
-      if (msg.req_id != null && this.pending.has(msg.req_id)) {
-        const resolver = this.pending.get(msg.req_id);
-        this.pending.delete(msg.req_id);
-        resolver(msg);
-        return;
-      }
-
-      if (msg.error) {
-        err(`Deriv error [${msg.error.code}]: ${msg.error.message}`);
-      } else if (msg.msg_type === 'rate_limit') {
-        warn('⚠ Deriv rate limit reached — cooling down 30s');
-        this.#coolDown(30_000);
-      }
-
-      this.onMessage?.(msg);
     });
 
     ws.on('error', (e) => {
+      this.lastError = e.message;
       err('WebSocket error:', e.message);
       this.onError?.(e);
     });
 
     ws.on('close', (code, reason) => {
       this.connected = false;
+      this.subscribed = false;
       this.#clearTimers();
-      this.pending.clear();
       log(`✖ Connection closed (code=${code}${reason ? `, reason="${reason}"` : ''})`);
-      this.onClose?.(code, reason);
+      this.onClose?.(code, reason?.toString() || '');
       if (this.stopped || code === 1000) return; // deliberate shutdown
       this.#scheduleReconnect();
     });
+  }
+
+  #handle(msg) {
+    // ---- Step 2: handshake acknowledgement (no `type` field) ----
+    if (msg.type === undefined) {
+      if (msg.error) {
+        this.lastError = `handshake: ${msg.error}`;
+        err('SignalR handshake rejected:', msg.error);
+        return;
+      }
+      this.connected = true;
+      this.attempt = 0; // a successful handshake resets the backoff
+      this.lastOpenAt = Date.now();
+      this.lastError = null;
+      log('✔ Connected to biquote.io');
+
+      // ---- Step 3: subscribe to our symbols ----
+      this.#send({
+        type: 1,
+        invocationId: String(++this.invocationId),
+        target: 'Subscribe',
+        arguments: [this.symbols],
+      });
+      this.#startTimers();
+      Promise.resolve(this.onOpen?.()).catch((e) => err('onOpen failed:', e.message));
+      return;
+    }
+
+    switch (msg.type) {
+      // ---- Invocation result / completion ----
+      case 3:
+        if (msg.error) {
+          this.lastError = `subscribe: ${msg.error}`;
+          err('Subscribe rejected:', msg.error);
+        } else {
+          log(`  ✓ Subscribe confirmed${msg.result ? `: ${JSON.stringify(msg.result).slice(0, 120)}` : ''}`);
+          this.subscribed = true;
+        }
+        return;
+
+      // ---- Stream messages ----
+      case 1: {
+        if (msg.target === 'ReceiveTick' && Array.isArray(msg.arguments)) {
+          for (const tick of msg.arguments) {
+            if (tick?.symbol) this.onTick(tick.symbol, tick);
+          }
+        } else if (msg.target === 'ReceiveSubscriptionState' && msg.arguments) {
+          this.subscribed = true;
+          log(`  ↻ subscription state: ${JSON.stringify(msg.arguments[0]).slice(0, 160)}`);
+        }
+        return;
+      }
+
+      // ---- Ping: keep the connection warm through proxies ----
+      case 6:
+        this.#send({ type: 6 });
+        return;
+
+      default:
+        return; // close / other message types
+    }
+  }
+
+  #send(obj) {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj) + RS);
   }
 
   /** Exponential backoff with jitter: 1s, 2s, 4s … capped at 30s. */
@@ -306,8 +360,8 @@ class DerivFeed {
     if (this.stopped || this.reconnectTimer) return;
     this.attempt += 1;
     const cap = Math.min(
-      CONFIG.DERIV.BACKOFF_MAX_MS,
-      CONFIG.DERIV.BACKOFF_BASE_MS * 2 ** (this.attempt - 1)
+      CONFIG.BIQUOTE.BACKOFF_MAX_MS,
+      CONFIG.BIQUOTE.BACKOFF_BASE_MS * 2 ** (this.attempt - 1)
     );
     // ±50% jitter prevents a thundering herd when many engines restart at once
     const delay = Math.round(cap * (0.5 + Math.random() * 0.5) + extraDelay);
@@ -319,29 +373,19 @@ class DerivFeed {
     }, delay);
   }
 
-  /** The server told us to slow down — push the next attempt far out. */
-  #coolDown(ms) {
-    this.attempt = 5;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      if (!this.connected) this.connect();
-    }, ms);
-  }
-
   #startTimers() {
     this.#clearTimers();
 
-    // Application keepalive — Deriv answers { msg_type: "pong" }
-    this.pingTimer = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) this.send({ ping: 1 });
-    }, CONFIG.DERIV.PING_EVERY_MS);
+    // Application keepalive
+    this.pingTimer = setInterval(() => this.#send({ type: 6 }), CONFIG.BIQUOTE.PING_EVERY_MS);
 
-    // Watchdog — silence means a zombie socket, force a reconnect
+    // Watchdog — complete silence means a zombie socket. The window is long on
+    // purpose: forex/metals are closed at weekends and we must not reconnect
+    // in a loop while the market is shut.
     this.watchdogTimer = setInterval(() => {
       if (!this.connected) return;
       const silence = Date.now() - this.lastMessageAt;
-      if (silence > CONFIG.DERIV.WATCHDOG_MS) {
+      if (silence > CONFIG.BIQUOTE.WATCHDOG_MS) {
         warn(`No data for ${Math.round(silence / 1000)}s — forcing reconnect`);
         try {
           this.ws.terminate();
@@ -349,7 +393,7 @@ class DerivFeed {
           /* ignore */
         }
       }
-    }, CONFIG.DERIV.WATCHDOG_MS / 2);
+    }, CONFIG.BIQUOTE.WATCHDOG_MS / 2);
   }
 }
 
@@ -360,7 +404,7 @@ class DerivFeed {
 /**
  * For every one of the 16 series we keep:
  *   • `candles` — the last MAX_CANDLES **closed** candles (oldest → newest)
- *   • `current` — the single *forming* candle, mutated live by ticks/ohlc
+ *   • `current` — the single *forming* candle, mutated live by incoming ticks
  *
  * Live changes are coalesced into `pending` between flushes so the SSE layer
  * emits at most one message per STREAM_INTERVAL_MS regardless of tick rate.
@@ -386,205 +430,130 @@ class MarketAggregator {
     this.pending = new Map();
   }
 
-  /* ---------- history backfill ---------- */
+  /* ---------- history backfill (REST) ---------- */
 
   /**
-   * Handle a history reply for one series.
+   * Pull history for one series: `GET /api/{symbol}/ohlc?interval=…&limit=…`
    *
-   * Granularity note (important): Deriv has **no** "interval" parameter for
-   * `ticks_history: "candle"`. It derives the candle interval from the
-   * requested time window — roughly `(end - start) / (count - 1)` — and snaps
-   * it to the nearest granularity it supports. `historyRequest()` therefore
-   * sends a window of exactly `(count - 1) × interval` seconds with `end`
-   * floored onto the timeframe grid.
-   *
-   * Because that inference is approximate, we also *measure* the interval we
-   * actually received and re-request with a corrected `count` until it matches
-   * the timeframe we want. Self-calibrating instead of guessing.
-   *
-   * @returns {number|null} the observed interval, or null if the reply was unusable
+   * biquote returns bars newest-first and flags the currently-forming one with
+   * `isOpen: true`, so there is no interval inference to calibrate here — we
+   * pass the exact interval string and get exactly that back.
    */
-  applyHistory(res, slot) {
-    const history = res.history;
-    if (!history?.prices?.length) {
-      warn(`Empty history for ${slot.key}`);
-      return null;
+  async backfill(slot) {
+    const url =
+      `${CONFIG.BIQUOTE.API}/api/${slot.symbol}/ohlc` +
+      `?interval=${encodeURIComponent(slot.intervalApi)}&limit=${MAX_CANDLES + 1}`;
+
+    const res = await fetchWithTimeout(url, CONFIG.BIQUOTE.REST_TIMEOUT_MS);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 120)}`);
+    }
+    const body = await res.json();
+    const bars = Array.isArray(body?.bars) ? body.bars : [];
+    if (bars.length === 0) throw new Error(`no bars returned for ${slot.symbol}`);
+
+    if (body.interval && body.interval !== slot.intervalApi) {
+      warn(`${slot.key}: upstream used interval "${body.interval}", expected "${slot.intervalApi}"`);
     }
 
-    const times = history.times ?? [];
-    const parsed = history.prices
-      .map((price, i) => {
-        const t = times[i];
-        const epoch = t !== null && typeof t === 'object' ? t.epoch : t;
-        return {
-          time: Number(epoch),
-          open: toNum(price),
-          high: toNum(price),
-          low: toNum(price),
-          close: toNum(price),
-          tickVolume: toNum(history.tick_volumes?.[i] ?? 0) || 0,
-        };
-      })
+    const toCandle = (b) => ({
+      time: Math.floor(new Date(b.openTime).getTime() / 1000),
+      open: toNum(b.open),
+      high: toNum(b.high),
+      low: toNum(b.low),
+      close: toNum(b.close),
+      tickVolume: toNum(b.tickVolume ?? b.volume ?? 0) || 0,
+    });
+
+    // `isOpen` marks the forming candle; fall back to "newest bar" if absent
+    const formingRaw = bars.find((b) => b.isOpen) ?? bars[0];
+    const closed = bars
+      .filter((b) => b !== formingRaw)
+      .map(toCandle)
       .filter((c) => Number.isFinite(c.time) && Number.isFinite(c.close))
       .sort((a, b) => a.time - b.time);
 
-    if (parsed.length === 0) {
-      warn(`No valid candles parsed for ${slot.key}`);
-      return null;
+    const forming = toCandle(formingRaw);
+    if (!Number.isFinite(forming.time) || !Number.isFinite(forming.close)) {
+      throw new Error(`unusable forming candle for ${slot.symbol}`);
     }
 
-    // Measure what the upstream actually gave us
-    const observed =
-      parsed.length > 1
-        ? Math.round(parsed[1].time - parsed[0].time)
-        : (slot.upstreamInterval ?? slot.interval);
-
-    if (observed !== slot.interval) {
-      warn(
-        `${slot.key}: upstream returned ${observed}s candles, ${slot.interval}s requested — ` +
-          `recalibrating (attempt ${(slot.histRetries ?? 0) + 1}/${HISTORY_CALIBRATION_TRIES})`
-      );
-      return observed; // the caller re-requests with a corrected count
-    }
-
-    const forming = parsed.pop(); // last candle is the one currently forming
-    slot.candles = parsed.slice(-MAX_CANDLES); // exactly MAX_CANDLES closed
+    slot.candles = closed.slice(-MAX_CANDLES); // exactly MAX_CANDLES closed
     slot.current = forming;
     slot.ready = true;
     slot.lastUpdate = Date.now();
     slot.tickCount = 0;
-    slot.upstreamInterval = observed;
-    slot.gridWarned = false;
 
     log(
-      `⬇ ${slot.key.padEnd(16)} ${slot.candles.length} closed + 1 forming ` +
-        `(last ${forming?.close ?? 'n/a'} @ ${forming ? new Date(forming.time * 1000).toISOString() : '-'})`
+      `⬇ ${slot.key.padEnd(12)} ${slot.candles.length} closed + 1 forming ` +
+        `(last ${forming.close} @ ${new Date(forming.time * 1000).toISOString()})`
     );
-    return observed;
   }
 
+  /* ---------- live tick path (the hot path) ---------- */
+
   /**
-   * The history request payload for one series.
+   * Fold one live tick into the series.
    *
-   * Deriv has no explicit "interval" parameter: it derives the candle interval
-   * from the time window, i.e. `(end - start) / (count - 1)`, snapped to the
-   * nearest supported granularity. Sending a window of exactly
-   * `MAX_CANDLES × interval` seconds with `MAX_CANDLES + 1` candles therefore
-   * pins the interval deterministically. `end` is floored onto the timeframe
-   * grid so the returned epochs are exact multiples of the interval.
+   * A tick whose epoch is newer than the current candle opens a new candle
+   * (closing the previous one); a tick inside the current candle updates its
+   * close / high / low in place. This is what keeps the active candle live.
+   *
+   * @returns {boolean} true when the tick produced a state change
    */
-  historyRequest(slot, count = MAX_CANDLES + 1) {
-    const span = Math.max(1, count - 1) * slot.interval;
-    const end = floorEpoch(Math.floor(Date.now() / 1000), slot.interval);
-    return {
-      ticks_history: 'candle',
-      symbol: slot.symbol,
-      adjust_start_time: 1,
-      start: end - span,
-      end,
-      count, // last element is the currently-forming candle
-      style: 'candles',
-    };
-  }
+  applyTick(symbol, tick) {
+    // One tick can only belong to the timeframes of its own symbol
+    const price = toNum(tick.mid ?? tick.ask ?? tick.bid);
+    const epochSec = tick.timestamp ? new Date(tick.timestamp).getTime() / 1000 : Date.now() / 1000;
+    if (!Number.isFinite(price) || !Number.isFinite(epochSec)) return false;
 
-  /** The live-candle subscription payload (must be sent right after history). */
-  subscribeRequest(slot) {
-    const end = floorEpoch(Math.floor(Date.now() / 1000), slot.interval);
-    return {
-      ticks_history: 'candle',
-      subscribe: 1,
-      symbol: slot.symbol,
-      adjust_start_time: 1,
-      start: end - slot.interval, // window of exactly one interval
-      end,
-      count: 1,
-      style: 'candles',
-    };
-  }
+    let changed = false;
 
-  /* ---------- live update paths ---------- */
+    for (const slot of this.store.values()) {
+      if (slot.symbol !== symbol) continue;
 
-  /**
-   * Handle a live candle update (msg_type "ohlc").
-   * This is what keeps the *current* candle's close / high / low up to date.
-   */
-  applyOhlc(candle, slot) {
-    if (!candle || typeof candle.epoch !== 'number' || !slot) return;
+      const epoch = floorEpoch(epochSec, slot.interval);
 
-    // One-time sanity check: the live stream must land on the same grid as
-    // the backfilled history, otherwise the chart would show misaligned bars.
-    if (candle.epoch % slot.interval !== 0 && !slot.gridWarned) {
-      slot.gridWarned = true;
-      warn(
-        `${slot.key}: live candle epoch ${candle.epoch} is not aligned to the ` +
-          `${slot.interval}s grid — check the upstream interval`
-      );
-    }
-
-    const incoming = {
-      time: candle.epoch,
-      open: toNum(candle.open),
-      high: toNum(candle.high),
-      low: toNum(candle.low),
-      close: toNum(candle.close),
-      tickVolume: toNum(candle.tick_volume ?? 0) || 0,
-    };
-
-    const isNewCandle = !slot.current || incoming.time > slot.current.time;
-
-    if (isNewCandle) {
-      // ── ROLLOVER: close the previous candle, open a new one ────────────────
-      let justClosed = null;
-      if (slot.current && incoming.time === slot.current.time + slot.interval) {
-        justClosed = slot.current;
-        this.#pushClosed(slot, justClosed);
-      } else if (slot.current) {
-        // Gap in the feed (weekend / reconnect): synthesise the missing candles
-        // by carrying the last close forward so the chart has no holes.
-        warn(`${slot.key} gap detected — filling missing candle(s)`);
-        let ghost = { ...slot.current, time: slot.current.time + slot.interval };
-        while (ghost.time < incoming.time) {
-          ghost = { ...ghost, time: ghost.time + slot.interval };
-          this.#pushClosed(slot, ghost);
+      // First tick ever, or the feed was down and we missed candles
+      if (!slot.current) {
+        slot.current = { time: epoch, open: price, high: price, low: price, close: price, tickVolume: 1 };
+        this.#markDirty(slot, null, true);
+        changed = true;
+      } else if (epoch > slot.current.time) {
+        // ── ROLLOVER: close the previous candle, open a new one ─────────────
+        let closed = null;
+        if (epoch === slot.current.time + slot.interval) {
+          closed = slot.current; // the normal case
+          this.#pushClosed(slot, closed);
+        } else {
+          // Gap (weekend / outage): carry the last close forward so the chart
+          // never shows a hole, then open the new candle at the live price.
+          warn(`${slot.key} gap of ${Math.round((epoch - slot.current.time) / slot.interval)} candles — filling`);
+          let ghost = { ...slot.current, time: slot.current.time + slot.interval };
+          while (ghost.time < epoch) {
+            this.#pushClosed(slot, ghost);
+            ghost = { ...ghost, time: ghost.time + slot.interval };
+          }
         }
+        slot.current = { time: epoch, open: price, high: price, low: price, close: price, tickVolume: 1 };
+        this.#markDirty(slot, closed, true);
+        changed = true;
+      } else if (epoch === slot.current.time) {
+        // ── Same candle: mutate the forming candle in place ─────────────────
+        slot.current.close = price;
+        slot.current.high = Math.max(slot.current.high, price);
+        slot.current.low = Math.min(slot.current.low, price);
+        slot.current.tickVolume += 1;
+        this.#markDirty(slot, null, false);
+        changed = true;
       }
-      slot.current = incoming;
-      this.#markDirty(slot, justClosed, true);
-    } else if (incoming.time === slot.current.time) {
-      // ── SAME candle: mutate the forming candle in place (the hot path) ────
-      slot.current.close = incoming.close;
-      slot.current.high = Math.max(slot.current.high, incoming.high);
-      slot.current.low = Math.min(slot.current.low, incoming.low);
-      if (incoming.open) slot.current.open = incoming.open;
-      if (incoming.tickVolume) slot.current.tickVolume = incoming.tickVolume;
-      this.#markDirty(slot, null, false);
-    } else {
-      // ── Late / corrected update for an already-closed candle ──────────────
-      const idx = slot.candles.findIndex((c) => c.time === incoming.time);
-      if (idx !== -1) {
-        slot.candles[idx] = incoming;
-        this.#markDirty(slot, null, false, true);
-      }
+      // Ticks older than the current candle are stale — deliberately ignored.
+
+      slot.lastUpdate = Date.now();
+      slot.tickCount += 1;
     }
 
-    slot.lastUpdate = Date.now();
-    slot.tickCount += 1;
-  }
-
-  /** Handle a raw tick — folds the last traded price into the forming candle. */
-  applyTick(tick, slot) {
-    if (!slot?.current) return;
-    const price = toNum(tick.quote);
-    if (!Number.isFinite(price)) return;
-
-    slot.current.close = price;
-    slot.current.high = Math.max(slot.current.high, price);
-    slot.current.low = Math.min(slot.current.low, price);
-    slot.lastUpdate = Date.now();
-    slot.tickCount += 1;
-    // Deliberately NOT marking dirty: the matching ohlc update already did,
-    // and ticks are far too chatty to push per-tick. The flush timer is the
-    // real rate limiter. This just keeps the in-memory candle accurate.
+    return changed;
   }
 
   /* ---------- internals ---------- */
@@ -598,12 +567,11 @@ class MarketAggregator {
   }
 
   /** Record a change for the next SSE flush (coalescing by series). */
-  #markDirty(slot, justClosed, isNewCandle, corrected = false) {
+  #markDirty(slot, justClosed, isNewCandle) {
     const existing = this.pending.get(slot.key);
     if (existing) {
       if (justClosed) existing.closed = justClosed;
       existing.isNewCandle = existing.isNewCandle || isNewCandle;
-      existing.corrected = existing.corrected || corrected;
     } else {
       this.pending.set(slot.key, {
         key: slot.key,
@@ -614,7 +582,6 @@ class MarketAggregator {
         current: null, // filled at flush time — always the freshest copy
         closed: justClosed,
         isNewCandle,
-        corrected,
       });
     }
   }
@@ -660,8 +627,13 @@ class MarketAggregator {
       type: 'snapshot',
       serverTime: Date.now(),
       maxCandles: MAX_CANDLES,
+      source: 'biquote.io (MetaTrader 5)',
       pairs: PAIRS.map((p) => ({ code: p.code, display: p.display, name: p.name })),
-      timeframes: TIMEFRAMES.map((t) => ({ seconds: t.seconds, label: t.label, name: t.name })),
+      timeframes: TIMEFRAMES.map((t) => ({
+        seconds: t.seconds,
+        label: t.label,
+        name: t.name,
+      })),
       series,
     };
   }
@@ -703,7 +675,7 @@ class SSEHub {
   /**
    * Register a new SSE client.
    * Optional query filters let a client narrow the stream to save bandwidth:
-   *   /stream?symbol=frxXAUUSD&interval=900
+   *   /stream?symbol=XAUUSD&interval=900
    */
   add(req, res) {
     res.writeHead(200, {
@@ -720,7 +692,7 @@ class SSEHub {
     const interval = req.query.interval ? Number(req.query.interval) : null;
 
     const client = {
-      id: randomUUID().slice(0, 8),
+      id: randomId(),
       res,
       // A filtered client only receives updates for the series it asked for
       wants: (item) =>
@@ -808,61 +780,28 @@ class SSEHub {
 const market = new MarketAggregator();
 const sse = new SSEHub();
 
-/**
- * subscription_id → seriesKey.
- * Deriv hands back a fresh subscription id in the reply to every subscribe
- * request, and stamps it on every subsequent ohlc / tick frame — this map is
- * how we route a live frame back to its in-memory slot.
- */
-const subIdToKey = new Map();
+const feed = new BiquoteFeed({
+  symbols: PAIRS.map((p) => p.code),
 
-/** req_id → seriesKey, for the moment between "we sent it" and "id known". */
-const reqIdToKey = new Map();
-
-/** req_id → slot, for outstanding history backfill requests. */
-const pendingHistory = new Map();
-
-const feed = new DerivFeed({
   /**
-   * Runs after every (re)connect:
-   *   1. request 100 candles for all 16 series
-   *   2. subscribe to live candle updates (+ optional raw tick stream)
-   *
-   * Each history request is immediately followed by its own subscribe request
-   * for the same symbol. Deriv resolves a subscription's candle interval from
-   * the *most recent* history request for that symbol, so keeping the two
-   * adjacent is what makes 4 different timeframes per symbol work correctly.
+   * Runs after every (re)connect: reload history for all 16 series and push
+   * it straight to any client that is already attached (they would otherwise
+   * keep showing the pre-disconnect data).
    */
-  onOpen() {
+  async onOpen() {
     log('Bootstrapping 16 series (4 pairs × 4 timeframes)…');
-    subIdToKey.clear();
-    reqIdToKey.clear();
-    pendingHistory.clear();
 
-    // 1 + 2) History then live subscription, back-to-back, for every series.
-    //     Sent pipelined (no awaiting) so Deriv processes them in this exact
-    //     order while we still get full network parallelism.
-    for (const meta of SERIES) {
-      const slot = market.store.get(meta.key);
-      slot.histRetries = 0;
-      slot.histRequestCount = MAX_CANDLES + 1;
-
-      const histReqId = feed.send(market.historyRequest(slot));
-      if (histReqId !== null) pendingHistory.set(histReqId, slot);
-
-      const subReqId = feed.send(market.subscribeRequest(slot));
-      if (subReqId !== null) reqIdToKey.set(subReqId, meta.key);
+    const BATCH = 4; // small parallel batches stay well under any rate limit
+    for (let i = 0; i < SERIES.length; i += BATCH) {
+      const batch = SERIES.slice(i, i + BATCH);
+      const results = await Promise.allSettled(batch.map((meta) => market.backfill(market.store.get(meta.key))));
+      results.forEach((r, n) => {
+        if (r.status === 'rejected') err(`backfill failed for ${batch[n].key}: ${r.reason?.message}`);
+      });
     }
 
-    // 3) Optional raw tick stream — one per pair, folded into every timeframe
-    if (CONFIG.DERIV.STREAM_TICKS) {
-      for (const pair of PAIRS) {
-        const reqId = feed.send({ ticks: 'tick', subscribe: 1, symbol: pair.code });
-        if (reqId !== null) reqIdToKey.set(reqId, `tick:${pair.code}`);
-      }
-    }
-
-    log(`✔ ${SERIES.length} history + ${SERIES.length} candle subscriptions dispatched`);
+    market.markAllDirty();
+    log(`✔ ${SERIES.length} series ready`);
   },
 
   onClose() {
@@ -874,78 +813,9 @@ const feed = new DerivFeed({
     });
   },
 
-  onMessage(msg) {
-    // A history backfill reply → fill the slot (with interval calibration)
-    if (msg.req_id != null && pendingHistory.has(msg.req_id)) {
-      const slot = pendingHistory.get(msg.req_id);
-      pendingHistory.delete(msg.req_id);
-
-      if (msg.error) {
-        err(`history failed for ${slot.key}: ${msg.error.code} ${msg.error.message}`);
-      } else if (msg.msg_type === 'history') {
-        const observed = market.applyHistory(msg, slot);
-
-        if (observed != null && observed !== slot.interval) {
-          // The upstream gave us the wrong candle interval — re-request with a
-          // `count` scaled so Deriv's own inference lands on the target.
-          slot.histRetries = (slot.histRetries ?? 0) + 1;
-          if (slot.histRetries <= HISTORY_CALIBRATION_TRIES) {
-            const count = Math.max(
-              2,
-              Math.round((slot.histRequestCount ?? MAX_CANDLES + 1) * (observed / slot.interval))
-            );
-
-            const id = feed.send(market.historyRequest(slot, count));
-            if (id !== null) {
-              slot.histRequestCount = count;
-              pendingHistory.set(id, slot);
-            }
-          } else {
-            err(
-              `${slot.key}: could not pin the ${slot.interval}s interval after ` +
-                `${HISTORY_CALIBRATION_TRIES} attempts — the chart will use ${observed}s`
-            );
-            slot.upstreamInterval = observed;
-            slot.ready = true;
-          }
-        } else if (observed != null) {
-          // Push the reloaded candles to any client that was already connected
-          // (they would otherwise keep showing the pre-disconnect data).
-          market.markAllDirty();
-        }
-      }
-    }
-
-    // Learn the real subscription id the first time we see it
-    if (msg.req_id != null && reqIdToKey.has(msg.req_id)) {
-      const key = reqIdToKey.get(msg.req_id);
-      reqIdToKey.delete(msg.req_id);
-      if (msg.subscription?.id) {
-        subIdToKey.set(msg.subscription.id, key);
-        log(`  ↻ subscribed ${String(key).padEnd(16)} → id ${msg.subscription.id}`);
-      }
-      // The first reply of a candle subscription is `history` — already
-      // backfilled above, so there is nothing else to do with it.
-    }
-
-    const key = msg.subscription?.id ? subIdToKey.get(msg.subscription.id) : null;
-    if (!key) return;
-
-    if (msg.msg_type === 'ohlc' && msg.candle) {
-      const slot = market.store.get(key);
-      if (slot) market.applyOhlc(msg.candle, slot);
-      return;
-    }
-
-    if (msg.msg_type === 'tick') {
-      // A tick stream is registered as "tick:<symbol>" — update EVERY
-      // timeframe of that symbol with the last traded price.
-      const symbol = key.startsWith('tick:') ? key.slice(5) : null;
-      if (!symbol) return;
-      for (const slot of market.store.values()) {
-        if (slot.symbol === symbol) market.applyTick(msg, slot);
-      }
-    }
+  /** Every live tick, folded into the forming candle of all its timeframes. */
+  onTick(symbol, tick) {
+    market.applyTick(symbol, tick);
   },
 });
 
@@ -1047,8 +917,8 @@ const statusTimer = setInterval(() => {
   });
 }, CONFIG.STATUS_INTERVAL_MS);
 
-/* ---- Module exports (also allow `import`ing this file for unit tests) ---- */
-export { DerivFeed, MarketAggregator, SSEHub, CONFIG, MAX_CANDLES };
+/* ---- Module exports (also allows `import` for unit tests) --------------- */
+export { BiquoteFeed, MarketAggregator, SSEHub, CONFIG, MAX_CANDLES };
 
 // Only boot the HTTP server + upstream feed when this file is the entry point
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
@@ -1060,7 +930,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     log(`  Dashboard : http://localhost:${CONFIG.PORT}/`);
     log(`  SSE feed  : http://localhost:${CONFIG.PORT}/stream`);
     log(`  Health    : http://localhost:${CONFIG.PORT}/health`);
-    log(`  Upstream  : ${feed.url}  (app_id=${CONFIG.DERIV.APP_ID})`);
+    log(`  Upstream  : ${CONFIG.BIQUOTE.WS}   REST ${CONFIG.BIQUOTE.API}`);
+    log(`  Source    : biquote.io — MetaTrader 5 (free, no API key)`);
     log(`  Pairs     : ${PAIRS.map((p) => p.display).join(', ')}`);
     log(`  Timeframes: ${TIMEFRAMES.map((t) => t.label).join(', ')}`);
     log(`  Store     : ${SERIES.length} series × ${MAX_CANDLES} candles (in-memory)`);

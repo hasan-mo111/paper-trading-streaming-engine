@@ -7,6 +7,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "preview": "node test/preview.mjs",
+    "diagnose": "node diagnose.mjs",
     "test": "node test/e2e.test.mjs"
   },
   "engines": {
