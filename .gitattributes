@@ -1,0 +1,20 @@
+# Normalise line endings so the working tree on Windows, the container on
+# Render and the committed blobs all agree. Without this, git rewrites LF -> CRLF
+# on checkout, which produces noisy "modified" diffs and can break shell scripts.
+* text=auto eol=lf
+
+# Files git must treat as binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.pdf binary
+*.zip binary
+
+# Lockfiles and generated files stay LF (npm writes LF anyway)
+package-lock.json text eol=lf
