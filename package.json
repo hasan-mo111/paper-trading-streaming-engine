@@ -1,32 +1,38 @@
 {
-  "name": "paper-trading-streaming-engine",
-  "version": "1.0.0",
-  "description": "Real-time paper trading streaming engine: Deriv WebSocket upstream -> in-memory candle aggregator -> SSE downstream, with a TradingView Lightweight Charts dashboard. Developed by Eng Hasan Mohamad.",
+  "name": "aetheron-core",
+  "version": "2.0.0",
+  "description": "Aetheron Core — autonomous Quant Trading & Signal Backend. MT5 tick feed -> Supabase-persisted candles -> server-side strategy engine (ATR sizing, 50-day Donchian breakout, split exits) -> SSE streams for price data and chat-ops events. Developed by Eng Hasan Mohamad.",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "test": "npm run test:engine && npm run test:e2e",
+    "test:engine": "node test/engine.test.mjs",
+    "test:e2e": "node test/e2e.test.mjs",
     "preview": "node test/preview.mjs",
-    "diagnose": "node diagnose.mjs",
-    "test": "node test/e2e.test.mjs"
+    "diagnose": "node diagnose.mjs"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "keywords": [
-    "deriv",
-    "paper-trading",
+    "aetheron",
+    "quant-trading",
+    "signal-engine",
+    "supabase",
     "websocket",
     "sse",
     "candles",
     "tradingview",
     "forex",
-    "gold"
+    "gold",
+    "mt5"
   ],
   "author": "Eng Hasan Mohamad",
   "license": "MIT",
   "dependencies": {
+    "@supabase/supabase-js": "^2.117.2",
     "express": "^4.19.2",
     "ws": "^8.18.0"
   }

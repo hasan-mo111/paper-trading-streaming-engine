@@ -19,3 +19,11 @@ Thumbs.db
 # build output
 dist/
 build/
+
+# Supabase local artefacts (never commit a downloaded key dump)
+supabase/.branches/
+supabase/.temp/
+
+# NOTE: .env and .env.* are ignored above, with .env.example explicitly
+# un-ignored. The Supabase service-role key must never reach this repository —
+# it bypasses row-level security entirely.
