@@ -51,6 +51,18 @@ const upper = (raw, fallback = '') => (raw ? String(raw).trim().toUpperCase() : 
 /** Strip trailing slashes — Supabase URLs are used to build REST paths. */
 const noSlash = (raw) => (raw ? String(raw).trim().replace(/\/+$/, '') : '');
 
+/**
+ * Normalise a credential.
+ *
+ * A key pasted into Render's dashboard, a `.env` file or a CI variable very
+ * easily carries a trailing newline or a stray space. PostgREST answers
+ * "Invalid API key" for that — the string matches no key in the project —
+ * which looks exactly like a genuinely wrong key and sends people hunting for
+ * a credential problem that is really a whitespace problem. Trimming here
+ * removes that whole class of confusing failure.
+ */
+const secret = (raw) => (raw ? String(raw).trim() : '');
+
 /* --------------------------------------------------------------- upstream --- */
 
 const BIQUOTE_WS_FALLBACK = 'wss://biquote.io/hubs/tick';
@@ -86,7 +98,7 @@ const supabase = {
    * Service-role key. Server-side only: it bypasses RLS, so it must never
    * reach a browser. Used for candles, executions and the quota counter.
    */
-  SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_KEY ?? '',
+  SERVICE_ROLE_KEY: secret(process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_KEY),
   /**
    * When true a missing Supabase configuration aborts the boot instead of
    * degrading to in-memory only. Keep it false so `/health` stays green.
@@ -117,7 +129,7 @@ const auth = {
    * Development escape hatch: a static token that maps to a local synthetic
    * user. Hard-disabled in production so a leaked default can never pass.
    */
-  DEV_TOKEN: process.env.NODE_ENV === 'production' ? '' : (process.env.DEV_TOKEN ?? ''),
+  DEV_TOKEN: process.env.NODE_ENV === 'production' ? '' : secret(process.env.DEV_TOKEN),
 };
 
 /* ------------------------------------------------------------------ quota -- */
@@ -150,10 +162,10 @@ const broker = {
   MODE: upper(process.env.BROKER_MODE, 'paper'),
   BASE_URL: noSlash(process.env.BROKER_BASE_URL),
   /** Shared secret for the MT5 bridge, sent as an HMAC signature. */
-  TOKEN: process.env.BROKER_TOKEN ?? '',
-  TIMEOUT_MS: int(process.env.BROKER_TIMEOUT_MS, 10_000, 1_000, 120_000),
-  /** Simulated fill latency in paper mode (keeps the async path honest). */
+  /** Paper-mode simulated fill latency (keeps the async path honest). */
   PAPER_LATENCY_MS: int(process.env.BROKER_PAPER_LATENCY_MS, 40, 0, 5_000),
+  /** Shared secret for the MT5 bridge — trimmed, like every other credential. */
+  TOKEN: secret(process.env.BROKER_TOKEN),
   /** Fallback equity when a profile has none (USD). */
   DEFAULT_BALANCE: num(process.env.ACCOUNT_BALANCE, 10_000),
   /** Fallback risk per trade, as a fraction of balance (0.01 = 1%). */
@@ -287,7 +299,17 @@ export function publicEnv() {
   };
 }
 
-/** Startup report: loud about missing credentials, silent about tuning knobs. */
+/**
+ * Startup report. Two different problems produce the SAME Supabase error
+ * ("Invalid API key"), so they are called out separately here:
+ *
+ *   • a malformed credential (whitespace, truncated paste, wrong project)
+ *   • a valid credential but `schema.sql` was never run  → "relation does not
+ *     exist" on every query
+ *
+ * The first is fixed in the Render dashboard, the second by running the schema.
+ * Saying which one applies saves an hour of guessing.
+ */
 export function auditEnv() {
   const problems = [];
   const warnings = [];
@@ -298,7 +320,28 @@ export function auditEnv() {
       'quota persistence or Supabase auth (in-memory fallbacks active).';
     if (supabase.REQUIRED) problems.push(msg);
     else warnings.push(msg);
+  } else {
+    // Cheap structural checks. A service-role JWT has three dot-separated
+    // parts; `sb_secret_…` style keys do not, so neither shape is mandated —
+    // but whitespace or an obviously truncated value is worth naming loudly.
+    const key = supabase.SERVICE_ROLE_KEY;
+    if (/\s/.test(key)) {
+      problems.push('SUPABASE_SERVICE_ROLE_KEY still contains whitespace — re-enter it in Render without spaces.');
+    }
+    if (key.includes('...') || key.endsWith('…')) {
+      problems.push('SUPABASE_SERVICE_ROLE_KEY looks truncated (contains an ellipsis) — paste the full key.');
+    }
+    if (key.length < 40) {
+      problems.push(
+        `SUPABASE_SERVICE_ROLE_KEY is only ${key.length} characters — a real key is much longer. ` +
+          'Check that you copied the service_role key, not the URL or an id.'
+      );
+    }
+    if (!/^https?:\/\//i.test(supabase.URL) || !/\.supabase\.(co|in)$/i.test(supabase.URL)) {
+      warnings.push(`SUPABASE_URL "${supabase.URL}" does not look like a Supabase project URL.`);
+    }
   }
+
   if (!auth.DEV_TOKEN && !supabase.URL) {
     warnings.push(
       'No Supabase auth and no DEV_TOKEN set — the API surface is effectively closed. ' +
@@ -310,6 +353,11 @@ export function auditEnv() {
   }
   if (strategy.LEG1_PCT + strategy.LEG2_PCT > 1.0001) {
     problems.push('LEG1_PCT + LEG2_PCT exceeds 100% — legs would over-allocate.');
+  }
+  if (market.MAX_CANDLES < strategy.DONCHIAN_ENTRY + 1) {
+    problems.push(
+      `MAX_CANDLES (${market.MAX_CANDLES}) cannot hold a ${strategy.DONCHIAN_ENTRY}-day Donchian channel.`
+    );
   }
 
   return { problems, warnings, ready: problems.length === 0 };

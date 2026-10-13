@@ -27,6 +27,53 @@ import { normaliseSymbol, normaliseInterval, seriesKey } from '../config/db.js';
 
 const log = createLogger('supabase');
 
+/**
+ * Turn a PostgREST error into something actionable.
+ *
+ * Supabase reports four very different situations through one channel, and all
+ * of them otherwise surface as an identical log line. Telling them apart here
+ * is the difference between a two-minute fix and an hour of guessing:
+ *
+ *   "Invalid API key"                 → the KEY is wrong (whitespace/truncated/
+ *                                       wrong project). Fix in the dashboard.
+ *   "relation … does not exist"       → the key is GOOD, but schema.sql was
+ *                                       never run.
+ *   "permission denied for table …"   → the key is an anon/publishable key.
+ *                                       The service_role key is required.
+ *   "JWT expired"/401                 → the key was rotated or revoked.
+ *
+ * @returns {{error:string, remedy:string}}
+ */
+function diagnoseSupabaseError(message) {
+  const m = String(message ?? '');
+
+  if (/invalid api key/i.test(m)) {
+    return {
+      error: m,
+      remedy:
+        'The service_role key is not recognised. Check for a trailing newline or stray space, ' +
+        'that the key and URL belong to the SAME Supabase project, and that you copied ' +
+        'service_role (not anon / publishable) from Settings -> API.',
+    };
+  }
+  if (/does not exist|schema cache/i.test(m)) {
+    return {
+      error: m,
+      remedy: 'Credentials are valid but a table is missing. Run supabase/schema.sql in the Supabase SQL Editor.',
+    };
+  }
+  if (/permission denied|row-level security|unauthorized/i.test(m)) {
+    return {
+      error: m,
+      remedy: 'The key authenticated but lacks rights. This usually means the anon/publishable key was used instead of service_role.',
+    };
+  }
+  if (/jwt expired|jwt invalid/i.test(m)) {
+    return { error: m, remedy: 'The key was rotated or revoked. Copy a fresh service_role key from Settings -> API.' };
+  }
+  return { error: m, remedy: 'See the Supabase dashboard -> Logs -> API for the full request.' };
+}
+
 /** Shape of one candle row on its way into PostgREST. */
 const toRow = (symbol, timeframe, candle, closed) => ({
   symbol,
@@ -58,6 +105,12 @@ export class SupabaseService {
     this.flushTimer = null;
     this.flushing = false;
     this.stats = { queued: 0, flushed: 0, rows: 0, errors: 0, lastFlushError: null, lastFlushAt: 0 };
+
+    /**
+     * Distinct error messages already explained in the log. Prevents the same
+     * line repeating every flush interval when a credential is wrong.
+     */
+    this.reportedErrors = new Set();
 
     /** in-memory fallbacks so the engine behaves identically without Supabase */
     this.local = {
@@ -123,17 +176,27 @@ export class SupabaseService {
       this.lastHealth = { connected: false, configured: this.configured, mode: 'local', error: this.loadError, at: Date.now() };
       return this.lastHealth;
     }
+
     try {
       // A deliberately trivial RPC. On a schema that predates it the error is
       // "function does not exist" — which still proves the REST endpoint and
       // the credentials work, i.e. everything a health check cares about.
       const { error } = await this.client.rpc('aetheron_ping');
-      if (error && /not found|does not exist|schema cache|pg_proc/i.test(error.message ?? '')) {
+
+      if (!error) {
+        this.lastHealth = { connected: true, configured: true, mode: 'supabase', at: Date.now() };
+        return this.lastHealth;
+      }
+
+      const msg = error.message ?? String(error);
+
+      if (/not found|does not exist|schema cache|pg_proc/i.test(msg)) {
+        // Credentials are fine; the schema is simply older than this code.
         this.lastHealth = { connected: true, configured: true, mode: 'supabase', note: 'aetheron_ping not installed', at: Date.now() };
         return this.lastHealth;
       }
-      if (error) throw new Error(error.message);
-      this.lastHealth = { connected: true, configured: true, mode: 'supabase', at: Date.now() };
+
+      this.lastHealth = { connected: false, configured: true, mode: 'supabase', ...diagnoseSupabaseError(msg), at: Date.now() };
       return this.lastHealth;
     } catch (e) {
       this.lastHealth = { connected: false, configured: true, mode: 'supabase', error: e.message, at: Date.now() };
@@ -162,7 +225,16 @@ export class SupabaseService {
       const { data, error } = await promise;
       if (error) {
         this.stats.errors += 1;
-        log.error(`${what} failed:`, error.message ?? error);
+        const msg = error.message ?? String(error);
+        log.error(`${what} failed: ${msg}`);
+
+        // The candle queue retries every few seconds forever, so without this
+        // one bad credential would print an identical wall of red lines all
+        // day. Name the remedy the first time each distinct error appears.
+        if (!this.reportedErrors.has(msg)) {
+          this.reportedErrors.add(msg);
+          log.error(`  → ${diagnoseSupabaseError(msg).remedy}`);
+        }
         return null;
       }
       return data ?? null;
@@ -181,7 +253,48 @@ export class SupabaseService {
   }
 
   /* ======================================================================== */
-  /*  CANDLES — permanent storage                                           */
+  /*  BOOT VERIFICATION                                                       */
+  /* ======================================================================== */
+
+  /**
+   * Prove the credentials actually work, once, at startup.
+   *
+   * `createClient()` succeeds with ANY non-empty string — it makes no network
+   * call — so a typo'd or whitespace-padded key only reveals itself when the
+   * first write fails, minutes later, buried in a repeating log. This runs a
+   * real query immediately, while there is still a human watching the deploy.
+   *
+   * @returns {Promise<{ok:boolean, error?:string, remedy?:string, ms?:number}>}
+   */
+  async verify({ table = 'candles' } = {}) {
+    if (!this.client) {
+      return { ok: false, error: 'Supabase is not configured', remedy: 'Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.' };
+    }
+
+    const started = Date.now();
+    try {
+      const { error } = await this.client.from(table).select('*').limit(1);
+      if (!error) {
+        const ms = Date.now() - started;
+        log.ok(`credentials verified - "${table}" is reachable (${ms}ms)`);
+        return { ok: true, ms };
+      }
+
+      const msg = error.message ?? String(error);
+      const { remedy } = diagnoseSupabaseError(msg);
+      log.error(`credentials REJECTED by ${this.env.supabase.URL}: ${msg}`);
+      log.error(`  -> ${remedy}`);
+      return { ok: false, error: msg, remedy };
+    } catch (e) {
+      log.error(`could not reach ${this.env.supabase.URL}: ${e.message}`);
+      log.error('  -> Check the project URL and whether outbound HTTPS is allowed.');
+      return { ok: false, error: e.message, remedy: 'Check the project URL and outbound network access.' };
+    }
+  }
+
+  /* ======================================================================== */
+  /*  CANDLES - permanent storage                                           */
+  /* ======================================================================== */
   /* ======================================================================== */
 
   /**
