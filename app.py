@@ -15,7 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import logging
 
 from strategy_engine import LiveStrategyEngine, PAIRS, INITIAL_BALANCE
-from p import get_pip_size
+from p import get_pip_size, COMMISSION_USD
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -186,10 +186,12 @@ async def broadcast_updates():
 def get_dashboard_state():
     """Get current dashboard state"""
     pairs_data = []
+    from p import COMMISSION_USD
     for pair in PAIRS:
         state = engine.pairs_states[pair]
         total_pnl = state.get_total_pnl()
         win_rate = state.get_win_rate()
+        strategy_metrics = state.get_strategy_metrics()
         
         # Get latest price
         latest_price = state.latest_price
@@ -241,6 +243,7 @@ def get_dashboard_state():
             'last_update': state.last_update.isoformat(),
             'daily_losses': state.daily_losses,
             'equity_curve': equity_curve,
+            'strategy_metrics': strategy_metrics,
             'has_data': len(state.hourly_data) > 0
         })
     

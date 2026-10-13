@@ -209,8 +209,54 @@
             border: 1px solid rgba(138, 147, 194, 0.4);
         }
 
+        .strategy-progress {
+            background: linear-gradient(90deg, rgba(42, 48, 88, 0.3), rgba(22, 27, 45, 0.3));
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 0.875rem;
+        }
+
+        .strategy-title {
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 0.75rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 1px solid rgba(42, 48, 88, 0.5);
+        }
+
+        .strategy-metric {
+            background: rgba(10, 14, 39, 0.5);
+            border: 1px solid rgba(42, 48, 88, 0.5);
+            border-radius: 6px;
+            padding: 0.5rem;
+            text-align: center;
+        }
+
+        .strategy-label {
+            display: block;
+            color: var(--text-secondary);
+            font-size: 0.7rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .strategy-value {
+            display: block;
+            font-weight: 700;
+            font-size: 0.875rem;
+            color: var(--text-primary);
+        }
+
+        .strategy-value.positive {
+            color: var(--accent-green);
+        }
+
+        .strategy-value.negative {
+            color: var(--accent-red);
+        }
+
         .mini-chart-container {
-            height: 120px;
+            height: 100px;
             margin-top: 1rem;
             position: relative;
         }
@@ -456,6 +502,51 @@
                             <i class="fas fa-chart-line-down me-1"></i>أقصى انخفاض
                         </span>
                         <span class="metric-value negative">${data.drawdown.toFixed(2)}%</span>
+                    </div>
+                    
+                    <!-- Strategy Progress Section -->
+                    <div class="strategy-progress mt-3 mb-3">
+                        <h6 class="strategy-title">
+                            <i class="fas fa-analytics me-2"></i>تقدم الاستراتيجية
+                        </h6>
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <div class="strategy-metric">
+                                    <span class="strategy-label">صادرات الدخول</span>
+                                    <span class="strategy-value">${data.strategy_metrics.trades_entered}</span>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="strategy-metric">
+                                    <span class="strategy-label">صفقات مغلقة</span>
+                                    <span class="strategy-value">${data.strategy_metrics.trades_closed}</span>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="strategy-metric">
+                                    <span class="strategy-label">صفقات رابحة</span>
+                                    <span class="strategy-value positive">${data.strategy_metrics.trades_won}</span>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="strategy-metric">
+                                    <span class="strategy-label">صفقات خاسرة</span>
+                                    <span class="strategy-value negative">${data.strategy_metrics.trades_lost}</span>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="strategy-metric">
+                                    <span class="strategy-label">إجمالي Pips</span>
+                                    <span class="strategy-value ${data.strategy_metrics.total_pips >= 0 ? 'positive' : 'negative'}">${data.strategy_metrics.total_pips}</span>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="strategy-metric">
+                                    <span class="strategy-label">متوسط Pips</span>
+                                    <span class="strategy-value ${data.strategy_metrics.avg_pips >= 0 ? 'positive' : 'negative'}">${data.strategy_metrics.avg_pips}</span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                     
                     <!-- Mini Chart -->

@@ -110,6 +110,62 @@ class PairState:
         dd = (self.peak_balance - self.balance) / self.peak_balance
         return dd * 100
     
+    def get_strategy_metrics(self):
+        """Get strategy progress metrics"""
+        trades_closed = len(self.trades)
+        trades_entered = trades_closed + (1 if self.open_trade else 0)
+        
+        if trades_closed == 0:
+            return {
+                'trades_entered': trades_entered,
+                'trades_closed': 0,
+                'trades_won': 0,
+                'trades_lost': 0,
+                'trades_breakeven': 0,
+                'total_pips': 0.0,
+                'total_pips_won': 0.0,
+                'total_pips_lost': 0.0,
+                'avg_pips': 0.0,
+                'avg_pips_won': 0.0,
+                'avg_pips_lost': 0.0,
+                'best_trade_pips': 0.0,
+                'worst_trade_pips': 0.0,
+                'total_pnl': 0.0
+            }
+        
+        trades_won = sum(1 for t in self.trades if t.pnl > 0)
+        trades_lost = sum(1 for t in self.trades if t.pnl < 0)
+        trades_breakeven = trades_closed - trades_won - trades_lost
+        
+        total_pips = sum(t.pips for t in self.trades)
+        total_pips_won = sum(t.pips for t in self.trades if t.pips > 0)
+        total_pips_lost = sum(abs(t.pips) for t in self.trades if t.pips < 0)
+        
+        avg_pips = total_pips / trades_closed if trades_closed > 0 else 0
+        avg_pips_won = total_pips_won / trades_won if trades_won > 0 else 0
+        avg_pips_lost = total_pips_lost / trades_lost if trades_lost > 0 else 0
+        
+        best_trade_pips = max((t.pips for t in self.trades), default=0)
+        worst_trade_pips = min((t.pips for t in self.trades), default=0)
+        total_pnl = self.get_total_pnl()
+        
+        return {
+            'trades_entered': trades_entered,
+            'trades_closed': trades_closed,
+            'trades_won': trades_won,
+            'trades_lost': trades_lost,
+            'trades_breakeven': trades_breakeven,
+            'total_pips': round(total_pips, 2),
+            'total_pips_won': round(total_pips_won, 2),
+            'total_pips_lost': round(total_pips_lost, 2),
+            'avg_pips': round(avg_pips, 2),
+            'avg_pips_won': round(avg_pips_won, 2),
+            'avg_pips_lost': round(avg_pips_lost, 2),
+            'best_trade_pips': round(best_trade_pips, 2),
+            'worst_trade_pips': round(worst_trade_pips, 2),
+            'total_pnl': round(total_pnl, 2)
+        }
+    
     def close_trade(self, exit_price: float, timestamp: datetime):
         if self.open_trade and not self.open_trade.closed:
             trade = self.open_trade
