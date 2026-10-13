@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aetheron Live Trading Dashboard</title>
+    <!-- Bootstrap 5 CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Font Awesome -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0e27;
+            --bg-secondary: #11162b;
+            --bg-card: #161b2d;
+            --border-color: #2a3058;
+            --text-primary: #e1e4f5;
+            --text-secondary: #8a93c2;
+            --accent-green: #00ff88;
+            --accent-red: #ff4757;
+            --accent-blue: #3742fa;
+            --accent-yellow: #ffa502;
+        }
+
+        * {
+            font-family: 'Cairo', sans-serif;
+        }
+
+        body {
+            background: linear-gradient(135deg, var(--bg-primary) 0%, #050818 100%);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding-bottom: 2rem;
+        }
+
+        .navbar {
+            background: var(--bg-card) !important;
+            border-bottom: 2px solid var(--border-color);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+
+        .navbar-brand {
+            color: var(--accent-green) !important;
+            font-weight: 700;
+            font-size: 1.5rem;
+            letter-spacing: 1px;
+        }
+
+        .status-badge {
+            padding: 0.375rem 0.875rem;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 0.875rem;
+        }
+
+        .status-live {
+            background: linear-gradient(90deg, rgba(0, 255, 136, 0.2), rgba(0, 255, 136, 0.1));
+            color: var(--accent-green);
+            border: 1px solid rgba(0, 255, 136, 0.4);
+            animation: pulse 2s infinite;
+        }
+
+        .status-offline {
+            background: linear-gradient(90deg, rgba(255, 71, 87, 0.2), rgba(255, 71, 87, 0.1));
+            color: var(--accent-red);
+            border: 1px solid rgba(255, 71, 87, 0.4);
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                box-shadow: 0 0 0 0 rgba(0, 255, 136, 0.4);
+            }
+            50% {
+                box-shadow: 0 0 10px 3px rgba(0, 255, 136, 0.2);
+            }
+        }
+
+        .dashboard-header {
+            margin: 2rem 0;
+            text-align: center;
+        }
+
+        .dashboard-title {
+            font-size: 2rem;
+            font-weight: 700;
+            background: linear-gradient(90deg, #00ff88, #3742fa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+
+        .dashboard-subtitle {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .pairs-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+
+        .pair-card {
+            background: linear-gradient(180deg, var(--bg-card) 0%, rgba(22, 27, 45, 0.8) 100%);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+        }
+
+        .pair-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 25px rgba(0, 255, 136, 0.1);
+            border-color: rgba(0, 255, 136, 0.5);
+        }
+
+        .pair-card-header {
+            background: linear-gradient(90deg, rgba(55, 66, 250, 0.2), transparent);
+            padding: 1rem 1.25rem;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .pair-name {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin: 0;
+        }
+
+        .pair-balance {
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--accent-green);
+        }
+
+        .pair-card-body {
+            padding: 1.25rem;
+        }
+
+        .metric-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.75rem;
+            padding-bottom: 0.75rem;
+            border-bottom: 1px solid rgba(42, 48, 88, 0.5);
+        }
+
+        .metric-row:last-of-type {
+            border-bottom: none;
+            margin-bottom: 1rem;
+        }
+
+        .metric-label {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+
+        .metric-value {
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        .metric-value.positive {
+            color: var(--accent-green);
+        }
+
+        .metric-value.negative {
+            color: var(--accent-red);
+        }
+
+        .metric-value.neutral {
+            color: var(--text-secondary);
+        }
+
+        .trade-status {
+            display: inline-block;
+            padding: 0.25rem 0.625rem;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .trade-status.active-buy {
+            background: rgba(0, 255, 136, 0.15);
+            color: var(--accent-green);
+            border: 1px solid rgba(0, 255, 136, 0.4);
+        }
+
+        .trade-status.active-sell {
+            background: rgba(255, 71, 87, 0.15);
+            color: var(--accent-red);
+            border: 1px solid rgba(255, 71, 87, 0.4);
+        }
+
+        .trade-status.closed {
+            background: rgba(138, 147, 194, 0.15);
+            color: var(--text-secondary);
+            border: 1px solid rgba(138, 147, 194, 0.4);
+        }
+
+        .mini-chart-container {
+            height: 120px;
+            margin-top: 1rem;
+            position: relative;
+        }
+
+        .chart-canvas {
+            width: 100% !important;
+            height: 100% !important;
+        }
+
+        .last-update {
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            margin-top: 1rem;
+            padding-top: 0.75rem;
+            border-top: 1px solid rgba(42, 48, 88, 0.3);
+        }
+
+        .no-data {
+            color: var(--text-secondary);
+            text-align: center;
+            padding: 1rem;
+            font-style: italic;
+        }
+
+        .spinner-border-sm {
+            width: 0.75rem;
+            height: 0.75rem;
+        }
+
+        @media (max-width: 768px) {
+            .pairs-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .dashboard-title {
+                font-size: 1.5rem;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <!-- Navbar -->
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="#">
+                <i class="fas fa-chart-line me-2"></i>
+                Aetheron Core - Live Dashboard
+            </a>
+            <div class="d-flex align-items-center">
+                <span id="statusBadge" class="status-badge status-live">
+                    <i class="fas fa-wifi me-1"></i>
+                    متصل - مباشر
+                </span>
+                <span class="ms-3 text-secondary" id="lastUpdateTime"></span>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Dashboard Header -->
+    <div class="container-fluid">
+        <div class="dashboard-header">
+            <h1 class="dashboard-title">لوحة مراقبة التداول الحية</h1>
+            <p class="dashboard-subtitle">
+                عزل رأس المال: $100.00 لكل زوج • تحديث تلقائي كل 5 ثواني • WebSocket مباشر
+            </p>
+        </div>
+
+        <!-- Pairs Grid -->
+        <div class="pairs-grid" id="pairsGrid">
+            <!-- Pair cards will be dynamically generated -->
+        </div>
+    </div>
+
+    <!-- Bootstrap 5 JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <script>
+        let charts = {};
+        let reconnectInterval = null;
+        let ws = null;
+        
+        // Initialize dashboard
+        function initDashboard() {
+            fetchInitialData();
+            connectWebSocket();
+        }
+        
+        // Fetch initial data via REST API
+        async function fetchInitialData() {
+            try {
+                const response = await fetch('/api/state');
+                const data = await response.json();
+                updateDashboard(data);
+            } catch (error) {
+                console.error('Error fetching initial data:', error);
+            }
+        }
+        
+        // Connect WebSocket for real-time updates
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = function() {
+                console.log('WebSocket connected');
+                updateStatus(true);
+                if (reconnectInterval) {
+                    clearInterval(reconnectInterval);
+                    reconnectInterval = null;
+                }
+            };
+            
+            ws.onmessage = function(event) {
+                try {
+                    const message = JSON.parse(event.data);
+                    if (message.type === 'update') {
+                        updateDashboard(message.data);
+                        updateLastUpdateTime(message.timestamp);
+                    }
+                } catch (error) {
+                    console.error('Error parsing WebSocket message:', error);
+                }
+            };
+            
+            ws.onclose = function() {
+                console.log('WebSocket disconnected');
+                updateStatus(false);
+                // Attempt to reconnect after 3 seconds
+                if (!reconnectInterval) {
+                    reconnectInterval = setInterval(() => {
+                        connectWebSocket();
+                    }, 3000);
+                }
+            };
+            
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+            };
+        }
+        
+        // Update dashboard with new data
+        function updateDashboard(data) {
+            const grid = document.getElementById('pairsGrid');
+            grid.innerHTML = '';
+            
+            data.pairs.forEach(pairData => {
+                const card = createPairCard(pairData);
+                grid.appendChild(card);
+                updateMiniChart(pairData);
+            });
+        }
+        
+        // Create pair card HTML
+        function createPairCard(data) {
+            const card = document.createElement('div');
+            card.className = 'pair-card';
+            card.id = `card-${data.pair}`;
+            
+            // Determine trade status
+            let tradeStatusHtml = '';
+            if (data.open_trade) {
+                const sideClass = data.open_trade.side === 'BUY' ? 'active-buy' : 'active-sell';
+                const sideText = data.open_trade.side === 'BUY' ? 'شراء نشط' : 'بيع نشط';
+                tradeStatusHtml = `
+                    <span class="trade-status ${sideClass}">
+                        <i class="fas fa-dot-circle me-1"></i>${sideText}
+                    </span>
+                `;
+            } else {
+                tradeStatusHtml = `
+                    <span class="trade-status closed">
+                        <i class="fas fa-circle me-1"></i>لا يوجد صفقة
+                    </span>
+                `;
+            }
+            
+            // Determine PnL color
+            let pnlClass = 'neutral';
+            if (data.current_pnl > 0) pnlClass = 'positive';
+            else if (data.current_pnl < 0) pnlClass = 'negative';
+            
+            card.innerHTML = `
+                <div class="pair-card-header">
+                    <h5 class="pair-name">${data.pair}</h5>
+                    <span class="pair-balance">$${data.balance.toFixed(2)}</span>
+                </div>
+                <div class="pair-card-body">
+                    <!-- PnL -->
+                    <div class="metric-row">
+                        <span class="metric-label">
+                            <i class="fas fa-coins me-1"></i>صافي الربح/الخسارة
+                        </span>
+                        <span class="metric-value ${pnlClass}">
+                            $${data.current_pnl.toFixed(2)} (${data.pnl_pct.toFixed(2)}%)
+                        </span>
+                    </div>
+                    
+                    <!-- Trade Status -->
+                    <div class="metric-row">
+                        <span class="metric-label">
+                            <i class="fas fa-exchange-alt me-1"></i>حالة الصفقة
+                        </span>
+                        <span>${tradeStatusHtml}</span>
+                    </div>
+                    
+                    ${data.open_trade ? `
+                    <!-- Entry Info -->
+                    <div class="metric-row">
+                        <span class="metric-label">سعر الدخول</span>
+                        <span class="metric-value">${data.open_trade.entry_price.toFixed(5)}</span>
+                    </div>
+                    <div class="metric-row">
+                        <span class="metric-label">وقف الخسارة</span>
+                        <span class="metric-value negative">${data.open_trade.stop_loss.toFixed(5)}</span>
+                    </div>
+                    <div class="metric-row">
+                        <span class="metric-label">جني الأرباح</span>
+                        <span class="metric-value positive">${data.open_trade.take_profit.toFixed(5)}</span>
+                    </div>
+                    ` : ''}
+                    
+                    <!-- Stats -->
+                    <div class="metric-row">
+                        <span class="metric-label">
+                            <i class="fas fa-list me-1"></i>عدد الصفقات
+                        </span>
+                        <span class="metric-value">${data.total_trades}</span>
+                    </div>
+                    <div class="metric-row">
+                        <span class="metric-label">
+                            <i class="fas fa-percentage me-1"></i>نسبة النجاح
+                        </span>
+                        <span class="metric-value ${data.win_rate >= 50 ? 'positive' : data.win_rate > 0 ? 'negative' : 'neutral'}">
+                            ${data.win_rate.toFixed(1)}%
+                        </span>
+                    </div>
+                    <div class="metric-row">
+                        <span class="metric-label">
+                            <i class="fas fa-chart-line-down me-1"></i>أقصى انخفاض
+                        </span>
+                        <span class="metric-value negative">${data.drawdown.toFixed(2)}%</span>
+                    </div>
+                    
+                    <!-- Mini Chart -->
+                    <div class="mini-chart-container">
+                        <canvas class="chart-canvas" id="chart-${data.pair}"></canvas>
+                    </div>
+                    
+                    <div class="last-update">
+                        <i class="fas fa-clock me-1"></i>
+                        آخر تحديث: ${formatTime(data.last_update)}
+                    </div>
+                </div>
+            `;
+            
+            return card;
+        }
+        
+        // Update mini chart
+        function updateMiniChart(data) {
+            const canvasId = `chart-${data.pair}`;
+            const canvas = document.getElementById(canvasId);
+            if (!canvas) return;
+            
+            const ctx = canvas.getContext('2d');
+            
+            // Destroy existing chart if exists
+            if (charts[data.pair]) {
+                charts[data.pair].destroy();
+            }
+            
+            // Prepare data
+            const labels = data.equity_curve.map(ec => {
+                const date = new Date(ec.time);
+                return `${date.getHours()}:${String(date.getMinutes()).padStart(2, '0')}`;
+            });
+            const balances = data.equity_curve.map(ec => ec.balance);
+            
+            if (labels.length === 0) {
+                // Show no data message
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#8a93c2';
+                ctx.font = '12px Cairo';
+                ctx.textAlign = 'center';
+                ctx.fillText('لا توجد بيانات منحنى الرصيد', canvas.width / 2, canvas.height / 2);
+                return;
+            }
+            
+            // Create gradient
+            const gradient = ctx.createLinearGradient(0, 0, 0, 120);
+            gradient.addColorStop(0, 'rgba(0, 255, 136, 0.3)');
+            gradient.addColorStop(1, 'rgba(0, 255, 136, 0.05)');
+            
+            charts[data.pair] = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: balances,
+                        borderColor: '#00ff88',
+                        backgroundColor: gradient,
+                        fill: true,
+                        tension: 0.4,
+                        pointRadius: 0,
+                        pointHoverRadius: 4,
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false,
+                            backgroundColor: 'rgba(22, 27, 45, 0.9)',
+                            borderColor: '#2a3058',
+                            borderWidth: 1,
+                            titleColor: '#e1e4f5',
+                            bodyColor: '#e1e4f5',
+                            callbacks: {
+                                label: function(context) {
+                                    return 'الرصيد: $' + context.parsed.y.toFixed(2);
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            display: false,
+                            grid: {
+                                display: false
+                            }
+                        },
+                        y: {
+                            display: false,
+                            grid: {
+                                display: false
+                            }
+                        }
+                    },
+                    interaction: {
+                        mode: 'nearest',
+                        axis: 'x',
+                        intersect: false
+                    }
+                }
+            });
+        }
+        
+        // Update status badge
+        function updateStatus(connected) {
+            const badge = document.getElementById('statusBadge');
+            if (connected) {
+                badge.className = 'status-badge status-live';
+                badge.innerHTML = '<i class="fas fa-wifi me-1"></i>متصل - مباشر';
+            } else {
+                badge.className = 'status-badge status-offline';
+                badge.innerHTML = '<i class="fas fa-wifi-slash me-1"></i>غير متصل - يعيد الاتصال...';
+            }
+        }
+        
+        // Update last update time
+        function updateLastUpdateTime(timestamp) {
+            const timeEl = document.getElementById('lastUpdateTime');
+            timeEl.textContent = formatTime(timestamp);
+        }
+        
+        // Format time
+        function formatTime(isoString) {
+            const date = new Date(isoString);
+            return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}`;
+        }
+        
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', initDashboard);
+    </script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# Core Web Framework
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+websockets==12.0
+
+# Data & Trading
+pandas==2.2.2
+numpy==1.26.4
+ccxt==4.2.0  # For live market data (optional, can use other feeds)
+
+# Utilities
+python-dotenv==1.0.1
+pydantic==2.7.4
+pydantic-settings==2.3.3
+
+# Async & Scheduling
+apscheduler==3.10.4
+
+# Render Deployment
+gunicorn==22.0.0
