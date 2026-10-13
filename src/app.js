@@ -88,6 +88,15 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   const dbReady = await persistence.init();
   if (!dbReady && env.supabase.REQUIRED) throw new Error(persistence.loadError ?? 'Supabase is required');
 
+  // Prove the credentials work NOW. `createClient()` accepts any non-empty
+  // string, so without this the first sign of a bad key would be a wall of
+  // failing writes minutes later — long after the deploy log stopped being
+  // watched. Verified before anything else starts writing.
+  const dbVerified = dbReady ? await persistence.verify() : { ok: false, error: 'not configured' };
+  if (dbReady && !dbVerified.ok && env.supabase.REQUIRED) {
+    throw new Error(`Supabase credentials rejected: ${dbVerified.error}\n  -> ${dbVerified.remedy}`);
+  }
+
   /* ===================================================================== */
   /*  2. CORE SERVICES                                                     */
   /* ===================================================================== */
@@ -238,6 +247,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     hydrated: hydration,
     restoredPositions: restored,
     dbReady,
+    dbVerified,
     version: publicEnv().version,
   };
 
@@ -252,7 +262,11 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     database: {
       configured: persistence.configured,
       enabled: persistence.enabled,
+      verified: bootInfo.dbVerified.ok,
       lastProbe: persistence.lastHealth,
+      // When credentials are bad, surface the remedy on /health too — that is
+      // often the first place anyone looks.
+      remedy: bootInfo.dbVerified.remedy ?? null,
       queue: persistence.getQueueStats(),
     },
     market: market.summary(),
@@ -283,7 +297,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   if (env.market.TELEGRAM_ENABLED) {
     try {
       const { mountTelegramGateway } = await import('./routes/telegram.js');
-      telegram = mountTelegramGateway(app, { log: log.raw, warn: log.warn, err: log.error });
+      telegram = mountTelegramGateway(app, { log: log.raw.bind(log), warn: log.warn.bind(log), err: log.error.bind(log) });
     } catch (e) {
       log.warn('Telegram gateway unavailable:', e.message);
     }
@@ -353,7 +367,11 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   log.raw('  AETHERON CORE  ·  Quant Trading & Signal Backend');
   log.raw('  Paper Trading Streaming Engine — Eng Hasan Mohamad');
   log.raw('========================================================');
-  log.raw(`  Database    : ${dbReady ? `Supabase ✓ (${persistence.schema})` : 'LOCAL MODE — no Supabase'}`);
+  log.raw(`  Database    : ${dbVerified.ok ? `Supabase OK (${persistence.schema})` : dbReady ? `CONFIGURED BUT BROKEN — ${dbVerified.error}` : 'LOCAL MODE - no Supabase'}`);
+  if (dbReady && !dbVerified.ok) {
+    log.warn(`  Database    : candles are NOT being persisted. ${dbVerified.remedy}`);
+    log.warn(`               Engine keeps running on RAM; /health will show the error.`);
+  }
   log.raw(`  Hydration   : ${hydration.series} series / ${hydration.candles} candles rehydrated in ${hydration.ms}ms`);
   if (restored > 0) log.warn(`  Recovery    : ${restored} open position(s) restored from the audit log`);
   log.raw(`  Symbols     : ${SYMBOLS.join(', ')}`);
