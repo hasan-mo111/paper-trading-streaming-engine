@@ -19,6 +19,24 @@ PIP_VALUE_STD      = 10.0
 MAX_LOT_SIZE       = 5.0
 MIN_LOT_SIZE       = 0.01
 
+def get_pip_size(pair: str) -> float:
+    """Calculate pip size for different pairs"""
+    if 'JPY' in pair:
+        return 0.01
+    elif 'XAU' in pair or 'XAG' in pair:
+        return 0.1
+    else:
+        return 0.0001
+
+def get_base_price(pair: str) -> float:
+    """Get base price for pair"""
+    if 'XAU' in pair:
+        return 2000.0
+    elif 'JPY' in pair:
+        return 150.0
+    else:
+        return 1.25
+
 EMA_TREND_PERIOD   = 200
 RSI_PERIOD         = 14
 RSI_BUY_MIN        = 50
@@ -35,10 +53,11 @@ start_date = end_date - timedelta(days=5*365)
 dates = pd.date_range(start=start_date, end=end_date, freq='h')
 
 # حلقة تكرارية لتشغيل الاختبار على كل زوج على حدة
-for pair in PAIRS:
-    print(f"\n" + "="*60)
-    print(f"🔄 جاري اختبار الاستراتيجية على الزوج: {pair}")
-    print("="*60)
+if __name__ == "__main__":
+    for pair in PAIRS:
+        print(f"\n" + "="*60)
+        print(f"🔄 جاري اختبار الاستراتيجية على الزوج: {pair}")
+        print("="*60)
 
     # توليد مسار سعري خاص بكل زوج بخصائصه (مثل الذهب بسعر أضخم والعملات بنطاقاتها)
     np.random.seed(hash(pair) % 10000)
@@ -158,17 +177,19 @@ for pair in PAIRS:
         equity_curve.append({'time': ts, 'balance': balance})
 
     # النتائج الخاصة بالزوج الحالي
-    print(f"💵 الرصيد الأولي: ${INITIAL_BALANCE:.2f} ──> الرصيد النهائي لـ {pair}: ${balance:.2f}")
-    print(f"📊 إجمالي الصفقات: {len(trades)}")
-    if len(trades) > 0:
-        win_rate = len([t for t in trades if t['net_pnl'] > 0]) / len(trades) * 100
-        print(f"🎯 نسبة الصفقات الرابحة: {win_rate:.1f}%")
+    if __name__ == "__main__":
+        print(f"💵 الرصيد الأولي: ${INITIAL_BALANCE:.2f} ──> الرصيد النهائي لـ {pair}: ${balance:.2f}")
+        print(f"📊 إجمالي الصفقات: {len(trades)}")
+        if len(trades) > 0:
+            win_rate = len([t for t in trades if t['net_pnl'] > 0]) / len(trades) * 100
+            print(f"🎯 نسبة الصفقات الرابحة: {win_rate:.1f}%")
 
     # رسم منحنى الرصيد لكل زوج
-    eq_df = pd.DataFrame(equity_curve)
-    plt.figure(figsize=(10, 3))
-    plt.plot(eq_df['time'], eq_df['balance'], color='#2980b9', linewidth=1.5)
-    plt.title(f'{pair} - 5 Years Equity Curve', fontweight='bold')
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
+    if __name__ == "__main__":
+        eq_df = pd.DataFrame(equity_curve)
+        plt.figure(figsize=(10, 3))
+        plt.plot(eq_df['time'], eq_df['balance'], color='#2980b9', linewidth=1.5)
+        plt.title(f'{pair} - 5 Years Equity Curve', fontweight='bold')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
