@@ -1,11 +1,137 @@
-web: gunicorn app:app --host 0.0.0.0 --port $PORT
-worker: python -c "pass"
-render: |
-  services:
-    - type: web
-      name: aetheron-live-trading
-      env: python
-      buildCommand: pip install -r requirements.txt
-      startCommand: gunicorn app:app --host 0.0.0.0 --port $PORT --workers 1 --timeout 120
-      plan: starter
-      healthCheckPath: /api/state
+# =============================================================================
+#  Render Blueprint  —  Aetheron Core
+#  Developed by Eng Hasan Mohamad
+# -----------------------------------------------------------------------------
+#  Deploy:  https://render.com  →  New  →  Blueprint  →  point at this repo
+#
+#  BEFORE THE FIRST DEPLOY
+#  -----------------------
+#    1. Run supabase/schema.sql in the Supabase SQL Editor.
+#    2. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY as secret env vars
+#       (Render → the service → Environment).
+#    3. Deploy. Check /health — `database.lastProbe.connected` must be true.
+#
+#  ⚠ NEVER put the service-role key in the Android app or in git. It bypasses
+#    row-level security and is the single most sensitive value in this system.
+# =============================================================================
+
+services:
+  - type: web
+    name: paper-trading-streaming-engine
+    runtime: node
+
+    # ── Plan ──────────────────────────────────────────────────────────────
+    #   free     → $0, but the instance SLEEPS after 15 min without traffic.
+    #              With SSE clients attached it stays awake, yet every cold
+    #              start costs 30–60s, and a sleeping engine is an engine that
+    #              is not watching the 50-day channel.
+    #   starter  → $7/mo, always on, no cold start.   ← recommended
+    plan: starter
+
+    region: frankfurt      # frankfurt | oregon | ohio | singapore
+    branch: main
+    autoDeploy: true
+
+    # Production dependencies only (express, ws, @supabase/supabase-js).
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+
+    # /health returns 200 even when the upstream feed or Supabase is down, so a
+    # third-party outage never causes Render to kill and restart the service.
+    healthCheckPath: /health
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      # ── Supabase: set these as SECRETS in the Render dashboard ──────────
+      # Marked `sync: false` so the blueprint never carries a real key.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+
+      # ── Strategy ───────────────────────────────────────────────────────
+      # The published Aetheron Universal parameters. Changing these changes
+      # the strategy, so they are pinned explicitly rather than relying on
+      # in-code defaults.
+      - key: DONCHIAN_ENTRY
+        value: "50"
+      - key: DONCHIAN_EXIT
+        value: "20"
+      - key: ATR_PERIOD
+        value: "20"
+      - key: LEG1_PCT
+        value: "0.25"
+      - key: LEG2_PCT
+        value: "0.75"
+      - key: LEG1_ATR_MULT
+        value: "1"
+      - key: ENTRY_TIMEFRAME
+        value: "86400"
+      - key: ATR_TIMEFRAME
+        value: "3600"
+
+      # Start in paper mode. Flip to `mt5` only once BROKER_BASE_URL and
+      # BROKER_TOKEN are set and the bridge has been tested end to end.
+      - key: BROKER_MODE
+        value: paper
+      - key: STRATEGY_EXECUTION_ENABLED
+        value: "true"
+
+      # ── Freemium ───────────────────────────────────────────────────────
+      - key: FREE_DAILY_EXECUTIONS
+        value: "3"
+      - key: PRO_DAILY_EXECUTIONS
+        value: "0"           # 0 = unlimited
+      - key: AUTH_REQUIRED
+        value: "true"
+
+      # ── Market data ────────────────────────────────────────────────────
+      - key: UPSTREAM_WS
+        value: wss://biquote.io/hubs/tick
+      - key: UPSTREAM_API
+        value: https://biquote.io
+
+      # ── Streaming ──────────────────────────────────────────────────────
+      - key: STREAM_INTERVAL_MS
+        value: "400"
+      - key: SSE_HEARTBEAT_MS
+        value: "15000"
+      - key: MAX_CANDLES
+        value: "100"
+      - key: BOOTSTRAP_DAILY_CANDLES
+        value: "100"
+
+      # ── AI analyst (OpenRouter) ────────────────────────────────────────
+      # Set OPENROUTER_API_KEY as a SECRET in the Render dashboard.
+      # Any `:free` model id works; swap AI_SIGNAL_MODEL if the chosen model
+      # is retired. The analyst never places orders — it only publishes a
+      # multi-timeframe read to the chat stream and (optionally) Telegram.
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: AI_SIGNAL_ENABLED
+        value: "true"
+      - key: AI_SIGNAL_MODEL
+        value: openrouter/free
+      - key: AI_SIGNAL_SYMBOL
+        value: XAUUSD
+      - key: AI_SIGNAL_INTERVAL_MS
+        value: "1800000"      # 30 minutes
+      - key: AI_SIGNAL_MIN_RR
+        value: "2"
+
+      # ── Telegram signal delivery ───────────────────────────────────────
+      # TELEGRAM_BOT_TOKEN already exists in the service environment; it is
+      # referenced (not stored) here. TELEGRAM_CHAT_ID is optional — set it to
+      # a channel/private chat id to receive signals without device pairing.
+      - key: TELEGRAM_ENABLED
+        value: "true"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: AI_SIGNAL_TELEGRAM
+        value: "true"
+
+      # PORT and HOST are injected by Render — do not set them here.

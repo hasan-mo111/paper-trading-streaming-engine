@@ -48,6 +48,9 @@ export const CHAT_TYPES = Object.freeze({
   SYSTEM: 'SYSTEM',
   HEALTH: 'HEALTH',
   RISK: 'RISK',
+  // A multi-timeframe read produced by the AI analyst. Additive: clients that
+  // do not know it simply render the message text like any other chat line.
+  AI_SIGNAL: 'AI_SIGNAL',
 });
 
 export class SSEDispatcher {

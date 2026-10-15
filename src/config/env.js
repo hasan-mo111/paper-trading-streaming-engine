@@ -246,6 +246,59 @@ const market = {
   TELEGRAM_ENABLED: bool(process.env.TELEGRAM_ENABLED, false),
 };
 
+/* ---------------------------------------------------------------- ai analyst - */
+/*
+ *  The AI analyst is a SECOND, independent reader of the same candles the
+ *  strategy trades: it sends a multi-timeframe snapshot (D1/H4/H1/M15/M5) to a
+ *  model on OpenRouter and publishes the strict-JSON verdict it gets back as a
+ *  chat message and, optionally, a Telegram alert.
+ *
+ *  It never places an order. The model's `action` is text on a screen; the
+ *  strategy engine remains the only thing that can move a position. That is why
+ *  every value here is a display/behaviour knob, not an execution one.
+ */
+
+const ai = {
+  /** Master switch — the analyst idles unless enabled AND a key is present. */
+  ENABLED: bool(process.env.AI_SIGNAL_ENABLED, true),
+  /** OpenRouter key. Absent ⇒ `configured:false`, the loop never fires. */
+  OPENROUTER_API_KEY: secret(process.env.OPENROUTER_API_KEY),
+  /** OpenRouter model id — any `:free` model works, the name is configurable.
+   *  `openrouter/free` is the free-models router: it always resolves to a
+   *  currently-available free model, so the feature survives model rotation.
+   *  Pin a specific id (e.g. `nvidia/nemotron-3-ultra-550b-a55b:free`) if you
+   *  want deterministic behaviour. */
+  MODEL: process.env.AI_SIGNAL_MODEL?.trim() || 'openrouter/free',
+  /** Instrument the analyst reads (the prompt is written for XAU/USD). */
+  SYMBOL: upper(process.env.AI_SIGNAL_SYMBOL, 'XAUUSD'),
+  /** Cadence of the automatic analysis. */
+  INTERVAL_MS: int(process.env.AI_SIGNAL_INTERVAL_MS, 30 * 60_000, 60_000, 86_400_000),
+  /** Seconds a client must wait between manual triggers. */
+  MANUAL_COOLDOWN_S: int(process.env.AI_SIGNAL_MANUAL_COOLDOWN_S, 60, 5, 3_600),
+  /** Warm-up after boot before the first automatic analysis (let candles land). */
+  BOOT_DELAY_MS: int(process.env.AI_SIGNAL_BOOT_DELAY_MS, 120_000, 5_000, 3_600_000),
+  /** Hard timeout for the upstream model call. */
+  TIMEOUT_MS: int(process.env.AI_SIGNAL_TIMEOUT_MS, 60_000, 5_000, 300_000),
+  /** Max tokens the model may spend on its JSON signal. */
+  MAX_TOKENS: int(process.env.AI_SIGNAL_MAX_TOKENS, 900, 256, 4_000),
+  /** Minimum reward:risk a BUY/SELL must satisfy to be published. */
+  MIN_RR: num(process.env.AI_SIGNAL_MIN_RR, 2),
+  /** How far (fraction of price) an entry may sit from the live quote. */
+  MAX_ENTRY_DRIFT: num(process.env.AI_SIGNAL_MAX_ENTRY_DRIFT, 0.02),
+  /** Bars sent per timeframe — enough to trend, small enough for the free tier. */
+  BARS: {
+    D1: int(process.env.AI_SIGNAL_BARS_D1, 60, 20, 100),
+    H4: int(process.env.AI_SIGNAL_BARS_H4, 60, 20, 100),
+    H1: int(process.env.AI_SIGNAL_BARS_H1, 80, 20, 100),
+    M15: int(process.env.AI_SIGNAL_BARS_M15, 60, 20, 100),
+    M5: int(process.env.AI_SIGNAL_BARS_M5, 60, 20, 100),
+  },
+  /** Fan a published signal out to Telegram when a bot token is configured. */
+  TELEGRAM: bool(process.env.AI_SIGNAL_TELEGRAM, true),
+  /** Optional fixed chat/channel id — delivery without device pairing. */
+  TELEGRAM_CHAT_ID: secret(process.env.AI_SIGNAL_CHAT_ID ?? process.env.TELEGRAM_CHAT_ID),
+};
+
 /* ------------------------------------------------------------------- server - */
 
 const server = {
@@ -272,6 +325,7 @@ export const ENV = Object.freeze({
   stream,
   persistence,
   market,
+  ai,
 });
 
 /**
@@ -295,6 +349,17 @@ export function publicEnv() {
       leg1Pct: strategy.LEG1_PCT,
       leg2Pct: strategy.LEG2_PCT,
       leg1AtrMult: strategy.LEG1_ATR_MULT,
+    },
+    // Non-secret AI analyst summary: whether it is live, which model, cadence.
+    // The API key itself never appears here.
+    ai: {
+      enabled: ai.ENABLED && Boolean(ai.OPENROUTER_API_KEY),
+      configured: Boolean(ai.OPENROUTER_API_KEY),
+      model: ai.MODEL,
+      symbol: ai.SYMBOL,
+      intervalMs: ai.INTERVAL_MS,
+      minRR: ai.MIN_RR,
+      telegram: ai.TELEGRAM,
     },
   };
 }
@@ -357,6 +422,15 @@ export function auditEnv() {
   if (market.MAX_CANDLES < strategy.DONCHIAN_ENTRY + 1) {
     problems.push(
       `MAX_CANDLES (${market.MAX_CANDLES}) cannot hold a ${strategy.DONCHIAN_ENTRY}-day Donchian channel.`
+    );
+  }
+
+  // The AI analyst is optional: missing key disables it rather than blocking
+  // boot, but saying so out loud beats a silently idle feature.
+  if (ai.ENABLED && !ai.OPENROUTER_API_KEY) {
+    warnings.push(
+      'AI_SIGNAL_ENABLED is on but OPENROUTER_API_KEY is not set — the AI analyst stays idle. ' +
+        'Add the key in Render → Environment to activate it.'
     );
   }
 

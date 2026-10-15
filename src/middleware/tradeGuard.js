@@ -141,6 +141,8 @@ export function apiManifest() {
       'GET /api/user/engine',
       'GET /api/market/candles',
       'GET /api/market/price',
+      'GET /api/ai/signal',
+      'GET /api/ai/analyze',
       'GET /api/stream/prices',
       'GET /api/stream/chat-events',
       'GET /stream',

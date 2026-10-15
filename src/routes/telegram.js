@@ -216,6 +216,37 @@ export function mountTelegramGateway(app, { log = console.log, warn = console.wa
     });
   });
 
+  /* ------------------------------------------------------------- broadcast -- */
+
+  /**
+   * Fan a server-originated message out to every paired chat, plus an optional
+   * fixed chat/channel id supplied by env (TELEGRAM_CHAT_ID / AI_SIGNAL_CHAT_ID).
+   *
+   * This is how the AI analyst reaches Telegram without a client being online:
+   * the bot token stays here, and delivery works even if no device ever paired.
+   *
+   * @param {string} text HTML message (caller escapes untrusted content)
+   * @returns {Promise<number>} how many chats accepted the message
+   */
+  async function notifyAll(text) {
+    if (!cfg.token || !text) return 0;
+    const targets = new Set();
+    for (const d of devices.values()) if (d.chatId) targets.add(d.chatId);
+    const fixed = process.env.TELEGRAM_CHAT_ID ?? process.env.AI_SIGNAL_CHAT_ID;
+    if (fixed) targets.add(String(fixed));
+
+    let sent = 0;
+    for (const chatId of targets) {
+      try {
+        if (await sendMessage(chatId, text)) sent += 1;
+      } catch (e) {
+        err('Telegram broadcast failed:', e.message);
+      }
+    }
+    if (targets.size === 0) warn('⚠ Telegram broadcast skipped — no paired chat and no TELEGRAM_CHAT_ID set');
+    return sent;
+  }
+
   /* ---------------------------------------------------------- formatting -- */
 
   function format(event, p = {}) {
@@ -250,7 +281,9 @@ export function mountTelegramGateway(app, { log = console.log, warn = console.wa
       case 'margin_call':
         return `⚠️ <b>MARGIN CALL</b>\nEquity <b>${money(p.equity)}</b>\nMargin level <b>${p.marginLevel}%</b>`;
       case 'ai_signal':
-        return `🧠 <b>AI READ</b> ${p.symbol ?? ''} ${p.intervalLabel ?? ''}\n\n${p.summary ?? ''}`;
+        return p.summary
+          ? `🧠 <b>AI READ</b> ${p.symbol ?? ''} ${p.intervalLabel ?? ''}\n\n${p.summary}`
+          : `🧠 <b>AI READ</b> ${p.symbol ?? ''}\n\n${p.text ?? ''}`;
       default:
         return null;
     }
@@ -259,6 +292,10 @@ export function mountTelegramGateway(app, { log = console.log, warn = console.wa
   return {
     config: cfg,
     devices,
+    /** Server-side broadcast used by the AI analyst (see notifyAll above). */
+    notifyAll,
+    /** Send to one chat id — escape hatch for other server modules. */
+    send: sendMessage,
     stop: () => {
       if (pollTimer) clearTimeout(pollTimer);
       pollTimer = null;

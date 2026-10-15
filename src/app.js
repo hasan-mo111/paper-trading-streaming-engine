@@ -56,6 +56,8 @@ import { tradeGuard } from './middleware/tradeGuard.js';
 import { StrategyEngine, ENGINE_STATE } from './engine/strategyEngine.js';
 import { mountSseRoutes } from './routes/sse.js';
 import { mountUserRoutes } from './routes/user.js';
+import { mountAiRoutes } from './routes/ai.js';
+import { AiSignalService } from './services/aiSignal.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -136,6 +138,11 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
 
   const guard = tradeGuard({ logger: log });
   const rateLimiter = createRateLimiter({ logger: log });
+
+  // The AI analyst is fully independent of the strategy: it reads the same
+  // candles but can never place an order. Its Telegram handle is attached
+  // further down, once (and if) the gateway has mounted.
+  const aiSignal = new AiSignalService({ market, dispatcher, env });
 
   /* ===================================================================== */
   /*  3. REHYDRATE FROM SUPABASE                                           */
@@ -279,6 +286,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     quota: quota.stats(),
     auth: auth.service.stats(),
     broker: broker.status(),
+    ai: aiSignal.status(),
     sse: { ...hub.summary, chat: dispatcher.stats() },
     memoryMb: Math.round((process.memoryUsage().heapUsed / 1048576) * 10) / 10,
     hydration: bootInfo.hydrated,
@@ -291,13 +299,18 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   /* ===================================================================== */
   mountSseRoutes({ app, hub, dispatcher, market, auth, tradeGuard: guard, healthProvider: healthPayload });
   mountUserRoutes({ app, auth, quota, engine, broker, persistence, tradeGuard: guard, rateLimiter: rateLimiter.middleware });
+  mountAiRoutes({ app, ai: aiSignal, tradeGuard: guard });
 
   /* ---- optional Telegram chat-ops gateway ------------------------------ */
+  // Mount when explicitly enabled OR when a bot token exists (the AI analyst
+  // can then deliver signals to a configured chat even without device pairing).
   let telegram = null;
-  if (env.market.TELEGRAM_ENABLED) {
+  if (env.market.TELEGRAM_ENABLED || process.env.TELEGRAM_BOT_TOKEN) {
     try {
       const { mountTelegramGateway } = await import('./routes/telegram.js');
       telegram = mountTelegramGateway(app, { log: log.raw.bind(log), warn: log.warn.bind(log), err: log.error.bind(log) });
+      // Hand the gateway to the analyst for server-originated broadcasts.
+      aiSignal.attachTelegram(telegram);
     } catch (e) {
       log.warn('Telegram gateway unavailable:', e.message);
     }
@@ -358,6 +371,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   dispatcher.attachMarket(market);
   dispatcher.start();
   engine.start();
+  aiSignal.start();
 
   /* ===================================================================== */
   /*  9. BANNER + RETURN                                                   */
@@ -379,6 +393,15 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   log.raw(`  Broker      : ${env.broker.MODE}${env.strategy.EXECUTION_ENABLED ? '' : ' (execution DISABLED)'}`);
   log.raw(`  Strategy    : ${env.strategy.DONCHIAN_ENTRY}d entry · ${env.strategy.DONCHIAN_EXIT}d trail · ATR(${env.strategy.ATR_PERIOD}) sizing`);
   log.raw(`  Quota       : FREE ${env.quota.FREE_DAILY_EXECUTIONS}/day · PRO unlimited`);
+  log.raw(
+    `  AI analyst  : ${
+      aiSignal.enabled
+        ? `${env.ai.MODEL} every ${Math.round(env.ai.INTERVAL_MS / 60_000)}m on ${env.ai.SYMBOL}`
+        : env.ai.OPENROUTER_API_KEY
+          ? 'disabled (AI_SIGNAL_ENABLED=false)'
+          : 'idle — OPENROUTER_API_KEY not set'
+    }`
+  );
   log.raw(`  Streams     : /stream · /api/stream/prices · /api/stream/chat-events`);
   log.raw(`  Upstream    : ${env.upstream.WS}`);
   log.raw('========================================================');
@@ -398,6 +421,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     dispatcher.stop();
     rateLimiter.stop();
     engine.stop();
+    aiSignal.stop();
     feed.stop();
     hub.closeAll();
     telegram?.stop?.();
@@ -426,6 +450,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     feed,
     rateLimiter,
     telegram,
+    aiSignal,
     health: healthPayload,
     close,
     // Re-exported for the e2e suite / unit tests.
