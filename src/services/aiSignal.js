@@ -60,6 +60,18 @@ const MIN_BARS = 20;
 export const FALLBACK_MODEL = 'openrouter/free';
 
 /**
+ * Appended as an extra user turn when a model answers with prose instead of the
+ * JSON contract. Free routers (openrouter/free) pick a model at random, and some
+ * open with "Here's the setup…" and never emit an object at all — the parser
+ * then has nothing to salvage. One explicit correction recovers the cycle
+ * instead of burning a whole interval.
+ */
+export const JSON_CORRECTION =
+  'Your previous reply was not valid JSON. Reply with ONLY the JSON object described ' +
+  'in the schema — no prose, no markdown fences, no explanation before or after it. ' +
+  'The reply must start with "{" and end with "}".';
+
+/**
  * Pull the answer out of a chat message. OpenRouter keeps the final text in
  * `content`, but reasoning models may stash it in `reasoning_content` when the
  * token budget runs out first. Returns a trimmed string, or '' when there is
@@ -254,8 +266,30 @@ export class AiSignalService {
         return { ok: false, error: 'insufficient-data', reason, detail: snapshot.detail };
       }
 
-      const call = await this.#callWithFallback(snapshot);
-      const parsed = this.#parseJson(call.content);
+      let call = await this.#callWithFallback(snapshot);
+      let parsed = this.#parseJson(call.content);
+
+      if (!parsed.ok) {
+        // The HTTP call succeeded but the model answered with prose instead of
+        // the contract — there is no JSON object for the parser to salvage.
+        // Retry once with an explicit correction (and extra headroom, in case
+        // the preamble ate the token budget) rather than losing the interval.
+        const retryModel = this.cfg.MODEL === FALLBACK_MODEL ? call.model : FALLBACK_MODEL;
+        log.warn(
+          `AI analyst: reply was not JSON (${parsed.error}; finish_reason=${call.finishReason ?? 'unknown'}) ` +
+            `— retrying once on "${retryModel}" with a JSON-only correction`
+        );
+        this.stats.fallbacks = (this.stats.fallbacks ?? 0) + 1;
+        try {
+          call = await this.#askModel(snapshot, retryModel, Math.max(this.cfg.MAX_TOKENS, 4_000), {
+            correction: JSON_CORRECTION,
+          });
+          parsed = this.#parseJson(call.content);
+        } catch (e) {
+          log.warn('AI analyst: correction retry failed —', e.message);
+        }
+      }
+
       if (!parsed.ok) {
         this.stats.errors += 1;
         this.stats.lastError = `parse: ${parsed.error}`;
@@ -340,8 +374,15 @@ export class AiSignalService {
 
   /* ============================================================== model call */
 
-  async #askModel(snapshot, model = this.cfg.MODEL, maxTokens = this.cfg.MAX_TOKENS) {
+  async #askModel(snapshot, model = this.cfg.MODEL, maxTokens = this.cfg.MAX_TOKENS, { correction = null } = {}) {
     const user = buildUserMessage(snapshot);
+    const messages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: user },
+    ];
+    // A reply we could not parse gets one follow-up turn spelling out the
+    // contract; models that add a preamble usually comply on the second ask.
+    if (correction) messages.push({ role: 'user', content: correction });
     const body = {
       model,
       temperature: 0.2,
@@ -349,10 +390,7 @@ export class AiSignalService {
       // Best-effort JSON mode. Free models may ignore it; the parser is strict
       // either way, so an ignored flag degrades gracefully.
       response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: user },
-      ],
+      messages,
     };
 
     const res = await this.fetchFn('https://openrouter.ai/api/v1/chat/completions', {
@@ -393,7 +431,7 @@ export class AiSignalService {
           'A reasoning model likely spent its whole budget thinking — raise AI_SIGNAL_MAX_TOKENS or switch AI_SIGNAL_MODEL.'
       );
     }
-    return { content, model };
+    return { content, model, finishReason: json?.choices?.[0]?.finish_reason ?? null };
   }
 
   /**

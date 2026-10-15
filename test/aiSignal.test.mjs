@@ -20,7 +20,7 @@
 
 import assert from 'node:assert/strict';
 
-import { AiSignalService, SYSTEM_PROMPT, formatChat, formatTelegram } from '../src/services/aiSignal.js';
+import { AiSignalService, SYSTEM_PROMPT, formatChat, formatTelegram, JSON_CORRECTION } from '../src/services/aiSignal.js';
 import { CHAT_TYPES } from '../src/services/sseDispatcher.js';
 
 /* ------------------------------------------------------------ test harness */
@@ -444,6 +444,62 @@ await test('no second attempt when the primary IS the fallback model', async () 
   const res = await svc.run('manual');
   assert.equal(res.ok, false);
   assert.equal(fetchFn.calls.length, 1, 'must not retry the same model');
+});
+
+/* ---- 5c. prose replies get one corrected retry --------------------------- */
+
+await test('a prose reply with no JSON triggers a corrected retry that recovers', async () => {
+  const market = fakeMarket({ price: 2400 });
+  const dispatcher = fakeDispatcher();
+  const telegram = fakeTelegram();
+  const fetchFn = sequenceFetch([
+    { content: "Here's the setup I see on gold right now — momentum looks constructive, so..." },
+    { content: buySignal() },
+  ]);
+  const svc = new AiSignalService({ market, dispatcher, telegram, fetchFn });
+  const res = await svc.run('manual');
+
+  assert.equal(res.ok, true, 'the corrected retry should recover the cycle');
+  assert.equal(res.signal.action, 'BUY');
+  assert.equal(fetchFn.calls.length, 2, 'prose + corrected retry = 2 calls');
+
+  // The retry re-sends the original turn and appends the correction, with room.
+  const retry = fetchFn.calls[1].body;
+  assert.equal(retry.messages.length, 3);
+  assert.equal(retry.messages[2].role, 'user');
+  assert.equal(retry.messages[2].content, JSON_CORRECTION);
+  assert.ok(retry.max_tokens >= 4000, 'retry gets extra headroom');
+
+  assert.equal(dispatcher.pushed.length, 1, 'the recovered signal is published');
+  assert.equal(telegram.sent.length, 1);
+  assert.equal(svc.stats.fallbacks, 1);
+  assert.equal(svc.stats.errors, 0, 'a recovered cycle is not counted as an error');
+});
+
+await test('a prose reply on a non-fallback model retries on openrouter/free', async () => {
+  const market = fakeMarket({ price: 2400 });
+  const fetchFn = sequenceFetch([{ content: 'Sure, let me walk you through it.' }, { content: buySignal() }]);
+  const env = { ai: baseCfg({ MODEL: 'some/chatty-model:free' }) };
+  const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), telegram: fakeTelegram(), env, fetchFn });
+  const res = await svc.run('manual');
+
+  assert.equal(res.ok, true);
+  assert.equal(fetchFn.calls[0].body.model, 'some/chatty-model:free');
+  assert.equal(fetchFn.calls[1].body.model, 'openrouter/free', 'retry uses the fallback model');
+});
+
+await test('prose on both attempts fails cleanly and publishes nothing', async () => {
+  const market = fakeMarket({ price: 2400 });
+  const dispatcher = fakeDispatcher();
+  const fetchFn = sequenceFetch([{ content: 'no json in here' }, { content: 'still no json, sorry' }]);
+  const svc = new AiSignalService({ market, dispatcher, fetchFn });
+  const res = await svc.run('manual');
+
+  assert.equal(res.ok, false);
+  assert.equal(res.error, 'bad-model-output');
+  assert.equal(dispatcher.pushed.length, 0);
+  assert.equal(fetchFn.calls.length, 2);
+  assert.equal(svc.stats.errors, 1);
 });
 
 /* ---- 6. formatters ------------------------------------------------------- */
