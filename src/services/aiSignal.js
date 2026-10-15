@@ -571,6 +571,10 @@ export class AiSignalService {
         stop_loss: signal.stop_loss,
         take_profit_1: signal.take_profit_1,
         take_profit_2: signal.take_profit_2,
+        // Carried on the frame so a client (the mobile app) can render the whole
+        // trade — levels and rationale — from the event alone, without a
+        // follow-up read. Purely additive; the message text is unchanged.
+        reasoning: signal.reasoning,
         asOf: signal.asOf,
       },
     });

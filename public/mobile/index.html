@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+   AETHERON SIGNALS — mobile client (installable PWA)
+   ----------------------------------------------------------------------------
+   Two jobs, nothing else:
+     1. Draw the live market from the public SSE feed  → GET /stream
+        (events: snapshot, update, status)
+     2. Overlay the AI trade — entry / SL / TP1 / TP2 — which is delivered on the
+        SAME connection as a chat `message` of type AI_SIGNAL (the public feed
+        subscribes to the '*' channel, so it sees chat-ops frames too), and
+        re-hydrated on load from GET /api/ai/signal.
+
+   No token, no build step. Served by the existing express.static() mount, so
+   this file alone is the whole app.
+  ============================================================================
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0f16" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="Aetheron" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Aetheron Signals</title>
+
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+
+  <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+
+  <style>
+    :root {
+      --bg: #0b0f16;
+      --panel: #131a24;
+      --panel2: #1a2331;
+      --line: #243040;
+      --text: #e6edf6;
+      --muted: #8496ad;
+      --accent: #2b7fff;
+      --up: #26a69a;
+      --down: #ef5350;
+      --warn: #f0b429;
+      --safe-t: env(safe-area-inset-top, 0px);
+      --safe-b: env(safe-area-inset-bottom, 0px);
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg); color: var(--text);
+      font: 14px/1.4 "Segoe UI", Inter, system-ui, -apple-system, sans-serif;
+      display: flex; flex-direction: column;
+      height: 100vh; height: 100dvh;
+      overflow: hidden; overscroll-behavior: none;
+      user-select: none; -webkit-user-select: none;
+    }
+
+    /* ---------------- header ---------------- */
+    header {
+      display: flex; align-items: center; gap: 8px;
+      padding: calc(8px + var(--safe-t)) 10px 8px;
+      background: var(--panel); border-bottom: 1px solid var(--line);
+      flex: 0 0 auto;
+    }
+    .brand { font-weight: 800; letter-spacing: .5px; font-size: 12px; }
+    .brand span { color: var(--gold, #f0b429); }
+    select {
+      appearance: none; background: var(--panel2); color: var(--text);
+      border: 1px solid var(--line); border-radius: 8px;
+      padding: 7px 9px; font-size: 13px; font-weight: 600; outline: none;
+    }
+    select:focus { border-color: var(--accent); }
+    #pair { min-width: 92px; }
+    #tf { min-width: 62px; }
+    .pill {
+      margin-left: auto; display: inline-flex; align-items: center; gap: 6px;
+      background: var(--panel2); border: 1px solid var(--line); border-radius: 999px;
+      padding: 5px 10px; font-size: 11px; color: var(--muted); white-space: nowrap;
+    }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+    .pill.ok .dot { background: var(--up); box-shadow: 0 0 7px var(--up); }
+    .pill.warn .dot { background: var(--warn); box-shadow: 0 0 7px var(--warn); }
+    .pill.error .dot { background: var(--down); box-shadow: 0 0 7px var(--down); }
+
+    /* ---------------- price strip ---------------- */
+    .strip {
+      display: flex; align-items: baseline; gap: 10px;
+      padding: 6px 12px; background: var(--panel2); border-bottom: 1px solid var(--line);
+      flex: 0 0 auto; font-variant-numeric: tabular-nums;
+    }
+    .strip .sym { font-size: 12px; font-weight: 700; color: var(--muted); }
+    .strip .price { font-size: 20px; font-weight: 800; }
+    .strip .chg { font-size: 12px; }
+    .strip .spacer { flex: 1 1 auto; }
+    .strip .when { font-size: 11px; color: var(--muted); }
+    .up { color: var(--up); } .down { color: var(--down); } .warn { color: var(--warn); }
+    .muted { color: var(--muted); }
+
+    /* ---------------- chart ---------------- */
+    #wrap { position: relative; flex: 1 1 auto; min-height: 0; }
+    #chart { position: absolute; inset: 0; }
+    #overlay { position: absolute; inset: 0; pointer-events: none; }
+    #empty {
+      position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+      color: var(--muted); font-size: 13px; text-align: center; padding: 20px;
+    }
+    #empty.show { display: flex; }
+
+    /* floating trade legend (top-left of the chart) */
+    #legend {
+      position: absolute; top: 8px; left: 8px; display: none; flex-direction: column; gap: 4px;
+      background: rgba(11,15,22,.72); backdrop-filter: blur(6px);
+      border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px;
+      font-size: 11px; font-variant-numeric: tabular-nums; pointer-events: none;
+    }
+    #legend.show { display: flex; }
+    #legend .row { display: flex; align-items: center; gap: 7px; }
+    #legend .sw { width: 10px; height: 3px; border-radius: 2px; }
+    #legend .k { color: var(--muted); min-width: 34px; }
+    #legend .v { font-weight: 700; }
+
+    /* ---------------- signal sheet ---------------- */
+    #sheet {
+      flex: 0 0 auto; background: var(--panel); border-top: 1px solid var(--line);
+      padding-bottom: var(--safe-b); transition: max-height .22s ease;
+      max-height: 44vh; display: flex; flex-direction: column;
+    }
+    #sheet.collapsed { max-height: 74px; }
+    .handle {
+      all: unset; display: flex; align-items: center; justify-content: center;
+      padding: 7px 0 5px; cursor: pointer; flex: 0 0 auto;
+    }
+    .handle i { width: 40px; height: 4px; border-radius: 2px; background: var(--line); display: block; }
+    #sheetBody { overflow-y: auto; padding: 0 12px 12px; -webkit-overflow-scrolling: touch; }
+
+    .top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .badge {
+      font-weight: 800; font-size: 13px; letter-spacing: .5px;
+      padding: 3px 10px; border-radius: 7px; color: #04121a;
+    }
+    .badge.buy { background: var(--up); }
+    .badge.sell { background: var(--down); color: #fff; }
+    .badge.hold { background: var(--panel2); color: var(--muted); }
+    .sigSym { font-weight: 700; font-size: 13px; }
+    .chip {
+      font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 999px;
+      border: 1px solid var(--line); color: var(--muted);
+    }
+    .chip.high { color: var(--up); border-color: rgba(38,166,154,.5); }
+    .chip.medium { color: var(--warn); border-color: rgba(240,180,41,.5); }
+    .chip.low { color: var(--down); border-color: rgba(239,83,80,.5); }
+    .top .spacer { flex: 1 1 auto; }
+
+    .levels { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 9px; }
+    .cell {
+      display: flex; align-items: center; gap: 7px; background: var(--panel2);
+      border: 1px solid var(--line); border-left-width: 3px; border-radius: 8px;
+      padding: 6px 9px; font-variant-numeric: tabular-nums;
+    }
+    .cell .k { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
+    .cell .v { margin-left: auto; font-weight: 700; font-size: 14px; }
+
+    .metaRow { display: flex; align-items: center; gap: 10px; margin-top: 8px; font-size: 12px; }
+    .rr { font-weight: 700; }
+    .reason { font-size: 12.5px; color: #c3d0e2; margin: 8px 0 0; line-height: 1.5; }
+
+    .foot { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+    .foot .m { font-size: 10.5px; color: var(--muted); flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .btn {
+      all: unset; cursor: pointer; text-align: center;
+      background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+      padding: 7px 13px; font-size: 12px; font-weight: 600;
+    }
+    .btn:active { border-color: var(--accent); }
+    .note { font-size: 11px; color: var(--warn); margin-top: 7px; }
+    .waiting { color: var(--muted); font-size: 12.5px; padding: 12px 2px 4px; }
+
+    /* ---------------- toast ---------------- */
+    #toast {
+      position: fixed; left: 50%; bottom: calc(96px + var(--safe-b)); transform: translateX(-50%) translateY(12px);
+      background: var(--panel2); border: 1px solid var(--line); border-radius: 10px;
+      padding: 9px 14px; font-size: 12.5px; opacity: 0; transition: opacity .2s, transform .2s;
+      pointer-events: none; max-width: 90vw; text-align: center; z-index: 20;
+    }
+    #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  </style>
+</head>
+
+<body>
+  <header>
+    <div class="brand">AETHERON&nbsp;<span>SIGNALS</span></div>
+    <select id="pair" aria-label="Pair"></select>
+    <select id="tf" aria-label="Timeframe"></select>
+    <span class="pill" id="conn"><span class="dot"></span><span id="connText">connecting…</span></span>
+  </header>
+
+  <div class="strip">
+    <span class="sym" id="stripSym">—</span>
+    <span class="price" id="stripPrice">—</span>
+    <span class="chg" id="stripChg"></span>
+    <span class="spacer"></span>
+    <span class="when" id="stripWhen"></span>
+  </div>
+
+  <main id="wrap">
+    <div id="chart"></div>
+    <canvas id="overlay"></canvas>
+    <div id="legend"></div>
+    <div id="empty">Waiting for market data…</div>
+  </main>
+
+  <section id="sheet" class="collapsed">
+    <button class="handle" id="handle" aria-label="Toggle details"><i></i></button>
+    <div id="sheetBody">
+      <div id="sigWaiting" class="waiting">No AI signal yet — the analyst runs automatically every 30 minutes.</div>
+      <div id="sigCard" hidden>
+        <div class="top">
+          <span class="badge" id="sigAction">—</span>
+          <span class="sigSym" id="sigSymbol">—</span>
+          <span class="chip" id="sigConf">—</span>
+          <span class="spacer"></span>
+          <span class="muted" id="sigAge" style="font-size:11px"></span>
+        </div>
+        <div class="levels" id="sigLevels"></div>
+        <div class="metaRow">
+          <span class="rr" id="sigRR"></span>
+          <span class="muted" id="sigStatus"></span>
+        </div>
+        <p class="reason" id="sigReason"></p>
+        <div class="note" id="sigNote" hidden></div>
+        <div class="foot">
+          <span class="m" id="sigModel"></span>
+          <button class="btn" id="centerBtn">Center</button>
+          <button class="btn" id="refreshBtn">Refresh</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div id="toast"></div>
+
+  <script>
+  (() => {
+    'use strict';
+
+    const DEMO = new URLSearchParams(location.search).get('demo') === '1';
+    const FALLBACK_PAIRS = [
+      { code: 'XAUUSD', display: 'XAUUSD', digits: 2 },
+      { code: 'EURUSD', display: 'EURUSD', digits: 5 },
+      { code: 'USDJPY', display: 'USDJPY', digits: 3 },
+      { code: 'GBPUSD', display: 'GBPUSD', digits: 5 },
+    ];
+    const FALLBACK_TFS = [
+      { seconds: 300, label: '5m' }, { seconds: 900, label: '15m' },
+      { seconds: 3600, label: '1h' }, { seconds: 14400, label: '4h' },
+      { seconds: 86400, label: 'D1' },
+    ];
+    const DEFAULT_PAIR = 'XAUUSD';
+    const DEFAULT_TF = 900;
+
+    const $ = (id) => document.getElementById(id);
+    const wrap = $('wrap'), chartEl = $('chart'), overlay = $('overlay');
+    const pairSel = $('pair'), tfSel = $('tf');
+    const connPill = $('conn'), connText = $('connText');
+    const stripSym = $('stripSym'), stripPrice = $('stripPrice'), stripChg = $('stripChg'), stripWhen = $('stripWhen');
+    const emptyEl = $('empty'), legendEl = $('legend');
+    const sheet = $('sheet'), sheetBody = $('sheetBody');
+    const sigWaiting = $('sigWaiting'), sigCard = $('sigCard');
+    const toastEl = $('toast');
+
+    const state = {
+      pairs: FALLBACK_PAIRS, timeframes: FALLBACK_TFS, maxCandles: 100,
+      cache: new Map(), activeKey: null, activeSymbol: DEFAULT_PAIR,
+      source: null, gotSnapshot: false, lastUpdateAt: null,
+      signal: null, priceLines: [], overlayKey: '',
+    };
+
+    const keyOf = (sym, iv) => `${sym}|${iv}`;
+    const sameSymbol = (a, b) => String(a || '').replace(/[^A-Za-z]/g, '').toUpperCase() === String(b || '').replace(/[^A-Za-z]/g, '').toUpperCase();
+    const digitsOf = (sym) => (state.pairs.find((p) => sameSymbol(p.code, sym)) || {}).digits
+      ?? ((state.cache.get(state.activeKey) || {}).symbol && 2) ?? 2;
+    const fmtP = (sym, v) => (v == null || !isFinite(v)) ? '—' : Number(v).toFixed(digitsOf(sym));
+    const fmtDiff = (v) => (v == null || !isFinite(v)) ? '—' : (Math.abs(v) < 1 ? v.toFixed(5) : Math.abs(v) < 100 ? v.toFixed(3) : v.toFixed(2));
+    const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+    let toastTimer = null;
+    function toast(msg) {
+      toastEl.textContent = msg;
+      toastEl.classList.add('show');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2200);
+    }
+
+    /* ==================================================================
+     *  CHART
+     * ================================================================== */
+    const chart = LightweightCharts.createChart(chartEl, {
+      layout: { background: { color: '#0b0f16' }, textColor: '#8496ad', fontSize: 11 },
+      grid: { vertLines: { color: '#161e2a' }, horzLines: { color: '#161e2a' } },
+      crosshair: {
+        mode: LightweightCharts.CrosshairMode.Normal,
+        vertLine: { color: '#2b7fff', width: 1, style: 3, labelBackgroundColor: '#2b7fff' },
+        horzLine: { color: '#2b7fff', width: 1, style: 3, labelBackgroundColor: '#2b7fff' },
+      },
+      rightPriceScale: { borderColor: '#243040', scaleMargins: { top: 0.12, bottom: 0.12 } },
+      timeScale: { borderColor: '#243040', timeVisible: true, secondsVisible: false, rightOffset: 5, barSpacing: 8 },
+      handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
+      handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: true },
+      localization: { locale: 'en', priceFormatter: (p) => Number(p).toFixed(2) },
+    });
+
+    const candleSeries = chart.addCandlestickSeries({
+      upColor: '#26a69a', downColor: '#ef5350',
+      borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+      wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+      priceLineColor: '#2b7fff', priceLineStyle: 3, priceLineWidth: 1,
+    });
+
+    // Keep the whole trade on screen: expand the auto-scale to include the
+    // signal's levels whenever one is drawn for the visible symbol.
+    //
+    // NOTE the frame shape: AutoscaleInfo is { priceRange: { minValue, maxValue } }.
+    // Reading `min`/`max` here yields undefined → NaN → a poisoned price scale,
+    // after which every chart coordinate call silently returns 0.
+    const originalAutoscale = candleSeries.options().autoscaleInfoProvider;
+    candleSeries.applyOptions({
+      autoscaleInfoProvider: (original) => {
+        const res = (typeof original === 'function' ? original() : originalAutoscale?.()) ?? null;
+        if (!res || !res.priceRange) return res;
+        const { minValue, maxValue } = res.priceRange;
+        if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) return res;
+        const s = state.signal;
+        if (!s || !isTrade(s) || !sameSymbol(s.symbol, state.activeSymbol)) return res;
+        const lv = [s.entry_price, s.stop_loss, s.take_profit_1, s.take_profit_2].filter(Number.isFinite);
+        if (!lv.length) return res;
+        return { ...res, priceRange: { minValue: Math.min(minValue, ...lv), maxValue: Math.max(maxValue, ...lv) } };
+      },
+    });
+
+    const resize = () => {
+      chart.applyOptions({ width: wrap.clientWidth, height: wrap.clientHeight });
+      sizeOverlay();
+      scheduleOverlay(); // sizeOverlay() clears the canvas — repaint on the next frame
+    };
+    window.addEventListener('resize', resize);
+    window.addEventListener('orientationchange', () => setTimeout(resize, 120));
+    if (window.ResizeObserver) new ResizeObserver(resize).observe(wrap);
+
+    chart.timeScale().subscribeVisibleLogicalRangeChange(() => scheduleOverlay());
+    chart.subscribeCrosshairMove(() => scheduleOverlay());
+
+    /* ==================================================================
+     *  TRADE OVERLAY  (shaded risk / reward bands, synced to the price scale)
+     * ================================================================== */
+    let overlayRaf = 0;
+    function scheduleOverlay() {
+      if (overlayRaf) return;
+      overlayRaf = requestAnimationFrame(() => { overlayRaf = 0; drawOverlay(false); });
+    }
+
+    function sizeOverlay() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = wrap.clientWidth, h = wrap.clientHeight;
+      // Only the BACKING STORE is set here. The element's box is driven by CSS
+      // (`inset: 0`), so it always matches the chart exactly even if a resize
+      // lands a frame late — an explicit style width/height could disagree with
+      // the container and stretch the bands.
+      overlay.width = Math.max(1, Math.round(w * dpr));
+      overlay.height = Math.max(1, Math.round(h * dpr));
+      const ctx = overlay.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      state.overlayKey = '';
+    }
+
+    function paneBox() {
+      const w = wrap.clientWidth, h = wrap.clientHeight;
+      let psW = 58, tsH = 26;
+      try {
+        const ps = chart.priceScale('right');
+        if (ps && typeof ps.width === 'function') psW = ps.width() || psW;
+      } catch { /* older build */ }
+      try {
+        const ts = chart.timeScale();
+        // `size()` returns the axis' own box. `height()` is not reliable across
+        // builds — some return the whole chart height, which would collapse the
+        // pane to zero and cull every band.
+        const sz = typeof ts.size === 'function' ? ts.size() : null;
+        if (sz && sz.height > 0) tsH = sz.height;
+        else if (typeof ts.height === 'function') tsH = ts.height() || tsH;
+      } catch { /* older build */ }
+      tsH = Math.min(tsH, h * 0.5); // the time axis can never eat half the chart
+      return { w, h, paneW: Math.max(0, w - psW), paneH: Math.max(0, h - tsH) };
+    }
+
+    function drawOverlay(force) {
+      const ctx = overlay.getContext('2d');
+      const box = paneBox();
+      const s = state.signal;
+      const canDraw = s && isTrade(s) && sameSymbol(s.symbol, state.activeSymbol);
+
+      let yE, yS, y1, y2;
+      if (canDraw) {
+        yE = candleSeries.priceToCoordinate(s.entry_price);
+        yS = candleSeries.priceToCoordinate(s.stop_loss);
+        y1 = candleSeries.priceToCoordinate(s.take_profit_1);
+        y2 = candleSeries.priceToCoordinate(s.take_profit_2);
+      }
+      const drawable = canDraw && [yE, yS, y1, y2].every((v) => v != null);
+      const sig = drawable
+        ? [box.w, box.h, yE | 0, yS | 0, y1 | 0, y2 | 0, s.action, s.entry_price].join('|')
+        : 'none';
+
+      if (!force && sig === state.overlayKey) return;
+      state.overlayKey = sig;
+
+      ctx.clearRect(0, 0, box.w, box.h);
+      if (!drawable) return;
+
+      // Never clip to a degenerate pane: fall back to the full canvas.
+      const clipBottom = box.paneH > 1 ? box.paneH : box.h;
+      const band = (a, b, fill) => {
+        const top = Math.min(a, b), bot = Math.max(a, b);
+        if (bot <= 0 || top >= clipBottom || bot - top < 0.5) return;
+        ctx.fillStyle = fill;
+        ctx.fillRect(0, top, box.paneW, Math.min(bot, clipBottom) - top);
+      };
+
+      const isBuy = s.action === 'BUY';
+      band(yE, yS, 'rgba(239,83,80,0.15)');            // risk
+      band(yE, y1, 'rgba(38,166,154,0.14)');           // reward → TP1
+      band(y1, y2, 'rgba(38,166,154,0.07)');           // reward → TP2
+
+      // A crisp edge on the entry so the boundary is unmistakable.
+      ctx.fillStyle = 'rgba(43,127,255,0.9)';
+      ctx.fillRect(0, (yE | 0) - 1, box.paneW, 2);
+
+      // Direction affordance: a small arrow at the left edge of the reward band.
+      ctx.fillStyle = 'rgba(38,166,154,0.85)';
+      ctx.beginPath();
+      if (isBuy) { ctx.moveTo(7, yE - 6); ctx.lineTo(15, yE - 6); ctx.lineTo(11, yE - 13); }
+      else { ctx.moveTo(7, yE + 6); ctx.lineTo(15, yE + 6); ctx.lineTo(11, yE + 13); }
+      ctx.closePath(); ctx.fill();
+    }
+
+    /* ==================================================================
+     *  SELECTORS + RENDER
+     * ================================================================== */
+    function buildSelectors() {
+      if (![...pairSel.options].length) {
+        pairSel.innerHTML = state.pairs.map((p) => `<option value="${esc(p.code)}">${esc(p.display)}</option>`).join('');
+        tfSel.innerHTML = state.timeframes.map((t) => `<option value="${t.seconds}">${esc(t.label)}</option>`).join('');
+      }
+      pairSel.value = [...pairSel.options].some((o) => o.value === DEFAULT_PAIR) ? DEFAULT_PAIR : pairSel.options[0]?.value;
+      tfSel.value = [...tfSel.options].some((o) => o.value === String(DEFAULT_TF)) ? String(DEFAULT_TF) : tfSel.options[0]?.value;
+    }
+
+    function activeSeries() { return state.cache.get(state.activeKey) || null; }
+    const toLc = (c) => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close });
+
+    function render() {
+      const symbol = pairSel.value;
+      const interval = Number(tfSel.value);
+      state.activeKey = keyOf(symbol, interval);
+      state.activeSymbol = symbol;
+
+      const s = activeSeries();
+      const rows = s ? (s.current ? [...s.candles, s.current] : s.candles.slice()) : [];
+
+      if (!rows.length) {
+        candleSeries.setData([]);
+        emptyEl.classList.add('show');
+        legendEl.classList.remove('show');
+        stripPrice.textContent = '—'; stripChg.textContent = '';
+        stripSym.textContent = `${symbol} · ${tfSel.selectedOptions[0]?.textContent || interval}`;
+      } else {
+        candleSeries.setData(rows.map(toLc));
+        chart.timeScale().fitContent();
+        emptyEl.classList.remove('show');
+        paintStrip(s, rows);
+      }
+
+      applySignalToChart();
+      resize();
+      state.overlayKey = '';
+      drawOverlay(true);
+    }
+
+    function paintStrip(s, rows) {
+      const cur = s.current || rows[rows.length - 1];
+      if (!cur) return;
+      const prev = rows.length > 1 ? rows[rows.length - 2].close : null;
+      stripSym.textContent = `${s.symbol} · ${s.intervalLabel || tfSel.selectedOptions[0]?.textContent || ''}`;
+      stripPrice.textContent = fmtP(s.symbol, cur.close);
+      stripPrice.className = 'price ' + (cur.close >= cur.open ? 'up' : 'down');
+      if (prev) {
+        const d = cur.close - prev, pct = (d / prev) * 100;
+        stripChg.textContent = `${d >= 0 ? '▲' : '▼'} ${d >= 0 ? '+' : ''}${fmtDiff(d)} (${pct.toFixed(2)}%)`;
+        stripChg.className = 'chg ' + (d >= 0 ? 'up' : 'down');
+      } else stripChg.textContent = '';
+      updateStatus();
+    }
+
+    pairSel.addEventListener('change', () => { render(); renderSignal(); });
+    tfSel.addEventListener('change', () => { render(); });
+
+    /* ==================================================================
+     *  SIGNAL
+     * ================================================================== */
+    const isTrade = (s) => !!s && s.valid && (s.action === 'BUY' || s.action === 'SELL');
+
+    /** Normalise the two possible sources (REST lastSignal / SSE meta) into one shape. */
+    function normaliseSignal(raw) {
+      if (!raw) return null;
+      const action = String(raw.action || '').toUpperCase();
+      return {
+        action,
+        symbol: raw.symbol || 'XAUUSD',
+        valid: raw.valid !== false && action !== 'HOLD',
+        note: raw.note ?? null,
+        entry_price: Number(raw.entry_price),
+        stop_loss: Number(raw.stop_loss),
+        take_profit_1: Number(raw.take_profit_1),
+        take_profit_2: Number(raw.take_profit_2),
+        rr: Number(raw.rr) || 0,
+        confidence: raw.confidence_score || raw.confidence || 'Medium',
+        reasoning: raw.reasoning || '',
+        model: raw.model || '',
+        asOf: raw.asOf || new Date().toISOString(),
+      };
+    }
+
+    function setSignal(raw) {
+      const prev = state.signal;
+      state.signal = raw ? normaliseSignal(raw) : null;
+      // Preserve reasoning across a live SSE frame that omits it.
+      if (state.signal && !state.signal.reasoning && prev && !prev.reasoning) state.signal.reasoning = '';
+      renderSignal();
+      applySignalToChart();
+      if (raw && isTrade(state.signal) && (!prev || prev.action !== state.signal.action || prev.entry_price !== state.signal.entry_price)) {
+        legendEl.classList.add('show');
+      }
+    }
+
+    function applySignalToChart() {
+      for (const l of state.priceLines) { try { candleSeries.removePriceLine(l); } catch { /* gone */ } }
+      state.priceLines = [];
+
+      const s = state.signal;
+      if (!isTrade(s) || !sameSymbol(s.symbol, state.activeSymbol)) {
+        legendEl.classList.remove('show');
+        state.overlayKey = '';
+        drawOverlay(true);
+        return;
+      }
+      const line = (price, color, title, dashed, width) => candleSeries.createPriceLine({
+        price, color, lineWidth: width, lineStyle: dashed ? 2 : 0,
+        axisLabelVisible: true, title, lineVisible: true,
+      });
+      state.priceLines.push(line(s.take_profit_2, '#26a69a', 'TP2', true, 1));
+      state.priceLines.push(line(s.take_profit_1, '#26a69a', 'TP1', true, 1));
+      state.priceLines.push(line(s.stop_loss, '#ef5350', 'SL', true, 1));
+      state.priceLines.push(line(s.entry_price, '#2b7fff', 'ENTRY', false, 2));
+      legendEl.classList.add('show');
+      state.overlayKey = '';
+      drawOverlay(true);
+    }
+
+    function statusOf(s, price) {
+      if (!isTrade(s) || !Number.isFinite(price)) return null;
+      const { action, entry_price: e, stop_loss: sl, take_profit_1: t1, take_profit_2: t2 } = s;
+      const buy = action === 'BUY';
+      if (buy ? price <= sl : price >= sl) return { t: 'stopped out', c: 'down' };
+      if (buy ? price >= t2 : price <= t2) return { t: 'TP2 reached', c: 'up' };
+      if (buy ? price >= t1 : price <= t1) return { t: 'TP1 reached', c: 'up' };
+      if (buy ? price < e : price > e) return { t: 'waiting for entry', c: 'warn' };
+      return { t: 'running', c: 'up' };
+    }
+
+    function updateStatus() {
+      if (!isTrade(state.signal)) return;
+      const s = activeSeries();
+      const cur = s?.current || s?.candles?.[s.candles.length - 1];
+      const st = statusOf(state.signal, cur?.close);
+      const el = $('sigStatus');
+      el.textContent = st ? st.t : '';
+      el.className = 'muted ' + (st ? st.c : '');
+      const age = ageLabel(state.signal.asOf);
+      $('sigAge').textContent = age;
+    }
+
+    function ageLabel(asOf) {
+      const secs = Math.max(0, (Date.now() - new Date(asOf).getTime()) / 1000);
+      if (!isFinite(secs)) return '';
+      if (secs < 90) return `${Math.round(secs)}s ago`;
+      if (secs < 5400) return `${Math.round(secs / 60)}m ago`;
+      if (secs < 172800) return `${Math.round(secs / 3600)}h ago`;
+      return `${Math.round(secs / 86400)}d ago`;
+    }
+
+    function renderSignal() {
+      const s = state.signal;
+      if (!s) {
+        sigCard.hidden = true;
+        sigWaiting.hidden = false;
+        sigWaiting.textContent = 'No AI signal yet — the analyst runs automatically every 30 minutes.';
+        legendEl.classList.remove('show');
+        return;
+      }
+      sigWaiting.hidden = true;
+      sigCard.hidden = false;
+
+      const action = s.action === 'SELL' ? 'SELL' : s.action === 'BUY' ? 'BUY' : 'HOLD';
+      const badge = $('sigAction');
+      badge.textContent = action;
+      badge.className = 'badge ' + action.toLowerCase();
+      $('sigSymbol').textContent = s.symbol;
+      const conf = $('sigConf');
+      conf.textContent = s.confidence;
+      conf.className = 'chip ' + String(s.confidence).toLowerCase();
+      $('sigAge').textContent = ageLabel(s.asOf);
+
+      const lv = $('sigLevels');
+      if (!isTrade(s)) {
+        lv.innerHTML = '';
+        $('sigRR').textContent = '';
+        $('sigReason').textContent = s.reasoning || 'No high-probability setup — staying flat.';
+        $('sigStatus').textContent = 'no trade';
+        $('sigNote').hidden = true;
+      } else {
+        const cells = [
+          ['Entry', s.entry_price, '#2b7fff'],
+          ['Stop', s.stop_loss, '#ef5350'],
+          ['TP 1', s.take_profit_1, '#26a69a'],
+          ['TP 2', s.take_profit_2, '#26a69a'],
+        ];
+        lv.innerHTML = cells.map(([k, v, c]) =>
+          `<div class="cell" style="border-left-color:${c}"><span class="k">${k}</span><span class="v">${fmtP(s.symbol, v)}</span></div>`
+        ).join('');
+        $('sigRR').innerHTML = `R:R <span class="up">1:${s.rr ? s.rr.toFixed(2) : '—'}</span>`;
+        $('sigReason').textContent = s.reasoning || '—';
+        $('sigNote').hidden = true;
+        updateStatus();
+      }
+      $('sigModel').textContent = s.model ? `model: ${s.model}` : '';
+      legendEl.innerHTML = isTrade(s) ? [
+        ['#2b7fff', 'ENTRY', fmtP(s.symbol, s.entry_price)],
+        ['#ef5350', 'SL', fmtP(s.symbol, s.stop_loss)],
+        ['#26a69a', 'TP1', fmtP(s.symbol, s.take_profit_1)],
+        ['#26a69a', 'TP2', fmtP(s.symbol, s.take_profit_2)],
+      ].map(([c, k, v]) => `<div class="row"><span class="sw" style="background:${c}"></span><span class="k">${k}</span><span class="v">${v}</span></div>`).join('') : '';
+    }
+
+    /** Pull the authoritative last signal (carries `reasoning`, which the SSE meta omits). */
+    async function refreshSignal() {
+      try {
+        const res = await fetch('/api/ai/signal', { cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const j = await res.json();
+        if (j && j.lastSignal) setSignal(j.lastSignal);
+      } catch (e) {
+        if (!state.signal) sigWaiting.textContent = 'Waiting for a signal… (server unreachable)';
+      }
+    }
+
+    $('refreshBtn').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      toast('Refreshing signal…');
+      await refreshSignal();
+      toast(state.signal ? 'Signal updated' : 'No signal available');
+    });
+
+    $('centerBtn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      chart.timeScale().fitContent();
+      state.overlayKey = ''; drawOverlay(true);
+      toast('Centered');
+    });
+
+    $('handle').addEventListener('click', () => sheet.classList.toggle('collapsed'));
+
+    /* ==================================================================
+     *  SSE
+     * ================================================================== */
+    function setConn(stateName, text) {
+      connPill.className = 'pill ' + stateName;
+      connText.textContent = text;
+    }
+
+    function onSnapshot(msg) {
+      state.gotSnapshot = true;
+      state.maxCandles = msg.maxCandles || 100;
+      if (msg.pairs?.length) state.pairs = msg.pairs;
+      if (msg.timeframes?.length) state.timeframes = msg.timeframes;
+
+      state.cache.clear();
+      for (const [key, ser] of Object.entries(msg.series || {})) {
+        if (!ser.candles?.length && !ser.current) continue;
+        state.cache.set(key, {
+          symbol: ser.symbol, interval: ser.interval, intervalLabel: ser.intervalLabel,
+          candles: (ser.candles || []).slice(), current: ser.current || null,
+        });
+      }
+      buildSelectors();
+      render();
+      if (msg.upstream) setConn(msg.upstream.connected ? 'ok' : 'warn', msg.upstream.connected ? 'live' : 'reconnecting');
+    }
+
+    function onUpdate(msg) {
+      state.lastUpdateAt = Date.now();
+      for (const item of msg.items || []) {
+        let s = state.cache.get(item.key);
+        if (!s) {
+          s = { symbol: item.symbol, interval: item.interval, candles: [], current: null };
+          state.cache.set(item.key, s);
+        }
+        if (item.closed) {
+          s.candles.push(item.closed);
+          if (s.candles.length > state.maxCandles) s.candles.shift();
+        }
+        s.current = item.current;
+        if (item.key === state.activeKey) {
+          if (item.closed) candleSeries.update(toLc(item.closed));
+          if (item.current) candleSeries.update(toLc(item.current));
+        }
+      }
+      const s = activeSeries();
+      if (s) { emptyEl.classList.remove('show'); paintStrip(s, s.current ? [...s.candles, s.current] : s.candles); }
+      // The forming candle drifts the price scale, so the bands must follow.
+      scheduleOverlay();
+      stripWhen.textContent = new Date(msg.serverTime || Date.now()).toLocaleTimeString();
+    }
+
+    function connect() {
+      state.source?.close();
+      setConn('warn', 'connecting…');
+      const es = new EventSource('/stream');
+      state.source = es;
+
+      es.addEventListener('open', () => setConn('ok', 'live'));
+
+      es.addEventListener('snapshot', (e) => {
+        setConn('ok', 'live');
+        try { onSnapshot(JSON.parse(e.data)); } catch (err) { console.error('bad snapshot', err); }
+      });
+      es.addEventListener('update', (e) => {
+        try { onUpdate(JSON.parse(e.data)); } catch { /* ignore */ }
+      });
+      es.addEventListener('status', (e) => {
+        try { const m = JSON.parse(e.data); setConn(m.connected ? 'ok' : 'warn', m.connected ? 'live' : 'reconnecting'); }
+        catch { /* ignore */ }
+      });
+
+      // Chat-ops frames ride the same socket (the public feed subscribes to '*').
+      es.addEventListener('message', (e) => {
+        try {
+          const m = JSON.parse(e.data);
+          if (m?.type === 'AI_SIGNAL') {
+            setSignal(m.meta || null);
+            if (!m.meta?.reasoning) refreshSignal();   // pull the full record
+            toast(`AI signal · ${m.meta?.action || ''} ${m.meta?.symbol || ''}`.trim());
+            if (navigator.vibrate) navigator.vibrate(35);
+          }
+        } catch { /* ignore */ }
+      });
+
+      es.addEventListener('error', () => {
+        if (es.readyState === EventSource.CLOSED) setConn('error', 'offline');
+        else setConn('warn', 'retrying…');
+      });
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) { scheduleOverlay(); updateStatus(); }
+    });
+
+    /* ==================================================================
+     *  DEMO (?demo=1) — deterministic sample so the overlay can be previewed
+     * ================================================================== */
+    function loadDemo() {
+      state.pairs = FALLBACK_PAIRS;
+      state.cache.set(keyOf('XAUUSD', 900), {
+        symbol: 'XAUUSD', interval: 900, intervalLabel: '15m', current: null,
+        candles: Array.from({ length: 80 }, (_, i) => {
+          const base = 4100 + i * 0.9 + Math.sin(i / 3) * 6;
+          const o = base, c = base + (i % 5 - 2) * 1.4;
+          return { time: Math.floor(Date.now() / 1000) - (80 - i) * 900, open: o, high: Math.max(o, c) + 3, low: Math.min(o, c) - 3, close: c };
+        }),
+      });
+      buildSelectors();
+      render();
+      setSignal({
+        action: 'BUY', symbol: 'XAUUSD', valid: true,
+        entry_price: 4166, stop_loss: 4152, take_profit_1: 4188, take_profit_2: 4205,
+        rr: 2.79, confidence_score: 'Medium', model: 'openrouter/free',
+        asOf: new Date().toISOString(),
+        reasoning: 'Daily and 4H remain in a clean bullish structure with higher highs. Price swept the 1H sell-side liquidity and reclaimed the 15m range high, so the pullback into 4166 is the execution zone with the stop beyond the swing low at 4152.',
+      });
+      setConn('ok', 'demo');
+    }
+
+    /* ==================================================================
+     *  BOOT
+     * ================================================================== */
+    (function boot() {
+      buildSelectors();
+      sizeOverlay();
+      resize();
+
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('sw.js').catch(() => { /* http/dev: fine */ });
+      }
+
+      if (DEMO) { loadDemo(); return; }
+      refreshSignal();
+      connect();
+    })();
+  })();
+  </script>
+</body>
+</html>
