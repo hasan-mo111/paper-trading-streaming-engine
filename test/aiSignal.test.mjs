@@ -93,7 +93,7 @@ function baseCfg(over = {}) {
     MANUAL_COOLDOWN_S: 60,
     BOOT_DELAY_MS: 120_000,
     TIMEOUT_MS: 5_000,
-    MAX_TOKENS: 900,
+    MAX_TOKENS: 2000,
     MIN_RR: 2,
     MAX_ENTRY_DRIFT: 0.02,
     BARS: { D1: 60, H4: 60, H1: 80, M15: 60, M5: 60 },
@@ -139,6 +139,21 @@ function fakeFetch(content, { ok = true, status = 200 } = {}) {
   fn.calls = calls;
   return fn;
 }
+
+/** A fetch stub that returns a SEQUENCE of raw message objects, one per call.
+ *  Used to exercise the fallback path: first call empty, second call valid. */
+function sequenceFetch(messages) {
+  const calls = [];
+  const fn = async (url, opts) => {
+    calls.push({ url, opts, body: JSON.parse(opts.body) });
+    const msg = messages[Math.min(calls.length - 1, messages.length - 1)];
+    return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ finish_reason: 'stop', message: msg }] }) };
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+const EMPTY = { content: '' };
 
 const buySignal = (entry = 2400, sl = 2390, tp1 = 2415, tp2 = 2425) =>
   JSON.stringify({
@@ -377,6 +392,57 @@ await testAsync('a slow model call cannot be overlapped (busy guard)', async () 
   assert.equal(a.ok, true);
   assert.equal(b.ok, false);
   assert.equal(b.error, 'busy');
+});
+
+/* ---- 5b. fallback + reasoning ------------------------------------------- */
+
+await test('an empty completion from the primary model falls back to openrouter/free', async () => {
+  const market = fakeMarket({ price: 2400 });
+  const fetchFn = sequenceFetch([EMPTY, { content: buySignal() }]);
+  const env = { ai: baseCfg({ MODEL: 'nvidia/nemotron-3-ultra-550b-a55b:free' }) };
+  const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), telegram: fakeTelegram(), env, fetchFn });
+  const res = await svc.run('manual');
+  assert.equal(res.ok, true, 'fallback should recover');
+  assert.equal(fetchFn.calls.length, 2, 'primary + fallback = 2 calls');
+  // First call is the configured model, second is the fallback with more room.
+  assert.equal(fetchFn.calls[0].body.model, 'nvidia/nemotron-3-ultra-550b-a55b:free');
+  assert.equal(fetchFn.calls[1].body.model, 'openrouter/free');
+  assert.ok(fetchFn.calls[1].body.max_tokens >= 8000, 'fallback gets extra headroom');
+  assert.equal(svc.stats.fallbacks, 1);
+});
+
+await test('reasoning_content is used when content is empty', async () => {
+  const market = fakeMarket({ price: 2400 });
+  const fetchFn = sequenceFetch([{ content: '', reasoning_content: buySignal() }]);
+  const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), telegram: fakeTelegram(), fetchFn });
+  const res = await svc.run('manual');
+  assert.equal(res.ok, true, 'reasoning_content should satisfy the parser');
+  assert.equal(res.signal.action, 'BUY');
+  assert.equal(fetchFn.calls.length, 1, 'no fallback needed');
+});
+
+await test('empty completion on the fallback model surfaces a diagnostic', async () => {
+  const market = fakeMarket({ price: 2400 });
+  const fetchFn = sequenceFetch([EMPTY, EMPTY]);
+  // Force a non-fallback primary so the fallback is actually attempted.
+  const env = { ai: baseCfg({ MODEL: 'nvidia/nemotron-3-ultra-550b-a55b:free' }) };
+  const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), env, fetchFn });
+  const res = await svc.run('manual');
+  assert.equal(res.ok, false);
+  assert.equal(res.error, 'exception');
+  assert.match(res.detail, /empty completion/);
+  assert.match(res.detail, /AI_SIGNAL_MAX_TOKENS|AI_SIGNAL_MODEL/);
+  assert.equal(fetchFn.calls.length, 2);
+});
+
+await test('no second attempt when the primary IS the fallback model', async () => {
+  const market = fakeMarket({ price: 2400 });
+  const fetchFn = sequenceFetch([EMPTY]);
+  const env = { ai: baseCfg({ MODEL: 'openrouter/free' }) };
+  const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), env, fetchFn });
+  const res = await svc.run('manual');
+  assert.equal(res.ok, false);
+  assert.equal(fetchFn.calls.length, 1, 'must not retry the same model');
 });
 
 /* ---- 6. formatters ------------------------------------------------------- */

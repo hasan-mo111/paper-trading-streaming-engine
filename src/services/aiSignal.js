@@ -51,6 +51,28 @@ const FRAMES = Object.freeze([
 /** Minimum closed bars per timeframe before we consider the data usable. */
 const MIN_BARS = 20;
 
+/**
+ * The generic OpenRouter free-model router. Used once, as a fallback, whenever
+ * the configured model returns an unusable (typically empty) completion — free
+ * models rotate and reasoning variants sometimes burn their whole token budget
+ * on thought without emitting an answer. One retry keeps the analyst alive.
+ */
+export const FALLBACK_MODEL = 'openrouter/free';
+
+/**
+ * Pull the answer out of a chat message. OpenRouter keeps the final text in
+ * `content`, but reasoning models may stash it in `reasoning_content` when the
+ * token budget runs out first. Returns a trimmed string, or '' when there is
+ * genuinely nothing usable.
+ */
+function pickContent(message) {
+  for (const key of ['content', 'reasoning_content', 'reasoning']) {
+    const v = message?.[key];
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return '';
+}
+
 /* ------------------------------------------------------------ system prompt */
 /*
  *  Kept verbatim in spirit to the desk instruction: bias → zone → risk, with a
@@ -127,6 +149,7 @@ export class AiSignalService {
       holds: 0,
       rejected: 0,
       errors: 0,
+      fallbacks: 0,
       lastRunAt: null,
       lastError: null,
       lastModel: null,
@@ -230,8 +253,8 @@ export class AiSignalService {
         return { ok: false, error: 'insufficient-data', reason, detail: snapshot.detail };
       }
 
-      const raw = await this.#askModel(snapshot);
-      const parsed = this.#parseJson(raw);
+      const call = await this.#callWithFallback(snapshot);
+      const parsed = this.#parseJson(call.content);
       if (!parsed.ok) {
         this.stats.errors += 1;
         this.stats.lastError = `parse: ${parsed.error}`;
@@ -245,7 +268,7 @@ export class AiSignalService {
       this.stats.runs += 1;
       this.stats.lastRunAt = Date.now();
       this.stats.lastLatencyMs = latency;
-      this.stats.lastModel = this.cfg.MODEL;
+      this.stats.lastModel = call.model;
       this.lastSignal = signal;
 
       if (signal.action === 'HOLD') this.stats.holds += 1;
@@ -313,12 +336,12 @@ export class AiSignalService {
 
   /* ============================================================== model call */
 
-  async #askModel(snapshot) {
+  async #askModel(snapshot, model = this.cfg.MODEL, maxTokens = this.cfg.MAX_TOKENS) {
     const user = buildUserMessage(snapshot);
     const body = {
-      model: this.cfg.MODEL,
+      model,
       temperature: 0.2,
-      max_tokens: this.cfg.MAX_TOKENS,
+      max_tokens: maxTokens,
       // Best-effort JSON mode. Free models may ignore it; the parser is strict
       // either way, so an ignored flag degrades gracefully.
       response_format: { type: 'json_object' },
@@ -354,11 +377,42 @@ export class AiSignalService {
       const detail = json?.error?.message ?? text.slice(0, 200) ?? res.status;
       throw new Error(`OpenRouter ${res.status}: ${detail}`);
     }
-    const content = json?.choices?.[0]?.message?.content;
-    if (typeof content !== 'string' || !content.trim()) {
-      throw new Error('OpenRouter returned an empty completion');
+
+    const msg = json?.choices?.[0]?.message ?? {};
+    // Some reasoning models stash the final answer in `reasoning_content` when
+    // the token budget runs out before `content` is written. Check both.
+    const content = pickContent(msg);
+    if (!content) {
+      const finish = json?.choices?.[0]?.finish_reason ?? 'unknown';
+      throw new Error(
+        `empty completion from "${model}" (finish_reason=${finish}, max_tokens=${maxTokens}). ` +
+          'A reasoning model likely spent its whole budget thinking — raise AI_SIGNAL_MAX_TOKENS or switch AI_SIGNAL_MODEL.'
+      );
     }
-    return content;
+    return { content, model };
+  }
+
+  /**
+   * Ask the configured model; if that yields nothing usable, fall back once to
+   * the generic free router with extra headroom. Free models are flaky and
+   * reasoning variants often burn their token budget on thought and return an
+   * empty `content` — a single, well-scoped retry keeps the analyst alive
+   * instead of reporting a hard error to the operator.
+   *
+   * @returns {Promise<{content:string, model:string}>}
+   */
+  async #callWithFallback(snapshot) {
+    try {
+      return await this.#askModel(snapshot);
+    } catch (primaryErr) {
+      const fallback = FALLBACK_MODEL;
+      if (this.cfg.MODEL === fallback) throw primaryErr;
+      log.warn(`AI analyst: ${primaryErr.message} — retrying once on "${fallback}"`);
+      this.stats.fallbacks = (this.stats.fallbacks ?? 0) + 1;
+      // Extra headroom: the common empty-completion cause is a reasoning model
+      // exhausting max_tokens before it emits the answer.
+      return await this.#askModel(snapshot, fallback, Math.max(this.cfg.MAX_TOKENS, 8_000));
+    }
   }
 
   /* ================================================================ parsing */
@@ -560,7 +614,7 @@ const DEFAULTS = Object.freeze({
   MANUAL_COOLDOWN_S: 60,
   BOOT_DELAY_MS: 120_000,
   TIMEOUT_MS: 60_000,
-  MAX_TOKENS: 900,
+  MAX_TOKENS: 2000,
   MIN_RR: 2,
   MAX_ENTRY_DRIFT: 0.02,
   BARS: { D1: 60, H4: 60, H1: 80, M15: 60, M5: 60 },

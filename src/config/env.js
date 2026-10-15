@@ -279,8 +279,10 @@ const ai = {
   BOOT_DELAY_MS: int(process.env.AI_SIGNAL_BOOT_DELAY_MS, 120_000, 5_000, 3_600_000),
   /** Hard timeout for the upstream model call. */
   TIMEOUT_MS: int(process.env.AI_SIGNAL_TIMEOUT_MS, 60_000, 5_000, 300_000),
-  /** Max tokens the model may spend on its JSON signal. */
-  MAX_TOKENS: int(process.env.AI_SIGNAL_MAX_TOKENS, 900, 256, 4_000),
+  /** Max tokens the model may spend on its JSON signal. Reasoning models burn
+   *  part of this budget on chain-of-thought, so it must be generous enough to
+   *  still let the answer be written (empty `content` otherwise). */
+  MAX_TOKENS: int(process.env.AI_SIGNAL_MAX_TOKENS, 2000, 256, 8_000),
   /** Minimum reward:risk a BUY/SELL must satisfy to be published. */
   MIN_RR: num(process.env.AI_SIGNAL_MIN_RR, 2),
   /** How far (fraction of price) an entry may sit from the live quote. */
