@@ -216,6 +216,7 @@ export class AiSignalService {
       model: this.cfg.MODEL,
       intervalMs: this.cfg.INTERVAL_MS,
       bootDelayMs: this.cfg.BOOT_DELAY_MS,
+      maxTokens: this.cfg.MAX_TOKENS,
       minRR: this.cfg.MIN_RR,
       telegram: Boolean(this.cfg.TELEGRAM && (this.telegram || this.cfg.TELEGRAM_CHAT_ID)),
       ...this.stats,
@@ -263,6 +264,9 @@ export class AiSignalService {
       }
 
       const signal = this.#validate(parsed.value, snapshot);
+      // The turn may have been served by the fallback model — report the model
+      // that actually answered, not the one that was configured.
+      signal.model = call.model;
       const latency = Date.now() - startedAt;
 
       this.stats.runs += 1;

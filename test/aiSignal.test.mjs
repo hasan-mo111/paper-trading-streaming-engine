@@ -180,6 +180,7 @@ await test('service reports its configuration through status()', () => {
   assert.equal(s.enabled, true);
   assert.equal(s.symbol, 'XAUUSD');
   assert.equal(s.model, 'openrouter/free');
+  assert.equal(s.maxTokens, 2000);
   assert.equal(s.lastSignal, null);
 });
 
