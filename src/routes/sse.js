@@ -64,7 +64,7 @@ export function mountSseRoutes({ app, hub, dispatcher, market, auth, tradeGuard,
     hub.sendTo(client, 'snapshot', snapshot);
 
     const total = Object.values(snapshot.series).reduce((n, s) => n + s.candles.length, 0);
-    log(`snapshot → ${client.id}: ${total} candles across ${Object.keys(snapshot.series).length} series`);
+    log.raw(`snapshot → ${client.id}: ${total} candles across ${Object.keys(snapshot.series).length} series`);
   });
 
   /* ====================================================================== */
