@@ -30,6 +30,7 @@
 import { getSymbolSpec, roundPrice } from '../config/db.js';
 import { createLogger } from './logger.js';
 import { CHAT_TYPES } from './sseDispatcher.js';
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
 const log = createLogger('ai');
 
@@ -857,14 +858,27 @@ export class AiSignalService {
         stop_loss: signal.stop_loss,
         take_profit_1: signal.take_profit_1,
         take_profit_2: signal.take_profit_2,
-        // Carried on the frame so a client (the mobile app) can render the whole
-        // trade — levels and rationale — from the event alone, without a
-        // follow-up read. Purely additive; the message text is unchanged.
         reasoning: signal.reasoning,
-        // The trade currently being followed, so a client can show management
-        // state without replaying the event history. null while flat.
         position: this.position,
         asOf: signal.asOf,
+        enc: this.#encryptForMobile({
+          source: 'ai-analyst',
+          kind,
+          symbol: snapshot.symbol,
+          price: snapshot.price,
+          action: signal.action,
+          valid: signal.valid,
+          rr: signal.rr,
+          confidence: signal.confidence_score,
+          entry_price: signal.entry_price,
+          stop_loss: signal.stop_loss,
+          take_profit_1: signal.take_profit_1,
+          take_profit_2: signal.take_profit_2,
+          reasoning: signal.reasoning,
+          position: this.position,
+          asOf: signal.asOf,
+          ts: Date.now(),
+        }),
       },
     });
 
@@ -901,6 +915,23 @@ export class AiSignalService {
         opened_at: payload.openedAt,
         closed_at: isClose ? payload.closedAt : null,
         icon,
+        enc: this.#encryptForMobile({
+          source: 'ai-analyst',
+          kind,
+          symbol: payload.symbol,
+          action: payload.action,
+          entry_price: payload.entry,
+          exit_price: isClose ? price : null,
+          stop_loss: payload.sl,
+          take_profit_1: payload.tp1,
+          take_profit_2: payload.tp2,
+          pnl_points: isClose ? payload.pnlPoints : null,
+          pnl_pct: isClose ? payload.pnlPct : null,
+          exit_reason: isClose ? kind : null,
+          opened_at: payload.openedAt,
+          closed_at: isClose ? payload.closedAt : null,
+          ts: Date.now(),
+        }),
       },
     });
 
@@ -941,6 +972,36 @@ export class AiSignalService {
     if (this.cfg.TELEGRAM_CHAT_ID) return sendDirect(this.cfg.TELEGRAM_CHAT_ID, text);
     return 0;
   }
+
+  /** Encrypt a JSON-serializable payload for the mobile app (optional). */
+  #encryptForMobile(payload) {
+    try {
+      const key = this.cfg.ENC_KEY;
+      if (!key) return null;
+      const algo = this.cfg.ENC_ALGO || 'aes-256-gcm';
+      let secret;
+      // try hex, then base64
+      if (/^[0-9a-fA-F]{32,}$/.test(key) && key.length % 2 === 0 && key.length === 64) {
+        secret = Buffer.from(key, 'hex');
+      } else if (/^[A-Za-z0-9+/=]+$/.test(key) && key.length >= 32) {
+        try { secret = Buffer.from(key, 'base64'); } catch { secret = Buffer.from(key); }
+      } else {
+        secret = Buffer.from(key);
+      }
+      if (secret.length !== 32) secret = secret.slice(0, 32);
+      const iv = randomBytes(12);
+      const cipher = createCipheriv(algo, secret, iv);
+      const plaintext = Buffer.from(JSON.stringify(payload));
+      let enc = cipher.update(plaintext);
+      enc = Buffer.concat([enc, cipher.final()]);
+      const tag = cipher.getAuthTag ? cipher.getAuthTag() : Buffer.alloc(0);
+      const out = Buffer.concat([iv, tag, enc]);
+      return out.toString('base64');
+    } catch (e) {
+      log.warn('signal encryption failed:', e.message);
+      return null;
+    }
+  }
 }
 
 /* ================================================================== helpers */
@@ -968,6 +1029,8 @@ const DEFAULTS = Object.freeze({
   CATCHUP_MAX: 3,
   TRACK_ENABLED: true,
   STATUS_EVERY_CYCLE: true,
+  ENC_KEY: '',
+  ENC_ALGO: 'aes-256-gcm',
 });
 
 /** [epochSeconds, open, high, low, close] — compact to save prompt tokens. */

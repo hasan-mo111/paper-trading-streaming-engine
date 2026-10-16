@@ -312,6 +312,9 @@ const ai = {
   CATCHUP_ENABLED: bool(process.env.AI_SIGNAL_CATCHUP, true),
   CATCHUP_DELAY_MS: int(process.env.AI_SIGNAL_CATCHUP_DELAY_MS, 180_000, 30_000, 900_000),
   CATCHUP_MAX: int(process.env.AI_SIGNAL_CATCHUP_MAX, 3, 0, 10),
+  /** Encryption key for mobile app signal (hex/base64). If set, AI_SIGNAL meta is encrypted. */
+  ENC_KEY: process.env.AI_SIGNAL_ENC_KEY || '',
+  ENC_ALGO: process.env.AI_SIGNAL_ENC_ALGO || 'aes-256-gcm',
   /** Follow an open trade to TP/SL/reversal and refuse a new entry meanwhile. */
   TRACK_ENABLED: bool(process.env.AI_SIGNAL_TRACK, true),
   /** Send one Telegram message every cycle: a new signal, a management update
