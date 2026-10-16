@@ -230,7 +230,8 @@ await testAsync('parses a reply wrapped in prose', async () => {
 await testAsync('unparseable output is rejected, not published', async () => {
   const market = fakeMarket();
   const dispatcher = fakeDispatcher();
-  const svc = new AiSignalService({ market, dispatcher, fetchFn: fakeFetch('not json at all') });
+  const env = { ai: baseCfg({ MAX_ATTEMPTS: 1 }) };
+  const svc = new AiSignalService({ market, dispatcher, env, fetchFn: fakeFetch('not json at all') });
   const res = await svc.run('manual');
   assert.equal(res.ok, false);
   assert.equal(res.error, 'bad-model-output');
@@ -330,7 +331,8 @@ await testAsync('HOLD is published to chat but never sent to Telegram', async ()
   const dispatcher = fakeDispatcher();
   const telegram = fakeTelegram();
   const content = JSON.stringify({ action: 'HOLD', symbol: 'XAU/USD', confidence_score: 'Low', reasoning: 'Noise.' });
-  const svc = new AiSignalService({ market, dispatcher, telegram, fetchFn: fakeFetch(content) });
+  const env = { ai: baseCfg({ STATUS_EVERY_CYCLE: false }) };
+  const svc = new AiSignalService({ market, dispatcher, telegram, env, fetchFn: fakeFetch(content) });
   await svc.run('manual');
   assert.equal(dispatcher.pushed.length, 1);
   assert.equal(dispatcher.pushed[0].severity, 'info');
@@ -340,7 +342,8 @@ await testAsync('HOLD is published to chat but never sent to Telegram', async ()
 await testAsync('an unchanged trade is not re-sent to Telegram', async () => {
   const market = fakeMarket({ price: 2400 });
   const telegram = fakeTelegram();
-  const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), telegram, fetchFn: fakeFetch(buySignal()) });
+  const env = { ai: baseCfg({ STATUS_EVERY_CYCLE: false }) };
+  const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), telegram, env, fetchFn: fakeFetch(buySignal()) });
   await svc.run('manual');
   await svc.run('manual');
   assert.equal(telegram.sent.length, 1, 'second identical signal must be suppressed');
@@ -439,11 +442,11 @@ await test('empty completion on the fallback model surfaces a diagnostic', async
 await test('no second attempt when the primary IS the fallback model', async () => {
   const market = fakeMarket({ price: 2400 });
   const fetchFn = sequenceFetch([EMPTY]);
-  const env = { ai: baseCfg({ MODEL: 'openrouter/free' }) };
+  const env = { ai: baseCfg({ MODEL: 'openrouter/free', MAX_ATTEMPTS: 1 }) };
   const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), env, fetchFn });
   const res = await svc.run('manual');
   assert.equal(res.ok, false);
-  assert.equal(fetchFn.calls.length, 1, 'must not retry the same model');
+  assert.equal(fetchFn.calls.length, 1, 'maxAttempts=1 → single attempt');
 });
 
 /* ---- 5c. prose replies get one corrected retry --------------------------- */
@@ -456,7 +459,8 @@ await test('a prose reply with no JSON triggers a corrected retry that recovers'
     { content: "Here's the setup I see on gold right now — momentum looks constructive, so..." },
     { content: buySignal() },
   ]);
-  const svc = new AiSignalService({ market, dispatcher, telegram, fetchFn });
+  const env = { ai: baseCfg({ MAX_ATTEMPTS: 2 }) };
+  const svc = new AiSignalService({ market, dispatcher, telegram, env, fetchFn });
   const res = await svc.run('manual');
 
   assert.equal(res.ok, true, 'the corrected retry should recover the cycle');
@@ -479,7 +483,7 @@ await test('a prose reply with no JSON triggers a corrected retry that recovers'
 await test('a prose reply on a non-fallback model retries on openrouter/free', async () => {
   const market = fakeMarket({ price: 2400 });
   const fetchFn = sequenceFetch([{ content: 'Sure, let me walk you through it.' }, { content: buySignal() }]);
-  const env = { ai: baseCfg({ MODEL: 'some/chatty-model:free' }) };
+  const env = { ai: baseCfg({ MODEL: 'some/chatty-model:free', MAX_ATTEMPTS: 2 }) };
   const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), telegram: fakeTelegram(), env, fetchFn });
   const res = await svc.run('manual');
 
@@ -492,7 +496,8 @@ await test('prose on both attempts fails cleanly and publishes nothing', async (
   const market = fakeMarket({ price: 2400 });
   const dispatcher = fakeDispatcher();
   const fetchFn = sequenceFetch([{ content: 'no json in here' }, { content: 'still no json, sorry' }]);
-  const svc = new AiSignalService({ market, dispatcher, fetchFn });
+  const env = { ai: baseCfg({ MAX_ATTEMPTS: 2 }) };
+  const svc = new AiSignalService({ market, dispatcher, env, fetchFn });
   const res = await svc.run('manual');
 
   assert.equal(res.ok, false);

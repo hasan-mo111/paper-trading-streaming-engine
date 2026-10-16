@@ -106,6 +106,10 @@ export const SYSTEM_PROMPT = [
   '   never arbitrary — they sit logically beyond a recent swing high/low.',
   '4. Filtering: in messy consolidation or high-risk noise, return action',
   '   "HOLD". Do not force a trade.',
+  '5. Economic calendar: when upcoming releases are supplied with the data, treat',
+  '   them as a risk filter. Do not open a trade straight into an imminent',
+  '   high-impact release, and name the event in your reasoning when it shapes',
+  '   the decision.',
   '',
   'Respond ONLY with a single valid JSON object — no markdown, no prose outside',
   'the JSON — in exactly this structure:',
@@ -132,17 +136,21 @@ export class AiSignalService {
    * @param {object}  [opts.env]           ENV override (tests)
    * @param {object}  [opts.telegram]      Telegram gateway handle ({ notifyAll })
    * @param {Function} [opts.fetchFn]      fetch override (tests)
+   * @param {object}  [opts.news]          EconomicNewsService (optional)
    */
-  constructor({ market, dispatcher, env = null, telegram = null, fetchFn = null } = {}) {
+  constructor({ market, dispatcher, env = null, telegram = null, fetchFn = null, news = null } = {}) {
     if (!market) throw new Error('AiSignalService requires a market aggregator');
     if (!dispatcher) throw new Error('AiSignalService requires an SSE dispatcher');
 
     this.market = market;
     this.dispatcher = dispatcher;
     this.env = env ?? market.env ?? null;
-    // `env.ai` may be missing when a caller passes a partial env (tests): fall
-    // back to a safe defaults object so the service never throws on boot.
-    this.cfg = (this.env && this.env.ai) || DEFAULTS;
+    this.news = news;
+    // `env.ai` can be partial — a trimmed test env, or a knob added to ENV after
+    // this process last booted. Merging over DEFAULTS guarantees every key the
+    // service reads exists, so a missing entry degrades to a sane value instead
+    // of silently disabling a feature through `undefined`.
+    this.cfg = { ...DEFAULTS, ...((this.env && this.env.ai) || {}) };
     this.telegram = telegram;
     this.fetchFn = fetchFn ?? globalThis.fetch;
 
@@ -162,6 +170,12 @@ export class AiSignalService {
       rejected: 0,
       errors: 0,
       fallbacks: 0,
+      opened: 0,
+      closed: 0,
+      wins: 0,
+      losses: 0,
+      reversals: 0,
+      statuses: 0,
       lastRunAt: null,
       lastError: null,
       lastModel: null,
@@ -171,6 +185,23 @@ export class AiSignalService {
     this.lastSignal = null;
     /** De-dupe key so an unchanged read does not spam Telegram. */
     this.lastTelegramKey = null;
+
+    /**
+     * The single trade the analyst is following right now.
+     *
+     * While this is set a new signal is NEVER published as an entry — the
+     * analyst manages this one until it takes profit, stops out, or is reversed.
+     * It is deliberately in-memory: after a restart the service starts flat
+     * rather than trusting an "open" flag it cannot verify against a fill it
+     * never received (the AI analyst never touches the broker).
+     * @type {object|null}
+     */
+    this.position = null;
+    /** Closed trades, newest last. Bounded: this is a status feed, not a ledger. */
+    this.history = [];
+    /** Catch-up retry timer, plus how many were burned inside the current interval. */
+    this.catchupTimer = null;
+    this.catchupsUsed = 0;
   }
 
   /* ------------------------------------------------------------- lifecycle */
@@ -195,6 +226,8 @@ export class AiSignalService {
     this.bootTimer.unref?.();
 
     this.intervalTimer = setInterval(() => {
+      // A new interval is a fresh budget for catch-up retries.
+      this.catchupsUsed = 0;
       this.run('schedule').catch((e) => log.error('AI analyst scheduled run failed:', e.message));
     }, this.cfg.INTERVAL_MS);
     this.intervalTimer.unref?.();
@@ -208,8 +241,10 @@ export class AiSignalService {
   stop() {
     if (this.bootTimer) clearTimeout(this.bootTimer);
     if (this.intervalTimer) clearInterval(this.intervalTimer);
+    if (this.catchupTimer) clearTimeout(this.catchupTimer);
     this.bootTimer = null;
     this.intervalTimer = null;
+    this.catchupTimer = null;
   }
 
   /** Attach the Telegram gateway once app.js has mounted it. */
@@ -231,8 +266,14 @@ export class AiSignalService {
       maxTokens: this.cfg.MAX_TOKENS,
       minRR: this.cfg.MIN_RR,
       telegram: Boolean(this.cfg.TELEGRAM && (this.telegram || this.cfg.TELEGRAM_CHAT_ID)),
+      trackEnabled: Boolean(this.cfg.TRACK_ENABLED),
+      statusEveryCycle: Boolean(this.cfg.STATUS_EVERY_CYCLE),
       ...this.stats,
+      catchupsUsed: this.catchupsUsed,
       lastSignal: this.lastSignal,
+      position: this.position,
+      historyCount: this.history.length,
+      news: this.news?.status?.() ?? null,
     };
   }
 
@@ -266,39 +307,28 @@ export class AiSignalService {
         return { ok: false, error: 'insufficient-data', reason, detail: snapshot.detail };
       }
 
-      let call = await this.#callWithFallback(snapshot);
-      let parsed = this.#parseJson(call.content);
-
-      if (!parsed.ok) {
-        // The HTTP call succeeded but the model answered with prose instead of
-        // the contract — there is no JSON object for the parser to salvage.
-        // Retry once with an explicit correction (and extra headroom, in case
-        // the preamble ate the token budget) rather than losing the interval.
-        const retryModel = this.cfg.MODEL === FALLBACK_MODEL ? call.model : FALLBACK_MODEL;
-        log.warn(
-          `AI analyst: reply was not JSON (${parsed.error}; finish_reason=${call.finishReason ?? 'unknown'}) ` +
-            `— retrying once on "${retryModel}" with a JSON-only correction`
-        );
-        this.stats.fallbacks = (this.stats.fallbacks ?? 0) + 1;
-        try {
-          call = await this.#askModel(snapshot, retryModel, Math.max(this.cfg.MAX_TOKENS, 4_000), {
-            correction: JSON_CORRECTION,
-          });
-          parsed = this.#parseJson(call.content);
-        } catch (e) {
-          log.warn('AI analyst: correction retry failed —', e.message);
-        }
+      // Calendar context first, and never at the cost of a cycle: a failed
+      // refresh leaves the previous window in place and the run continues.
+      let newsLines = [];
+      if (this.news) {
+        await this.news.ensureFresh().catch(() => {});
+        newsLines = this.news.forPrompt();
       }
 
-      if (!parsed.ok) {
+      const attempt = await this.#askWithRetries(snapshot, newsLines);
+
+      if (!attempt.parsed.ok) {
         this.stats.errors += 1;
-        this.stats.lastError = `parse: ${parsed.error}`;
-        log.warn('AI analyst: model returned unparseable JSON —', parsed.error);
-        return { ok: false, error: 'bad-model-output', reason, detail: parsed.error };
+        this.stats.lastError = `parse: ${attempt.parsed.error}`;
+        log.warn(`AI analyst: no usable reply after ${attempt.attempts} attempt(s) —`, attempt.parsed.error);
+        // Do not let a failed cycle become a silent 30-minute hole in the feed.
+        this.#scheduleCatchup();
+        return { ok: false, error: 'bad-model-output', reason, detail: attempt.parsed.error };
       }
 
-      const signal = this.#validate(parsed.value, snapshot);
-      // The turn may have been served by the fallback model — report the model
+      const call = attempt.call;
+      const signal = this.#validate(attempt.parsed.value, snapshot);
+      // The turn may have been served by a fallback model — report the model
       // that actually answered, not the one that was configured.
       signal.model = call.model;
       const latency = Date.now() - startedAt;
@@ -307,29 +337,202 @@ export class AiSignalService {
       this.stats.lastRunAt = Date.now();
       this.stats.lastLatencyMs = latency;
       this.stats.lastModel = call.model;
+      this.catchupsUsed = 0; // a healthy cycle clears the catch-up budget
       this.lastSignal = signal;
 
       if (signal.action === 'HOLD') this.stats.holds += 1;
       else this.stats.published += 1;
       if (!signal.valid) this.stats.rejected += 1;
 
-      this.#publish(signal, snapshot, reason);
+      // The trade lifecycle decides whether this is an entry, a management
+      // update, or the reversal that closes the running trade.
+      const effect = this.#applySignal(signal, snapshot, reason);
+
       log.info(
         `AI analyst → ${signal.action}` +
           (signal.action !== 'HOLD' ? ` @ ${signal.entry_price} (R:R 1:${signal.rr.toFixed(2)})` : '') +
-          ` · ${latency}ms${signal.valid ? '' : ' · downgraded: ' + signal.note}`
+          ` · ${latency}ms · ${effect.kind}${signal.valid ? '' : ' · downgraded: ' + signal.note}`
       );
-      return { ok: true, reason, signal };
+      return { ok: true, reason, signal, effect: effect.kind, position: this.position };
     } catch (e) {
       this.stats.runs += 1;
       this.stats.errors += 1;
       this.stats.lastError = e.message;
       this.stats.lastRunAt = Date.now();
       log.error('AI analyst run failed:', e.message);
+      this.#scheduleCatchup();
       return { ok: false, error: 'exception', reason, detail: e.message };
     } finally {
       this.running = false;
     }
+  }
+
+  /* ======================================================== trade lifecycle */
+
+  /**
+   * Follow a live quote and act on the running trade the instant a level is
+   * touched — a 30-minute cycle is far too coarse to be sitting inside a stop.
+   *
+   * Wired to the market aggregator's forming-tick hook, so it is O(1), does
+   * no allocation while flat, and cannot throw into the tick path.
+   *
+   * @param {string} symbol
+   * @param {number} price
+   * @returns {object|null} the closed trade, or null when nothing happened
+   */
+  onPrice(symbol, price) {
+    const p = this.position;
+    if (!p || !Number.isFinite(price)) return null;
+    if (String(symbol).toUpperCase() !== p.symbol) return null;
+
+    const dir = p.action === 'BUY' ? 1 : -1;
+    p.lastPrice = price;
+    p.ticks = (p.ticks ?? 0) + 1;
+
+    // Track the excursion so the status line can report heat taken.
+    const movePct = ((price - p.entry) / p.entry) * 100 * dir;
+    if (movePct > p.mfe) p.mfe = movePct;
+    if (movePct < p.mae) p.mae = movePct;
+
+    const atOrBeyond = (level) => (dir > 0 ? price >= level : price <= level);
+    const atOrWorse = (level) => (dir > 0 ? price <= level : price >= level);
+
+    // Stop first: when a single tick gaps through both, the stop is the fill a
+    // real broker would have given.
+    if (atOrWorse(p.sl)) return this.#closePosition('SL', price);
+    if (atOrBeyond(p.tp2)) return this.#closePosition('TP2', price);
+    if (atOrBeyond(p.tp1) && p.stage === 'open') return this.#protectAtBreakeven(price);
+    return null;
+  }
+
+  /**
+   * Decide what a fresh signal means for the book.
+   *
+   *  • flat  + actionable signal → open the trade (the only entry path)
+   *  • open  + opposite idea at Medium/High confidence → close as REVERSAL
+   *  • open  + anything else     → report, never re-enter
+   *  • flat  + HOLD/invalid      → report why nothing was taken
+   *
+   * @returns {{ kind: 'opened'|'management'|'reversal-close'|'hold' }}
+   */
+  #applySignal(signal, snapshot, reason) {
+    const actionable = signal.valid && (signal.action === 'BUY' || signal.action === 'SELL');
+
+    if (this.position) {
+      const opposite = signal.action !== this.position.action;
+      const confident = signal.confidence_score === 'High' || signal.confidence_score === 'Medium';
+
+      if (actionable && opposite && confident) {
+        const closed = this.#closePosition('REVERSAL', snapshot.price, { signal });
+        return { kind: closed ? 'reversal-close' : 'management' };
+      }
+      this.#publishStatus(signal, snapshot, reason, 'management');
+      return { kind: 'management' };
+    }
+
+    if (actionable) {
+      if (this.cfg.TRACK_ENABLED) this.#openPosition(signal, snapshot);
+      this.#publishStatus(signal, snapshot, reason, this.cfg.TRACK_ENABLED ? 'opened' : 'signal');
+      return { kind: 'opened' };
+    }
+
+    this.#publishStatus(signal, snapshot, reason, 'hold');
+    return { kind: 'hold' };
+  }
+
+  /** Take the signal as a paper position the analyst will now manage. */
+  #openPosition(signal, snapshot) {
+    this.position = {
+      id: `ai-${Date.now().toString(36)}`,
+      action: signal.action,
+      symbol: signal.symbol,
+      entry: signal.entry_price,
+      sl: signal.stop_loss,
+      tp1: signal.take_profit_1,
+      tp2: signal.take_profit_2,
+      rr: signal.rr,
+      confidence: signal.confidence_score,
+      reasoning: signal.reasoning,
+      model: signal.model,
+      openedAt: new Date().toISOString(),
+      openedMs: Date.now(),
+      openedAtPrice: snapshot.price,
+      stage: 'open', // 'open' | 'tp1'
+      lastPrice: snapshot.price,
+      mfe: 0,
+      mae: 0,
+      ticks: 0,
+    };
+    this.stats.opened += 1;
+    log.ok(`AI trade OPEN → ${signal.action} ${signal.symbol} @ ${signal.entry_price}`);
+  }
+
+  /** TP1 reached: pull the stop to entry so the trade can no longer lose. */
+  #protectAtBreakeven(price) {
+    const p = this.position;
+    if (!p) return null;
+    p.stage = 'tp1';
+    p.sl = p.entry;
+    p.lastPrice = price;
+    log.ok(`AI trade ${p.symbol}: TP1 reached at ${price} — stop moved to breakeven (${p.entry})`);
+    this.#emitTradeEvent('TP1', p, price);
+    return null;
+  }
+
+  /**
+   * Close the running trade at `price` and report it.
+   * @param {'SL'|'TP2'|'REVERSAL'} reason
+   */
+  #closePosition(reason, price, { signal = null } = {}) {
+    const p = this.position;
+    if (!p) return null;
+
+    const dir = p.action === 'BUY' ? 1 : -1;
+    const pnlPoints = (price - p.entry) * dir;
+    const closed = {
+      ...p,
+      closedAt: new Date().toISOString(),
+      closedMs: Date.now(),
+      exitPrice: price,
+      exitReason: reason,
+      pnlPoints,
+      pnlPct: (pnlPoints / p.entry) * 100,
+      exitNote: signal?.reasoning ?? null,
+    };
+
+    this.position = null;
+    this.history.push(closed);
+    if (this.history.length > 50) this.history.shift();
+
+    this.stats.closed += 1;
+    if (reason === 'REVERSAL') this.stats.reversals += 1;
+    if (pnlPoints >= 0) this.stats.wins += 1;
+    else this.stats.losses += 1;
+
+    const icon = reason === 'SL' ? '🛑' : reason === 'REVERSAL' ? '↩️' : '✅';
+    log.ok(
+      `AI trade CLOSED (${reason}) ${closed.action} ${closed.symbol} @ ${price} ` +
+        `→ ${pnlPoints >= 0 ? '+' : ''}${pnlPoints.toFixed(2)} pts`
+    );
+    this.#emitTradeEvent(reason, closed, price, icon);
+    return closed;
+  }
+
+  /** Schedule a single catch-up run after a failed cycle. */
+  #scheduleCatchup() {
+    if (!this.cfg.CATCHUP_ENABLED || this.catchupTimer) return;
+    if (this.catchupsUsed >= this.cfg.CATCHUP_MAX) {
+      log.warn('AI analyst: catch-up budget exhausted — waiting for the next interval');
+      return;
+    }
+    this.catchupsUsed += 1;
+    const delay = this.cfg.CATCHUP_DELAY_MS;
+    this.catchupTimer = setTimeout(() => {
+      this.catchupTimer = null;
+      this.run('catchup').catch((e) => log.error('AI analyst catch-up failed:', e.message));
+    }, delay);
+    this.catchupTimer.unref?.();
+    log.warn(`AI analyst: catch-up #${this.catchupsUsed} scheduled in ${Math.round(delay / 1_000)}s`);
   }
 
   /* ============================================================ data gather */
@@ -374,8 +577,8 @@ export class AiSignalService {
 
   /* ============================================================== model call */
 
-  async #askModel(snapshot, model = this.cfg.MODEL, maxTokens = this.cfg.MAX_TOKENS, { correction = null } = {}) {
-    const user = buildUserMessage(snapshot);
+  async #askModel(snapshot, model = this.cfg.MODEL, maxTokens = this.cfg.MAX_TOKENS, { correction = null, news = [] } = {}) {
+    const user = buildUserMessage(snapshot, news);
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: user },
@@ -435,26 +638,59 @@ export class AiSignalService {
   }
 
   /**
-   * Ask the configured model; if that yields nothing usable, fall back once to
-   * the generic free router with extra headroom. Free models are flaky and
-   * reasoning variants often burn their token budget on thought and return an
-   * empty `content` — a single, well-scoped retry keeps the analyst alive
-   * instead of reporting a hard error to the operator.
+   * Ask the model chain until one reply parses, correcting a prose answer and
+   * escalating models on failure.
    *
-   * @returns {Promise<{content:string, model:string}>}
+   * Free routers are flaky in two different ways, and they need different
+   * responses:
+   *   • the call itself fails (timeout, 429, empty completion) → try the next
+   *     model in the chain, with extra headroom for reasoning variants;
+   *   • the call succeeds but answers in prose → re-ask with the JSON-only
+   *     correction turn. Re-asking the same model is what actually recovers a
+   *     chatty reply, so a repeat model is deliberate, not a bug.
+   *
+   * @returns {Promise<{call:object, parsed:object, attempts:number}>}
    */
-  async #callWithFallback(snapshot) {
-    try {
-      return await this.#askModel(snapshot);
-    } catch (primaryErr) {
-      const fallback = FALLBACK_MODEL;
-      if (this.cfg.MODEL === fallback) throw primaryErr;
-      log.warn(`AI analyst: ${primaryErr.message} — retrying once on "${fallback}"`);
-      this.stats.fallbacks = (this.stats.fallbacks ?? 0) + 1;
-      // Extra headroom: the common empty-completion cause is a reasoning model
-      // exhausting max_tokens before it emits the answer.
-      return await this.#askModel(snapshot, fallback, Math.max(this.cfg.MAX_TOKENS, 8_000));
+  async #askWithRetries(snapshot, newsLines = []) {
+    const chain = this.#modelChain();
+    const maxAttempts = Math.max(1, this.cfg.MAX_ATTEMPTS);
+    let call = { content: '', model: chain[0] };
+    let parsed = { ok: false, error: 'no attempt made' };
+
+    for (let i = 0; i < maxAttempts; i++) {
+      const model = chain[Math.min(i, chain.length - 1)];
+      // Attempt 0 asks cleanly; every later attempt spells out the contract and
+      // buys extra headroom in case a preamble ate the token budget.
+      const correction = i === 0 ? null : JSON_CORRECTION;
+      const maxTokens = i === 0 ? this.cfg.MAX_TOKENS : Math.max(this.cfg.MAX_TOKENS, 4_000);
+
+      try {
+        call = await this.#askModel(snapshot, model, maxTokens, { correction, news: newsLines });
+        parsed = this.#parseJson(call.content);
+        if (parsed.ok) return { call, parsed, attempts: i + 1 };
+        log.warn(
+          `AI analyst: attempt ${i + 1}/${maxAttempts} on "${model}" was not JSON ` +
+            `(${parsed.error}; finish_reason=${call.finishReason ?? 'unknown'})`
+        );
+      } catch (e) {
+        log.warn(`AI analyst: attempt ${i + 1}/${maxAttempts} on "${model}" failed — ${e.message}`);
+        parsed = { ok: false, error: e.message };
+      }
+
+      if (i > 0) this.stats.fallbacks += 1;
     }
+    return { call, parsed, attempts: maxAttempts };
+  }
+
+  /**
+   * Ordered list of models to try: the configured primary, then any explicitly
+   * configured fallbacks, then the generic free router. Deduplicated so the
+   * primary is never tried twice in a row by accident.
+   */
+  #modelChain() {
+    const extra = Array.isArray(this.cfg.FALLBACK_MODELS) ? this.cfg.FALLBACK_MODELS : [];
+    const chain = [this.cfg.MODEL, ...extra, FALLBACK_MODEL].filter(Boolean);
+    return [...new Set(chain)];
   }
 
   /* ================================================================ parsing */
@@ -587,7 +823,17 @@ export class AiSignalService {
 
   /* =============================================================== publishing */
 
-  #publish(signal, snapshot, reason) {
+  /**
+   * Publish one cycle to the chat feed and decide what Telegram receives.
+   *
+   *  'opened'     → the full trade card (the levels everyone acts on)
+   *  'management' → a status line for the trade already running
+   *  'hold'       → why the analyst stood aside
+   *  'signal'     → an actionable read while tracking is switched off
+   *
+   * @param {'opened'|'management'|'hold'|'signal'} kind
+   */
+  #publishStatus(signal, snapshot, reason, kind) {
     const chat = formatChat(signal);
     const severity = signal.action === 'HOLD' ? 'info' : signal.valid ? 'success' : 'warning';
 
@@ -598,7 +844,9 @@ export class AiSignalService {
       meta: {
         source: 'ai-analyst',
         reason,
+        kind,
         symbol: snapshot.symbol,
+        price: snapshot.price,
         action: signal.action,
         valid: signal.valid,
         note: signal.note,
@@ -613,38 +861,85 @@ export class AiSignalService {
         // trade — levels and rationale — from the event alone, without a
         // follow-up read. Purely additive; the message text is unchanged.
         reasoning: signal.reasoning,
+        // The trade currently being followed, so a client can show management
+        // state without replaying the event history. null while flat.
+        position: this.position,
         asOf: signal.asOf,
       },
     });
 
-    this.#notifyTelegram(signal).catch((e) => log.warn('AI Telegram notify failed:', e.message));
+    this.#notifyCycle(signal, snapshot, kind).catch((e) => log.warn('AI Telegram notify failed:', e.message));
   }
 
   /**
-   * Send the signal to Telegram. Only actionable, validated signals are sent —
-   * a HOLD would otherwise wake the desk every cycle for nothing. An unchanged
-   * signal is also suppressed so a flat market does not spam.
+   * Report a lifecycle event (stop-to-breakeven, take profit, reversal, stop)
+   * on the chat feed and to Telegram.
+   *
+   * @param {'TP1'|'TP2'|'SL'|'REVERSAL'} kind
    */
-  async #notifyTelegram(signal) {
+  #emitTradeEvent(kind, payload, price, icon = '•') {
+    const isClose = kind === 'SL' || kind === 'TP2' || kind === 'REVERSAL';
+    const message = isClose ? formatClose(payload) : formatProtect(payload, price);
+
+    this.dispatcher.push({
+      type: isClose ? CHAT_TYPES.AI_TRADE_CLOSE : CHAT_TYPES.AI_TRADE_UPDATE,
+      message,
+      severity: kind === 'SL' ? 'warning' : 'success',
+      meta: {
+        source: 'ai-analyst',
+        kind,
+        symbol: payload.symbol,
+        action: payload.action,
+        entry_price: payload.entry,
+        exit_price: isClose ? price : null,
+        stop_loss: payload.sl,
+        take_profit_1: payload.tp1,
+        take_profit_2: payload.tp2,
+        pnl_points: isClose ? payload.pnlPoints : null,
+        pnl_pct: isClose ? payload.pnlPct : null,
+        exit_reason: isClose ? kind : null,
+        opened_at: payload.openedAt,
+        closed_at: isClose ? payload.closedAt : null,
+        icon,
+      },
+    });
+
     if (!this.cfg.TELEGRAM) return;
-    if (signal.action === 'HOLD' || !signal.valid) return;
+    this.#sendTelegram(message).catch((e) => log.warn('AI Telegram notify failed:', e.message));
+  }
 
-    const key = `${signal.action}:${signal.entry_price}`;
-    if (key === this.lastTelegramKey) return;
+  /**
+   * Telegram for one cycle. A new trade is announced exactly once (de-duped on
+   * its levels); every other cycle gets the status line that STATUS_EVERY_CYCLE
+   * exists for — a quiet analyst and a dead analyst must not look alike.
+   */
+  async #notifyCycle(signal, snapshot, kind) {
+    if (!this.cfg.TELEGRAM) return;
 
-    const text = formatTelegram(signal);
-    let sent = 0;
-
-    if (this.telegram?.notifyAll) {
-      sent = await this.telegram.notifyAll(text);
-    } else if (this.cfg.TELEGRAM_CHAT_ID) {
-      sent = await sendDirect(this.cfg.TELEGRAM_CHAT_ID, text);
+    if (kind === 'opened') {
+      if (signal.action === 'HOLD' || !signal.valid) return;
+      const key = `${signal.action}:${signal.entry_price}`;
+      if (key === this.lastTelegramKey) return;
+      const sent = await this.#sendTelegram(formatTelegram(signal));
+      if (sent > 0) {
+        this.lastTelegramKey = key;
+        log.ok(`AI signal delivered to ${sent} Telegram chat(s)`);
+      }
+      return;
     }
 
-    if (sent > 0) {
-      this.lastTelegramKey = key;
-      log.ok(`AI signal delivered to ${sent} Telegram chat(s)`);
-    }
+    if (!this.cfg.STATUS_EVERY_CYCLE) return;
+    const status = await this.#sendTelegram(
+      formatStatus({ signal, position: this.position, price: snapshot.price, reason: kind })
+    );
+    if (status > 0) this.stats.statuses += 1;
+  }
+
+  /** One place that knows how a message actually leaves the process. */
+  async #sendTelegram(text) {
+    if (this.telegram?.notifyAll) return this.telegram.notifyAll(text);
+    if (this.cfg.TELEGRAM_CHAT_ID) return sendDirect(this.cfg.TELEGRAM_CHAT_ID, text);
+    return 0;
   }
 }
 
@@ -659,13 +954,20 @@ const DEFAULTS = Object.freeze({
   INTERVAL_MS: 1_800_000,
   MANUAL_COOLDOWN_S: 60,
   BOOT_DELAY_MS: 120_000,
-  TIMEOUT_MS: 60_000,
+  TIMEOUT_MS: 90_000,
   MAX_TOKENS: 2000,
   MIN_RR: 2,
   MAX_ENTRY_DRIFT: 0.02,
   BARS: { D1: 60, H4: 60, H1: 80, M15: 60, M5: 60 },
   TELEGRAM: false,
   TELEGRAM_CHAT_ID: '',
+  MAX_ATTEMPTS: 3,
+  FALLBACK_MODELS: [],
+  CATCHUP_ENABLED: true,
+  CATCHUP_DELAY_MS: 180_000,
+  CATCHUP_MAX: 3,
+  TRACK_ENABLED: true,
+  STATUS_EVERY_CYCLE: true,
 });
 
 /** [epochSeconds, open, high, low, close] — compact to save prompt tokens. */
@@ -679,8 +981,13 @@ function compactPrice(v) {
   return Number.isFinite(v) ? Number(v) : null;
 }
 
-/** Build the USER turn: the snapshot as a small JSON document. */
-export function buildUserMessage(snapshot) {
+/**
+ * Build the USER turn: the snapshot as a small JSON document.
+ *
+ * @param {object} snapshot
+ * @param {string[]} [news] upcoming high-impact events, as compact lines
+ */
+export function buildUserMessage(snapshot, news = null) {
   const tf = {};
   for (const [bucket, f] of Object.entries(snapshot.frames)) {
     tf[bucket] = { label: f.label, rows: f.bars };
@@ -691,8 +998,17 @@ export function buildUserMessage(snapshot) {
     current_price: snapshot.price,
     timeframes: tf,
     row_format: ['epoch_seconds', 'open', 'high', 'low', 'close'],
-    instruction: 'Analyse the frames macro→micro and return the strict JSON signal now.',
   };
+
+  const events = Array.isArray(news) ? news.filter(Boolean) : [];
+  if (events.length) {
+    payload.upcoming_high_impact_events_utc = events;
+    payload.instruction =
+      'Analyse the frames macro→micro. Treat the upcoming events above as a risk filter — ' +
+      'do not open a trade straight into one. Return the strict JSON signal now.';
+  } else {
+    payload.instruction = 'Analyse the frames macro→micro and return the strict JSON signal now.';
+  }
   return JSON.stringify(payload);
 }
 
@@ -725,6 +1041,74 @@ export function formatTelegram(signal) {
 const truncate = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 const esc = (s) =>
   String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/**
+ * The every-cycle Telegram status: the trade being followed, or the reason for
+ * standing aside. Deliberately one compact message — this lands ~48×/day.
+ *
+ * @param {{signal:object, position:object|null, price:number, reason:string}} ctx
+ */
+export function formatStatus({ signal, position, price, reason }) {
+  const symbol = esc((position ?? signal)?.symbol ?? 'XAUUSD');
+  const head = `🧠 <b>AI STATUS · ${symbol}</b>`;
+
+  if (position) {
+    const dir = position.action === 'BUY' ? 1 : -1;
+    const ref = Number.isFinite(price) ? price : position.lastPrice ?? position.entry;
+    const pts = (ref - position.entry) * dir;
+    const pct = (pts / position.entry) * 100;
+    const sign = pts >= 0 ? '+' : '';
+    const mins = Math.max(0, Math.round((Date.now() - position.openedMs) / 60_000));
+    const state =
+      signal && signal.valid && signal.action === position.action
+        ? 'setup still valid'
+        : signal && signal.action !== position.action
+          ? 'opposite idea forming'
+          : 'following';
+
+    return [
+      head,
+      `🔄 Following <b>${position.action}</b> @ ${position.entry}`,
+      `Price ${ref} · ${sign}${pts.toFixed(2)} pts (${sign}${pct.toFixed(2)}%) · ${mins}m open`,
+      `SL ${position.sl} · TP1 ${position.tp1} · TP2 ${position.tp2}${
+        position.stage === 'tp1' ? ' · SL at breakeven' : ''
+      }`,
+      `State: ${state}`,
+    ].join('\n');
+  }
+
+  const action = signal?.action ?? 'HOLD';
+  const conf = signal?.confidence_score ? ` (${signal.confidence_score})` : '';
+  const why = signal?.reasoning ? esc(truncate(signal.reasoning, 240)) : 'Waiting for an A-grade setup.';
+  const note = action === 'HOLD' ? '' : signal?.valid === false ? ` ⚠ ${esc(signal.note ?? 'rejected')}` : '';
+  return [head, `⏸️ Flat — <b>${action}</b>${conf}${note}`, why, `Cycle: ${reason}`].join('\n');
+}
+
+/** Telegram/chat message for a closed trade. */
+export function formatClose(closed) {
+  const icon = closed.exitReason === 'SL' ? '🛑' : closed.exitReason === 'REVERSAL' ? '↩️' : '✅';
+  const label =
+    closed.exitReason === 'SL' ? 'STOP LOSS' : closed.exitReason === 'REVERSAL' ? 'REVERSED OUT' : 'TAKE PROFIT';
+  const sign = closed.pnlPoints >= 0 ? '+' : '';
+  const mins = Math.max(0, Math.round((closed.closedMs - closed.openedMs) / 60_000));
+
+  const body = [
+    `${icon} <b>AI TRADE CLOSED · ${label}</b>`,
+    `<b>${closed.action}</b> ${esc(closed.symbol)} @ ${closed.entry} → ${closed.exitPrice}`,
+    `Result: ${sign}${closed.pnlPoints.toFixed(2)} pts (${sign}${closed.pnlPct.toFixed(2)}%) · ${mins}m`,
+  ];
+  if (closed.exitNote) body.push('', esc(truncate(closed.exitNote, 200)));
+  return body.join('\n');
+}
+
+/** Telegram/chat message for the TP1 stop-to-breakeven action. */
+export function formatProtect(position, price) {
+  return [
+    '🛡️ <b>TP1 REACHED · STOP → BREAKEVEN</b>',
+    `<b>${position.action}</b> ${esc(position.symbol)} @ ${position.entry} · price ${price}`,
+    `Stop moved to ${position.entry} — the trade can no longer lose.`,
+  ].join('\n');
+}
 
 /** Direct send used only when no gateway is attached but a chat id is set. */
 async function sendDirect(chatId, text) {

@@ -51,6 +51,10 @@ export const CHAT_TYPES = Object.freeze({
   // A multi-timeframe read produced by the AI analyst. Additive: clients that
   // do not know it simply render the message text like any other chat line.
   AI_SIGNAL: 'AI_SIGNAL',
+  // Lifecycle of the single trade the analyst follows after an AI_SIGNAL: a
+  // stop-to-breakeven/partial action, and the final close. Also additive.
+  AI_TRADE_UPDATE: 'AI_TRADE_UPDATE',
+  AI_TRADE_CLOSE: 'AI_TRADE_CLOSE',
 });
 
 export class SSEDispatcher {

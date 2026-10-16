@@ -277,8 +277,10 @@ const ai = {
   MANUAL_COOLDOWN_S: int(process.env.AI_SIGNAL_MANUAL_COOLDOWN_S, 60, 5, 3_600),
   /** Warm-up after boot before the first automatic analysis (let candles land). */
   BOOT_DELAY_MS: int(process.env.AI_SIGNAL_BOOT_DELAY_MS, 120_000, 5_000, 3_600_000),
-  /** Hard timeout for the upstream model call. */
-  TIMEOUT_MS: int(process.env.AI_SIGNAL_TIMEOUT_MS, 60_000, 5_000, 300_000),
+  /** Hard timeout for the upstream model call. A free-tier model can genuinely
+   *  take a minute to answer, so the default is deliberately above the 60s a
+   *  thoughtless value would use — a timeout here costs a whole cycle. */
+  TIMEOUT_MS: int(process.env.AI_SIGNAL_TIMEOUT_MS, 90_000, 5_000, 300_000),
   /** Max tokens the model may spend on its JSON signal. Reasoning models burn
    *  part of this budget on chain-of-thought, so it must be generous enough to
    *  still let the answer be written (empty `content` otherwise). */
@@ -299,6 +301,47 @@ const ai = {
   TELEGRAM: bool(process.env.AI_SIGNAL_TELEGRAM, true),
   /** Optional fixed chat/channel id — delivery without device pairing. */
   TELEGRAM_CHAT_ID: secret(process.env.AI_SIGNAL_CHAT_ID ?? process.env.TELEGRAM_CHAT_ID),
+  /** Model calls attempted within a single cycle before it is declared failed. */
+  MAX_ATTEMPTS: int(process.env.AI_SIGNAL_MAX_ATTEMPTS, 3, 1, 6),
+  /** Extra OpenRouter ids tried, in order, once the primary model has failed.
+   *  Pinning two or three instruction-following models lifts the cycle success
+   *  rate far more than re-asking the same random router. */
+  FALLBACK_MODELS: list(process.env.AI_SIGNAL_FALLBACK_MODELS, []),
+  /** When a whole cycle fails, retry it sooner than the next interval — a
+   *  dropped cycle otherwise means a silent 30-minute hole in the feed. */
+  CATCHUP_ENABLED: bool(process.env.AI_SIGNAL_CATCHUP, true),
+  CATCHUP_DELAY_MS: int(process.env.AI_SIGNAL_CATCHUP_DELAY_MS, 180_000, 30_000, 900_000),
+  CATCHUP_MAX: int(process.env.AI_SIGNAL_CATCHUP_MAX, 3, 0, 10),
+  /** Follow an open trade to TP/SL/reversal and refuse a new entry meanwhile. */
+  TRACK_ENABLED: bool(process.env.AI_SIGNAL_TRACK, true),
+  /** Send one Telegram message every cycle: a new signal, a management update
+   *  for the open trade, or the reason for standing aside. Without this a
+   *  healthy analyst is indistinguishable from a dead one. */
+  STATUS_EVERY_CYCLE: bool(process.env.AI_SIGNAL_STATUS_EVERY_CYCLE, true),
+};
+
+/* --------------------------------------------------------- economic calendar */
+
+/*
+ *  Upcoming high-impact releases, injected into the analyst's prompt. Kept as
+ *  its own section because it is a data source, not an analyst behaviour — the
+ *  same calendar could later inform the strategy engine too.
+ */
+const news = {
+  ENABLED: bool(process.env.AI_NEWS_ENABLED, true),
+  URL: process.env.AI_NEWS_URL?.trim() || 'https://nfs.faireconomy.media/ff_calendar_thisweek.xml',
+  /** How long a downloaded week of events is trusted before a refresh. */
+  TTL_MS: int(process.env.AI_NEWS_TTL_MS, 3 * 3_600_000, 60_000, 24 * 3_600_000),
+  TIMEOUT_MS: int(process.env.AI_NEWS_TIMEOUT_MS, 15_000, 1_000, 120_000),
+  /** How far ahead the prompt looks. One trading day is what the model can act on. */
+  HORIZON_H: int(process.env.AI_NEWS_HORIZON_H, 24, 1, 168),
+  /** HIGH keeps the prompt focused; MEDIUM widens it to second-tier prints. */
+  MIN_IMPACT: upper(process.env.AI_NEWS_MIN_IMPACT, 'HIGH'),
+  /** Currencies worth telling the analyst about ("ALL" also keeps global items). */
+  COUNTRIES: list(process.env.AI_NEWS_COUNTRIES, ['USD', 'ALL']).map((s) => s.toUpperCase()),
+  /** Minutes east of UTC the feed's times are written in (0 = the feed is UTC). */
+  TZ_OFFSET_MIN: int(process.env.AI_NEWS_TZ_OFFSET_MIN, 0, -840, 840),
+  MAX_EVENTS: int(process.env.AI_NEWS_MAX_EVENTS, 8, 1, 30),
 };
 
 /* ------------------------------------------------------------------- server - */
@@ -328,6 +371,7 @@ export const ENV = Object.freeze({
   persistence,
   market,
   ai,
+  news,
 });
 
 /**

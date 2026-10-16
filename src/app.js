@@ -58,6 +58,7 @@ import { mountSseRoutes } from './routes/sse.js';
 import { mountUserRoutes } from './routes/user.js';
 import { mountAiRoutes } from './routes/ai.js';
 import { AiSignalService } from './services/aiSignal.js';
+import { EconomicNewsService } from './services/economicNews.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -109,6 +110,9 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   // callbacks below reference it, and they only ever fire after construction
   // has finished (the feed is started by the caller).
   let engine = null;
+  // The AI analyst is built after the market (it needs candles), but the tick
+  // hook below must reach it — hold the reference in the closure.
+  let aiSignal = null;
 
   // The aggregator is created after persistence so it can queue candle writes
   // from its very first tick.
@@ -119,6 +123,9 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     onFormingTick: (symbol, tick, price) => {
       dispatcher.onTick(symbol, tick);
       engine?.onTick(symbol, tick, price);
+      // Let the analyst follow its running trade tick-by-tick: a stop has to be
+      // honoured between the 30-minute analysis cycles, not at the next one.
+      aiSignal?.onPrice(symbol, price);
     },
   });
 
@@ -142,7 +149,11 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   // The AI analyst is fully independent of the strategy: it reads the same
   // candles but can never place an order. Its Telegram handle is attached
   // further down, once (and if) the gateway has mounted.
-  const aiSignal = new AiSignalService({ market, dispatcher, env });
+  //
+  // The economic calendar feeds the analyst's prompt (see economicNews.js). It
+  // is created here so both the analyst and /health can see it.
+  const news = new EconomicNewsService({ env });
+  aiSignal = new AiSignalService({ market, dispatcher, env, news });
 
   /* ===================================================================== */
   /*  3. REHYDRATE FROM SUPABASE                                           */
@@ -372,6 +383,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   dispatcher.start();
   engine.start();
   aiSignal.start();
+  news.start();
 
   /* ===================================================================== */
   /*  9. BANNER + RETURN                                                   */
@@ -402,6 +414,8 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
           : 'idle — OPENROUTER_API_KEY not set'
     }`
   );
+  log.raw(`  AI tracking : ${env.ai.TRACK_ENABLED ? 'one trade at a time · Telegram status every cycle' : 'signal-only (no tracking)'}`);
+  log.raw(`  Calendar    : ${news.enabled ? `${env.news.MIN_IMPACT}+ events within ${env.news.HORIZON_H}h` : 'disabled'}`);
   log.raw(`  Streams     : /stream · /api/stream/prices · /api/stream/chat-events`);
   log.raw(`  Upstream    : ${env.upstream.WS}`);
   log.raw('========================================================');
@@ -422,6 +436,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     rateLimiter.stop();
     engine.stop();
     aiSignal.stop();
+    news.stop();
     feed.stop();
     hub.closeAll();
     telegram?.stop?.();
@@ -451,6 +466,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     rateLimiter,
     telegram,
     aiSignal,
+    news,
     health: healthPayload,
     close,
     // Re-exported for the e2e suite / unit tests.
