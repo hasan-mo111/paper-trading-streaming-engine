@@ -41,7 +41,7 @@ export function mountAiRoutes({ app, ai, tradeGuard = null }) {
     if (result.ok) return res.json(result);
 
     const code =
-      result.error === 'cooldown' || result.error === 'busy'
+      result.error === 'cooldown' || result.error === 'busy' || result.error === 'rate-limited'
         ? 429
         : result.error === 'disabled' || result.error === 'insufficient-data'
           ? 503

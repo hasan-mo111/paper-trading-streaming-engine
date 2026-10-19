@@ -57,7 +57,7 @@ import { StrategyEngine, ENGINE_STATE } from './engine/strategyEngine.js';
 import { mountSseRoutes } from './routes/sse.js';
 import { mountUserRoutes } from './routes/user.js';
 import { mountAiRoutes } from './routes/ai.js';
-import { AiSignalService } from './services/aiSignal.js';
+import { AiAnalystManager } from './services/aiAnalystManager.js';
 import { EconomicNewsService } from './services/economicNews.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -153,7 +153,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   // The economic calendar feeds the analyst's prompt (see economicNews.js). It
   // is created here so both the analyst and /health can see it.
   const news = new EconomicNewsService({ env });
-  aiSignal = new AiSignalService({ market, dispatcher, env, news });
+  aiSignal = new AiAnalystManager({ market, dispatcher, env, news });
 
   /* ===================================================================== */
   /*  3. REHYDRATE FROM SUPABASE                                           */
@@ -408,10 +408,17 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   log.raw(
     `  AI analyst  : ${
       aiSignal.enabled
-        ? `${env.ai.MODEL} every ${Math.round(env.ai.INTERVAL_MS / 60_000)}m on ${env.ai.SYMBOL}`
+        ? `${env.ai.MODEL} every ${Math.round(env.ai.INTERVAL_MS / 60_000)}m on ${aiSignal.symbols.join(', ')}`
         : env.ai.OPENROUTER_API_KEY
           ? 'disabled (AI_SIGNAL_ENABLED=false)'
           : 'idle — OPENROUTER_API_KEY not set'
+    }`
+  );
+  log.raw(
+    `  AI payload  : ${
+      env.ai.ENC_KEY
+        ? `sealed for mobile (${env.ai.ENC_ALGO}) · Telegram plaintext`
+        : 'PLAINTEXT — set AI_SIGNAL_ENC_KEY to seal mobile payloads'
     }`
   );
   log.raw(`  AI tracking : ${env.ai.TRACK_ENABLED ? 'one trade at a time · Telegram status every cycle' : 'signal-only (no tracking)'}`);

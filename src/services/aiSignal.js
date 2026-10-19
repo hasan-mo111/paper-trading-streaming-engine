@@ -30,9 +30,26 @@
 import { getSymbolSpec, roundPrice } from '../config/db.js';
 import { createLogger } from './logger.js';
 import { CHAT_TYPES } from './sseDispatcher.js';
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { encryptSignal } from './signalCipher.js';
 
 const log = createLogger('ai');
+
+/**
+ * Does this error mean "you have spent your quota"? OpenRouter answers 429 for
+ * per-minute/per-day limits and 402 when free credits run out; third-party
+ * proxies phrase it as "rate limit" / "quota exceeded". Kept as a module-level
+ * export so the multi-symbol manager can back off on the same definition the
+ * analyst uses to stop retrying.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isRateLimitError(err) {
+  const message = typeof err === 'string' ? err : (err && err.message) || '';
+  return /(^|\D)(429|402)(\D|$)|rate.?limit|quota|too many requests|insufficient.?credit/i.test(
+    String(message)
+  );
+}
 
 /* --------------------------------------------------------------- timeframes */
 
@@ -177,6 +194,7 @@ export class AiSignalService {
       losses: 0,
       reversals: 0,
       statuses: 0,
+      rateLimits: 0,
       lastRunAt: null,
       lastError: null,
       lastModel: null,
@@ -184,6 +202,8 @@ export class AiSignalService {
     };
     /** The most recent validated signal, replayed to new readers. */
     this.lastSignal = null;
+    /** Ciphertext of `lastSignal`, for /api/ai/signal when sealed mode is on. */
+    this.lastSignalEnc = null;
     /** De-dupe key so an unchanged read does not spam Telegram. */
     this.lastTelegramKey = null;
 
@@ -203,6 +223,12 @@ export class AiSignalService {
     /** Catch-up retry timer, plus how many were burned inside the current interval. */
     this.catchupTimer = null;
     this.catchupsUsed = 0;
+  }
+
+  /** A sealed payload the mobile client opened successfully is the only proof
+   *  the wire format is right. Cached so /api/ai/signal can replay it. */
+  get secure() {
+    return Boolean(this.cfg.ENC_KEY);
   }
 
   /* ------------------------------------------------------------- lifecycle */
@@ -256,6 +282,7 @@ export class AiSignalService {
   /* ----------------------------------------------------------------- status */
 
   status() {
+    const secure = this.secure;
     return {
       enabled: this.enabled,
       configured: Boolean(this.cfg.OPENROUTER_API_KEY),
@@ -269,10 +296,15 @@ export class AiSignalService {
       telegram: Boolean(this.cfg.TELEGRAM && (this.telegram || this.cfg.TELEGRAM_CHAT_ID)),
       trackEnabled: Boolean(this.cfg.TRACK_ENABLED),
       statusEveryCycle: Boolean(this.cfg.STATUS_EVERY_CYCLE),
+      encrypted: secure,
       ...this.stats,
       catchupsUsed: this.catchupsUsed,
-      lastSignal: this.lastSignal,
-      position: this.position,
+      // A sealed deployment must never leak the trade through this payload:
+      // the plaintext levels are replaced by the ciphertext the app can open.
+      lastSignal: secure ? null : this.lastSignal,
+      signalEnc: secure ? this.lastSignalEnc : null,
+      position: secure ? null : this.position,
+      positionOpen: Boolean(this.position),
       historyCount: this.history.length,
       news: this.news?.status?.() ?? null,
     };
@@ -319,9 +351,15 @@ export class AiSignalService {
       const attempt = await this.#askWithRetries(snapshot, newsLines);
 
       if (!attempt.parsed.ok) {
+        const rateLimited = Boolean(attempt.rateLimited);
         this.stats.errors += 1;
-        this.stats.lastError = `parse: ${attempt.parsed.error}`;
+        this.stats.lastError = rateLimited
+          ? `rate-limit: ${attempt.parsed.error}`
+          : `parse: ${attempt.parsed.error}`;
         log.warn(`AI analyst: no usable reply after ${attempt.attempts} attempt(s) —`, attempt.parsed.error);
+        // A rate-limit failure must NOT schedule a catch-up: the retry would
+        // hit the same wall and spend the remainder of the quota doing it.
+        if (rateLimited) return { ok: false, error: 'rate-limited', reason, detail: attempt.parsed.error };
         // Do not let a failed cycle become a silent 30-minute hole in the feed.
         this.#scheduleCatchup();
         return { ok: false, error: 'bad-model-output', reason, detail: attempt.parsed.error };
@@ -676,6 +714,14 @@ export class AiSignalService {
       } catch (e) {
         log.warn(`AI analyst: attempt ${i + 1}/${maxAttempts} on "${model}" failed — ${e.message}`);
         parsed = { ok: false, error: e.message };
+        // A quota rejection is not a malformed reply: retrying (or walking the
+        // fallback chain) would burn more of a quota that is already spent and
+        // only deepen the hole. Stop here and let the caller back off.
+        if (isRateLimitError(e.message)) {
+          this.stats.rateLimits += 1;
+          this.stats.lastError = `rate-limit: ${e.message}`;
+          return { call, parsed, attempts: i + 1, rateLimited: true };
+        }
       }
 
       if (i > 0) this.stats.fallbacks += 1;
@@ -834,15 +880,63 @@ export class AiSignalService {
    *
    * @param {'opened'|'management'|'hold'|'signal'} kind
    */
-  #publishStatus(signal, snapshot, reason, kind) {
-    const chat = formatChat(signal);
-    const severity = signal.action === 'HOLD' ? 'info' : signal.valid ? 'success' : 'warning';
+  /**
+   * The exact payload the phone receives, encrypted or not.
+   * Kept in one place so the plaintext and sealed paths can never drift.
+   */
+  #signalPayload(signal, snapshot, kind, reason) {
+    return {
+      source: 'ai-analyst',
+      v: 1,
+      kind,
+      reason,
+      symbol: snapshot.symbol,
+      price: snapshot.price,
+      action: signal.action,
+      valid: signal.valid,
+      note: signal.note ?? null,
+      rr: signal.rr,
+      confidence: signal.confidence_score,
+      model: signal.model,
+      entry_price: signal.entry_price,
+      stop_loss: signal.stop_loss,
+      take_profit_1: signal.take_profit_1,
+      take_profit_2: signal.take_profit_2,
+      reasoning: signal.reasoning,
+      position: this.position,
+      asOf: signal.asOf,
+      ts: Date.now(),
+    };
+  }
 
-    this.dispatcher.push({
-      type: CHAT_TYPES.AI_SIGNAL,
-      message: chat,
-      severity,
-      meta: {
+  #publishStatus(signal, snapshot, reason, kind) {
+    const severity = signal.action === 'HOLD' ? 'info' : signal.valid ? 'success' : 'warning';
+    const payload = this.#signalPayload(signal, snapshot, kind, reason);
+
+    let message;
+    let meta;
+
+    if (this.secure) {
+      // Sealed mode: the frame carries ciphertext and routing only. The levels
+      // must not appear anywhere in it — not in meta, not in the message text.
+      const enc = this.#encryptForMobile(payload);
+      if (!enc) {
+        log.error('AI signal not published — encryption failed while ENC_KEY is set');
+        return;
+      }
+      this.lastSignalEnc = enc;
+      message = `AI ${signal.symbol} · ${kind}`;
+      meta = {
+        source: 'ai-analyst',
+        kind,
+        symbol: signal.symbol,
+        asOf: signal.asOf,
+        encAlg: this.cfg.ENC_ALGO || 'aes-256-gcm',
+        enc,
+      };
+    } else {
+      message = formatChat(signal);
+      meta = {
         source: 'ai-analyst',
         reason,
         kind,
@@ -861,27 +955,10 @@ export class AiSignalService {
         reasoning: signal.reasoning,
         position: this.position,
         asOf: signal.asOf,
-        enc: this.#encryptForMobile({
-          source: 'ai-analyst',
-          kind,
-          symbol: snapshot.symbol,
-          price: snapshot.price,
-          action: signal.action,
-          valid: signal.valid,
-          rr: signal.rr,
-          confidence: signal.confidence_score,
-          entry_price: signal.entry_price,
-          stop_loss: signal.stop_loss,
-          take_profit_1: signal.take_profit_1,
-          take_profit_2: signal.take_profit_2,
-          reasoning: signal.reasoning,
-          position: this.position,
-          asOf: signal.asOf,
-          ts: Date.now(),
-        }),
-      },
-    });
+      };
+    }
 
+    this.dispatcher.push({ type: CHAT_TYPES.AI_SIGNAL, message, severity, meta });
     this.#notifyCycle(signal, snapshot, kind).catch((e) => log.warn('AI Telegram notify failed:', e.message));
   }
 
@@ -893,50 +970,93 @@ export class AiSignalService {
    */
   #emitTradeEvent(kind, payload, price, icon = '•') {
     const isClose = kind === 'SL' || kind === 'TP2' || kind === 'REVERSAL';
-    const message = isClose ? formatClose(payload) : formatProtect(payload, price);
+    const plain = isClose ? formatClose(payload) : formatProtect(payload, price);
+    const body = {
+      source: 'ai-analyst',
+      v: 1,
+      kind,
+      symbol: payload.symbol,
+      action: payload.action,
+      entry_price: payload.entry,
+      exit_price: isClose ? price : null,
+      stop_loss: payload.sl,
+      take_profit_1: payload.tp1,
+      take_profit_2: payload.tp2,
+      pnl_points: isClose ? payload.pnlPoints : null,
+      pnl_pct: isClose ? payload.pnlPct : null,
+      exit_reason: isClose ? kind : null,
+      opened_at: payload.openedAt,
+      closed_at: isClose ? payload.closedAt : null,
+      ts: Date.now(),
+    };
+
+    let message = plain;
+    let meta;
+
+    if (this.secure) {
+      const enc = this.#encryptForMobile(body);
+      if (!enc) {
+        log.error(`AI trade event ${kind} not published — encryption failed while ENC_KEY is set`);
+        return;
+      }
+      message = `AI ${payload.symbol} · ${kind}`;
+      meta = {
+        source: 'ai-analyst',
+        kind,
+        symbol: payload.symbol,
+        encAlg: this.cfg.ENC_ALGO || 'aes-256-gcm',
+        enc,
+      };
+    } else {
+      meta = { ...body, icon };
+    }
 
     this.dispatcher.push({
       type: isClose ? CHAT_TYPES.AI_TRADE_CLOSE : CHAT_TYPES.AI_TRADE_UPDATE,
       message,
       severity: kind === 'SL' ? 'warning' : 'success',
-      meta: {
-        source: 'ai-analyst',
-        kind,
-        symbol: payload.symbol,
-        action: payload.action,
-        entry_price: payload.entry,
-        exit_price: isClose ? price : null,
-        stop_loss: payload.sl,
-        take_profit_1: payload.tp1,
-        take_profit_2: payload.tp2,
-        pnl_points: isClose ? payload.pnlPoints : null,
-        pnl_pct: isClose ? payload.pnlPct : null,
-        exit_reason: isClose ? kind : null,
-        opened_at: payload.openedAt,
-        closed_at: isClose ? payload.closedAt : null,
-        icon,
-        enc: this.#encryptForMobile({
-          source: 'ai-analyst',
-          kind,
-          symbol: payload.symbol,
-          action: payload.action,
-          entry_price: payload.entry,
-          exit_price: isClose ? price : null,
-          stop_loss: payload.sl,
-          take_profit_1: payload.tp1,
-          take_profit_2: payload.tp2,
-          pnl_points: isClose ? payload.pnlPoints : null,
-          pnl_pct: isClose ? payload.pnlPct : null,
-          exit_reason: isClose ? kind : null,
-          opened_at: payload.openedAt,
-          closed_at: isClose ? payload.closedAt : null,
-          ts: Date.now(),
-        }),
-      },
+      meta,
     });
 
     if (!this.cfg.TELEGRAM) return;
-    this.#sendTelegram(message).catch((e) => log.warn('AI Telegram notify failed:', e.message));
+    this.#sendTelegram(plain).catch((e) => log.warn('AI Telegram notify failed:', e.message));
+  }
+
+  /**
+   * Publish a status for the trade already running WITHOUT calling the model.
+   *
+   * This is what makes a four-symbol book affordable on a free tier: once a
+   * trade is open the levels are fixed, so the analyst only needs a fresh read
+   * to look for a reversal — everything else is arithmetic on the live price.
+   *
+   * @param {string} reason
+   * @returns {{ok:boolean, kind?:string, symbol?:string, error?:string}}
+   */
+  statusUpdate(reason = 'schedule') {
+    const symbol = this.cfg.SYMBOL;
+    const base = this.lastSignal ? { ...this.lastSignal } : null;
+    const position = this.position;
+    if (!base && !position) return { ok: false, error: 'nothing-to-report', symbol };
+
+    const price = this.market.priceOf?.(symbol, 900) ?? position?.lastPrice ?? null;
+    const signal = base ?? {
+      action: position.action,
+      symbol,
+      valid: true,
+      confidence_score: position.confidence ?? 'Low',
+      reasoning: position.reasoning ?? '',
+      entry_price: position.entry,
+      stop_loss: position.sl,
+      take_profit_1: position.tp1,
+      take_profit_2: position.tp2,
+      rr: position.rr ?? 0,
+      model: position.model ?? null,
+      asOf: new Date().toISOString(),
+    };
+
+    const kind = position ? 'management' : 'hold';
+    this.#publishStatus({ ...signal, symbol }, { symbol, price }, reason, kind);
+    return { ok: true, kind, symbol };
   }
 
   /**
@@ -973,30 +1093,15 @@ export class AiSignalService {
     return 0;
   }
 
-  /** Encrypt a JSON-serializable payload for the mobile app (optional). */
+  /**
+   * Seal a payload for the mobile client. Returns null only when no key is
+   * configured; a failure with a key configured is logged and the caller
+   * suppresses the frame rather than leaking plaintext.
+   */
   #encryptForMobile(payload) {
+    if (!this.cfg.ENC_KEY) return null;
     try {
-      const key = this.cfg.ENC_KEY;
-      if (!key) return null;
-      const algo = this.cfg.ENC_ALGO || 'aes-256-gcm';
-      let secret;
-      // try hex, then base64
-      if (/^[0-9a-fA-F]{32,}$/.test(key) && key.length % 2 === 0 && key.length === 64) {
-        secret = Buffer.from(key, 'hex');
-      } else if (/^[A-Za-z0-9+/=]+$/.test(key) && key.length >= 32) {
-        try { secret = Buffer.from(key, 'base64'); } catch { secret = Buffer.from(key); }
-      } else {
-        secret = Buffer.from(key);
-      }
-      if (secret.length !== 32) secret = secret.slice(0, 32);
-      const iv = randomBytes(12);
-      const cipher = createCipheriv(algo, secret, iv);
-      const plaintext = Buffer.from(JSON.stringify(payload));
-      let enc = cipher.update(plaintext);
-      enc = Buffer.concat([enc, cipher.final()]);
-      const tag = cipher.getAuthTag ? cipher.getAuthTag() : Buffer.alloc(0);
-      const out = Buffer.concat([iv, tag, enc]);
-      return out.toString('base64');
+      return encryptSignal(payload, this.cfg.ENC_KEY, { algorithm: this.cfg.ENC_ALGO });
     } catch (e) {
       log.warn('signal encryption failed:', e.message);
       return null;
@@ -1012,6 +1117,11 @@ const DEFAULTS = Object.freeze({
   OPENROUTER_API_KEY: '',
   MODEL: 'openrouter/free',
   SYMBOL: 'XAUUSD',
+  SYMBOLS: ['XAUUSD', 'EURUSD', 'USDJPY', 'GBPUSD'],
+  STAGGER_MS: 12_000,
+  RATE_LIMIT_FACTOR_MAX: 4,
+  RATE_LIMIT_COOLDOWN_MS: 600_000,
+  MANAGEMENT_EVERY: 2,
   INTERVAL_MS: 1_800_000,
   MANUAL_COOLDOWN_S: 60,
   BOOT_DELAY_MS: 120_000,
@@ -1022,7 +1132,7 @@ const DEFAULTS = Object.freeze({
   BARS: { D1: 60, H4: 60, H1: 80, M15: 60, M5: 60 },
   TELEGRAM: false,
   TELEGRAM_CHAT_ID: '',
-  MAX_ATTEMPTS: 3,
+  MAX_ATTEMPTS: 2,
   FALLBACK_MODELS: [],
   CATCHUP_ENABLED: true,
   CATCHUP_DELAY_MS: 180_000,

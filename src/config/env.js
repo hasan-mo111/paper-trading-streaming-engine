@@ -269,8 +269,32 @@ const ai = {
    *  Pin a specific id (e.g. `nvidia/nemotron-3-ultra-550b-a55b:free`) if you
    *  want deterministic behaviour. */
   MODEL: process.env.AI_SIGNAL_MODEL?.trim() || 'openrouter/free',
-  /** Instrument the analyst reads (the prompt is written for XAU/USD). */
+  /** Instrument the analyst reads. Kept for single-symbol deployments and for
+   *  the per-symbol service inside the multi-symbol manager. */
   SYMBOL: upper(process.env.AI_SIGNAL_SYMBOL, 'XAUUSD'),
+  /** Instruments the analyst covers. One model call per symbol per cycle, so
+   *  this is the main driver of free-tier quota consumption. */
+  SYMBOLS: list(process.env.AI_SIGNAL_SYMBOLS, ['XAUUSD', 'EURUSD', 'USDJPY', 'GBPUSD']).map((s) =>
+    s.toUpperCase()
+  ),
+  /** Gap between two symbol calls inside one cycle. Four bursts of model calls
+   *  look exactly like abuse to a per-minute quota; a stagger looks like normal
+   *  use and is the cheapest way to stay under it. 0 disables the pause. */
+  STAGGER_MS: int(process.env.AI_SIGNAL_STAGGER_MS, 12_000, 0, 120_000),
+  /** After a 429/402 the cycle interval is multiplied (1 → 2 → 4 …) up to this
+   *  cap. This is the "quota ran out, slow down" behaviour, not a hard stop. */
+  RATE_LIMIT_FACTOR_MAX: num(process.env.AI_SIGNAL_RATE_LIMIT_FACTOR_MAX, 4),
+  /** Hard pause after a quota rejection before any symbol is retried. */
+  RATE_LIMIT_COOLDOWN_MS: int(
+    process.env.AI_SIGNAL_RATE_LIMIT_COOLDOWN_MS,
+    10 * 60_000,
+    60_000,
+    6 * 3_600_000
+  ),
+  /** While a trade is open the model is called once every N cycles; the other
+   *  cycles publish a free tick-level status. 1 = call on every cycle. This is
+   *  what keeps a multi-symbol book inside a small daily quota. */
+  MANAGEMENT_EVERY: int(process.env.AI_SIGNAL_MANAGEMENT_EVERY, 2, 1, 10),
   /** Cadence of the automatic analysis. */
   INTERVAL_MS: int(process.env.AI_SIGNAL_INTERVAL_MS, 30 * 60_000, 60_000, 86_400_000),
   /** Seconds a client must wait between manual triggers. */
@@ -301,8 +325,10 @@ const ai = {
   TELEGRAM: bool(process.env.AI_SIGNAL_TELEGRAM, true),
   /** Optional fixed chat/channel id — delivery without device pairing. */
   TELEGRAM_CHAT_ID: secret(process.env.AI_SIGNAL_CHAT_ID ?? process.env.TELEGRAM_CHAT_ID),
-  /** Model calls attempted within a single cycle before it is declared failed. */
-  MAX_ATTEMPTS: int(process.env.AI_SIGNAL_MAX_ATTEMPTS, 3, 1, 6),
+  /** Model calls attempted within a single cycle before it is declared failed.
+   *  Two (ask, then correct) is the quota-sane default: every extra attempt is
+   *  a real request against a free daily cap. */
+  MAX_ATTEMPTS: int(process.env.AI_SIGNAL_MAX_ATTEMPTS, 2, 1, 6),
   /** Extra OpenRouter ids tried, in order, once the primary model has failed.
    *  Pinning two or three instruction-following models lifts the cycle success
    *  rate far more than re-asking the same random router. */
@@ -406,6 +432,10 @@ export function publicEnv() {
       configured: Boolean(ai.OPENROUTER_API_KEY),
       model: ai.MODEL,
       symbol: ai.SYMBOL,
+      symbols: ai.SYMBOLS,
+      staggerMs: ai.STAGGER_MS,
+      managementEvery: ai.MANAGEMENT_EVERY,
+      sealed: Boolean(ai.ENC_KEY),
       intervalMs: ai.INTERVAL_MS,
       minRR: ai.MIN_RR,
       telegram: ai.TELEGRAM,

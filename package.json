@@ -9,7 +9,7 @@
     "dev": "node --watch server.js",
     "test": "npm run test:engine && npm run test:ai && npm run test:e2e",
     "test:engine": "node test/engine.test.mjs",
-    "test:ai": "node test/aiSignal.test.mjs",
+    "test:ai": "node test/aiSignal.test.mjs && node test/signalCipher.test.mjs && node test/aiManager.test.mjs",
     "test:e2e": "node test/e2e.test.mjs",
     "preview": "node test/preview.mjs",
     "diagnose": "node diagnose.mjs"
