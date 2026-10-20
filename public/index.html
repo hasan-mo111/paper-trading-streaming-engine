@@ -241,7 +241,7 @@
     const state = {
       pairs: FALLBACK_PAIRS,
       timeframes: FALLBACK_TFS,
-      maxCandles: 100,
+      maxCandles: 300,
       /** seriesKey -> { symbol, interval, candles:[], current, ready } */
       cache: new Map(),
       activeKey: null,
@@ -476,7 +476,7 @@
     /** 1) Initial payload: the full 100-candle history for all 16 series. */
     function onSnapshot(msg) {
       state.gotSnapshot = true;
-      state.maxCandles = msg.maxCandles || 100;
+      state.maxCandles = msg.maxCandles || 300;
       if (msg.pairs) state.pairs = msg.pairs;
       if (msg.timeframes) state.timeframes = msg.timeframes;
 

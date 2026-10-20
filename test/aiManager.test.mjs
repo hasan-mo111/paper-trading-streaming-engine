@@ -12,8 +12,9 @@
  *    3. CHEAP CYCLES WHILE A TRADE IS OPEN — the model is only consulted every
  *       MANAGEMENT_EVERY cycles, the rest are free tick-level statuses.
  *
- *  Plus the seal: with a key configured, no frame and no status payload may
- *  contain a level in the clear, and the ciphertext must open with the key.
+ *  The feed is plaintext: every frame and every status payload must carry the
+ *  exact levels a client acts on, because the trade rides the same public SSE
+ *  connection as the candles.
  *
  *  Run:  node test/aiManager.test.mjs
  * ============================================================================= */
@@ -21,7 +22,6 @@
 import assert from 'node:assert/strict';
 
 import { AiAnalystManager } from '../src/services/aiAnalystManager.js';
-import { decryptSignal } from '../src/services/signalCipher.js';
 import { CHAT_TYPES } from '../src/services/sseDispatcher.js';
 
 let passed = 0;
@@ -46,7 +46,6 @@ const PAIRS = [
   ['USD/JPY', 'USDJPY'],
   ['GBP/USD', 'GBPUSD'],
 ];
-const HEX_KEY = '44f5057bf5ad263ac8d571ea796711a7657514563a4a59d5e0962a989d4e19f0';
 
 function baseCfg(over = {}) {
   return {
@@ -76,8 +75,6 @@ function baseCfg(over = {}) {
     CATCHUP_MAX: 3,
     TRACK_ENABLED: true,
     STATUS_EVERY_CYCLE: true,
-    ENC_KEY: '',
-    ENC_ALGO: 'aes-256-gcm',
     ...over,
   };
 }
@@ -320,64 +317,31 @@ await test('without an open trade every cycle still asks the model', async () =>
   assert.equal(mgr.status().openTrades.length, 0);
 });
 
-/* ---- 4. the seal --------------------------------------------------------- */
+/* ---- 4. plaintext feed --------------------------------------------------- */
 
-await test('with a key set, no frame carries a level in the clear', async () => {
-  const cfg = baseCfg({ ENC_KEY: HEX_KEY });
-  const dispatcher = fakeDispatcher();
-  const mgr = makeManager(cfg, { dispatcher });
-
-  await mgr.run('manual');
-  const frame = dispatcher.pushed.find((m) => m.type === CHAT_TYPES.AI_SIGNAL);
-  assert.ok(frame, 'a signal frame should have been published');
-
-  const json = JSON.stringify(frame);
-  for (const leak of ['entry_price', 'stop_loss', 'take_profit', 'BUY', '2400']) {
-    assert.equal(json.includes(leak), false, `frame leaked "${leak}": ${json.slice(0, 300)}`);
-  }
-  assert.equal(frame.meta.enc.startsWith('v1.'), true);
-  assert.equal(frame.meta.encAlg, 'aes-256-gcm');
-
-  const payload = decryptSignal(frame.meta.enc, HEX_KEY);
-  assert.equal(payload.symbol, 'XAUUSD');
-  assert.equal(payload.action, 'BUY');
-  assert.equal(Math.round(payload.entry_price), 2400);
-  assert.equal(typeof payload.ts, 'number');
-
-  // A frame sealed with our key must NOT open with a different one.
-  assert.throws(() => decryptSignal(frame.meta.enc, 'f'.repeat(64)));
-});
-
-await test('status() hides the trade book but publishes the ciphertext', async () => {
-  const cfg = baseCfg({ ENC_KEY: HEX_KEY, SYMBOLS: ['XAUUSD'] });
-  const mgr = makeManager(cfg);
-
-  await mgr.run('manual');
-  const status = mgr.status();
-  const json = JSON.stringify(status);
-
-  assert.equal(status.encrypted, true);
-  assert.equal(status.perSymbol.XAUUSD.lastSignal, null, 'plaintext signal must not be exposed');
-  assert.equal(status.perSymbol.XAUUSD.position, null, 'plaintext position must not be exposed');
-  assert.equal(status.perSymbol.XAUUSD.positionOpen, true, 'but its existence must be reported');
-  assert.equal(json.includes('entry_price'), false, 'status leaked a level');
-  assert.equal(json.includes('stop_loss'), false);
-
-  const blob = status.signals.XAUUSD;
-  assert.equal(blob.startsWith('v1.'), true);
-  assert.equal(decryptSignal(blob, HEX_KEY).action, 'BUY');
-});
-
-await test('without a key the payload stays plaintext (legacy deployments keep working)', async () => {
+await test('the published frame carries the levels in the clear', async () => {
   const dispatcher = fakeDispatcher();
   const mgr = makeManager(baseCfg({ SYMBOLS: ['XAUUSD'] }), { dispatcher });
 
   await mgr.run('manual');
   const frame = dispatcher.pushed.find((m) => m.type === CHAT_TYPES.AI_SIGNAL);
-  assert.equal(frame.meta.enc, undefined);
+  assert.ok(frame, 'a signal frame should have been published');
+
+  // The trade rides the same public socket as the candles: no ciphertext, no
+  // redaction, the exact numbers a client is meant to act on.
   assert.equal(frame.meta.action, 'BUY');
-  assert.equal(mgr.status().encrypted, false);
-  assert.equal(mgr.status().signals.XAUUSD, undefined);
+  assert.equal(Math.round(frame.meta.entry_price), 2400);
+  assert.equal(Math.round(frame.meta.stop_loss), 2388);
+  assert.equal(Math.round(frame.meta.take_profit_1), 2418);
+  assert.equal(typeof frame.meta.ts, 'number');
+  assert.equal(frame.meta.enc, undefined, 'the wire must no longer carry ciphertext');
+
+  // /api/ai/signal replays the same trade, not a redacted shell.
+  const status = mgr.status();
+  assert.equal(status.perSymbol.XAUUSD.lastSignal.action, 'BUY');
+  assert.equal(status.perSymbol.XAUUSD.positionOpen, true);
+  assert.equal(status.signals, undefined);
+  assert.equal(status.encrypted, undefined);
 });
 
 /* ---------------------------------------------------------------- summary */

@@ -30,7 +30,6 @@
 import { getSymbolSpec, roundPrice } from '../config/db.js';
 import { createLogger } from './logger.js';
 import { CHAT_TYPES } from './sseDispatcher.js';
-import { encryptSignal } from './signalCipher.js';
 
 const log = createLogger('ai');
 
@@ -202,8 +201,6 @@ export class AiSignalService {
     };
     /** The most recent validated signal, replayed to new readers. */
     this.lastSignal = null;
-    /** Ciphertext of `lastSignal`, for /api/ai/signal when sealed mode is on. */
-    this.lastSignalEnc = null;
     /** De-dupe key so an unchanged read does not spam Telegram. */
     this.lastTelegramKey = null;
 
@@ -223,12 +220,6 @@ export class AiSignalService {
     /** Catch-up retry timer, plus how many were burned inside the current interval. */
     this.catchupTimer = null;
     this.catchupsUsed = 0;
-  }
-
-  /** A sealed payload the mobile client opened successfully is the only proof
-   *  the wire format is right. Cached so /api/ai/signal can replay it. */
-  get secure() {
-    return Boolean(this.cfg.ENC_KEY);
   }
 
   /* ------------------------------------------------------------- lifecycle */
@@ -282,7 +273,6 @@ export class AiSignalService {
   /* ----------------------------------------------------------------- status */
 
   status() {
-    const secure = this.secure;
     return {
       enabled: this.enabled,
       configured: Boolean(this.cfg.OPENROUTER_API_KEY),
@@ -296,14 +286,13 @@ export class AiSignalService {
       telegram: Boolean(this.cfg.TELEGRAM && (this.telegram || this.cfg.TELEGRAM_CHAT_ID)),
       trackEnabled: Boolean(this.cfg.TRACK_ENABLED),
       statusEveryCycle: Boolean(this.cfg.STATUS_EVERY_CYCLE),
-      encrypted: secure,
       ...this.stats,
       catchupsUsed: this.catchupsUsed,
-      // A sealed deployment must never leak the trade through this payload:
-      // the plaintext levels are replaced by the ciphertext the app can open.
-      lastSignal: secure ? null : this.lastSignal,
-      signalEnc: secure ? this.lastSignalEnc : null,
-      position: secure ? null : this.position,
+      // Plaintext on purpose: the same levels ride the public chart feed, and
+      // hiding them here while publishing them on /stream would only make the
+      // REST replay disagree with the live one.
+      lastSignal: this.lastSignal,
+      position: this.position,
       positionOpen: Boolean(this.position),
       historyCount: this.history.length,
       news: this.news?.status?.() ?? null,
@@ -881,8 +870,9 @@ export class AiSignalService {
    * @param {'opened'|'management'|'hold'|'signal'} kind
    */
   /**
-   * The exact payload the phone receives, encrypted or not.
-   * Kept in one place so the plaintext and sealed paths can never drift.
+   * The exact payload published on the feed (and returned by /api/ai/signal).
+   * One shape for every consumer: the dashboard, the mobile PWA and Telegram
+   * must never see a different trade.
    */
   #signalPayload(signal, snapshot, kind, reason) {
     return {
@@ -911,52 +901,12 @@ export class AiSignalService {
 
   #publishStatus(signal, snapshot, reason, kind) {
     const severity = signal.action === 'HOLD' ? 'info' : signal.valid ? 'success' : 'warning';
-    const payload = this.#signalPayload(signal, snapshot, kind, reason);
 
-    let message;
-    let meta;
-
-    if (this.secure) {
-      // Sealed mode: the frame carries ciphertext and routing only. The levels
-      // must not appear anywhere in it — not in meta, not in the message text.
-      const enc = this.#encryptForMobile(payload);
-      if (!enc) {
-        log.error('AI signal not published — encryption failed while ENC_KEY is set');
-        return;
-      }
-      this.lastSignalEnc = enc;
-      message = `AI ${signal.symbol} · ${kind}`;
-      meta = {
-        source: 'ai-analyst',
-        kind,
-        symbol: signal.symbol,
-        asOf: signal.asOf,
-        encAlg: this.cfg.ENC_ALGO || 'aes-256-gcm',
-        enc,
-      };
-    } else {
-      message = formatChat(signal);
-      meta = {
-        source: 'ai-analyst',
-        reason,
-        kind,
-        symbol: snapshot.symbol,
-        price: snapshot.price,
-        action: signal.action,
-        valid: signal.valid,
-        note: signal.note,
-        rr: signal.rr,
-        confidence: signal.confidence_score,
-        model: signal.model,
-        entry_price: signal.entry_price,
-        stop_loss: signal.stop_loss,
-        take_profit_1: signal.take_profit_1,
-        take_profit_2: signal.take_profit_2,
-        reasoning: signal.reasoning,
-        position: this.position,
-        asOf: signal.asOf,
-      };
-    }
+    // Plaintext by design: the trade rides the same public SSE connection as
+    // the candles, so `meta` carries the levels and `message` is the human
+    // card. There is no second, encrypted wire format to keep in sync.
+    const meta = this.#signalPayload(signal, snapshot, kind, reason);
+    const message = formatChat(signal);
 
     this.dispatcher.push({ type: CHAT_TYPES.AI_SIGNAL, message, severity, meta });
     this.#notifyCycle(signal, snapshot, kind).catch((e) => log.warn('AI Telegram notify failed:', e.message));
@@ -990,26 +940,8 @@ export class AiSignalService {
       ts: Date.now(),
     };
 
-    let message = plain;
-    let meta;
-
-    if (this.secure) {
-      const enc = this.#encryptForMobile(body);
-      if (!enc) {
-        log.error(`AI trade event ${kind} not published — encryption failed while ENC_KEY is set`);
-        return;
-      }
-      message = `AI ${payload.symbol} · ${kind}`;
-      meta = {
-        source: 'ai-analyst',
-        kind,
-        symbol: payload.symbol,
-        encAlg: this.cfg.ENC_ALGO || 'aes-256-gcm',
-        enc,
-      };
-    } else {
-      meta = { ...body, icon };
-    }
+    const message = plain;
+    const meta = { ...body, icon };
 
     this.dispatcher.push({
       type: isClose ? CHAT_TYPES.AI_TRADE_CLOSE : CHAT_TYPES.AI_TRADE_UPDATE,
@@ -1092,21 +1024,6 @@ export class AiSignalService {
     if (this.cfg.TELEGRAM_CHAT_ID) return sendDirect(this.cfg.TELEGRAM_CHAT_ID, text);
     return 0;
   }
-
-  /**
-   * Seal a payload for the mobile client. Returns null only when no key is
-   * configured; a failure with a key configured is logged and the caller
-   * suppresses the frame rather than leaking plaintext.
-   */
-  #encryptForMobile(payload) {
-    if (!this.cfg.ENC_KEY) return null;
-    try {
-      return encryptSignal(payload, this.cfg.ENC_KEY, { algorithm: this.cfg.ENC_ALGO });
-    } catch (e) {
-      log.warn('signal encryption failed:', e.message);
-      return null;
-    }
-  }
 }
 
 /* ================================================================== helpers */
@@ -1139,8 +1056,6 @@ const DEFAULTS = Object.freeze({
   CATCHUP_MAX: 3,
   TRACK_ENABLED: true,
   STATUS_EVERY_CYCLE: true,
-  ENC_KEY: '',
-  ENC_ALGO: 'aes-256-gcm',
 });
 
 /** [epochSeconds, open, high, low, close] — compact to save prompt tokens. */

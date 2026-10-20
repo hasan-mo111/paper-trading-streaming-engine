@@ -239,8 +239,15 @@ const persistence = {
 /* ------------------------------------------------------------------- market - */
 
 const market = {
-  /** Closed candles retained per series in RAM (the ring size). */
-  MAX_CANDLES: int(process.env.MAX_CANDLES, 100, 50, 5_000),
+  /**
+   * Closed candles retained per series in RAM (the ring size).
+   *
+   * Every series is shipped to a new SSE client as part of the `snapshot`, so
+   * this is a bandwidth knob as much as a memory one: 300 bars is three times
+   * the chart history of the old 100-bar ring while each snapshot stays in the
+   * low hundreds of kilobytes. Override with MAX_CANDLES when needed.
+   */
+  MAX_CANDLES: int(process.env.MAX_CANDLES, 300, 50, 5_000),
   /** Static dashboard + legacy public stream. */
   SERVE_PUBLIC: bool(process.env.SERVE_PUBLIC, true),
   TELEGRAM_ENABLED: bool(process.env.TELEGRAM_ENABLED, false),
@@ -338,10 +345,8 @@ const ai = {
   CATCHUP_ENABLED: bool(process.env.AI_SIGNAL_CATCHUP, true),
   CATCHUP_DELAY_MS: int(process.env.AI_SIGNAL_CATCHUP_DELAY_MS, 180_000, 30_000, 900_000),
   CATCHUP_MAX: int(process.env.AI_SIGNAL_CATCHUP_MAX, 3, 0, 10),
-  /** Encryption key for mobile app signal (hex/base64). If set, AI_SIGNAL meta is encrypted. */
-  ENC_KEY: process.env.AI_SIGNAL_ENC_KEY || '',
-  ENC_ALGO: process.env.AI_SIGNAL_ENC_ALGO || 'aes-256-gcm',
-  /** Follow an open trade to TP/SL/reversal and refuse a new entry meanwhile. */
+  /** Exit behaviour while a trade is open: TP1 moves the stop to breakeven,
+   *  TP2/SL/reversal close the tracked trade. */
   TRACK_ENABLED: bool(process.env.AI_SIGNAL_TRACK, true),
   /** Send one Telegram message every cycle: a new signal, a management update
    *  for the open trade, or the reason for standing aside. Without this a
@@ -435,7 +440,6 @@ export function publicEnv() {
       symbols: ai.SYMBOLS,
       staggerMs: ai.STAGGER_MS,
       managementEvery: ai.MANAGEMENT_EVERY,
-      sealed: Boolean(ai.ENC_KEY),
       intervalMs: ai.INTERVAL_MS,
       minRR: ai.MIN_RR,
       telegram: ai.TELEGRAM,

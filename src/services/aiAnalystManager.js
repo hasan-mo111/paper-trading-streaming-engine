@@ -164,20 +164,18 @@ export class AiAnalystManager {
   /**
    * Aggregate status for /health and /api/ai/signal.
    *
-   * A per-symbol `status()` already redacts every level when sealed mode is on;
-   * the aggregate therefore only has to collect the sealed blobs and hoist the
-   * shared counters into one place.
+   * Every per-symbol status is plaintext now: the levels travel on the public
+   * SSE feed exactly as they do here, so the aggregate is a straight
+   * collection plus the shared counters.
    */
   status() {
     const perSymbol = {};
-    const signals = {};
     const totals = Object.fromEntries(COUNTERS.map((k) => [k, 0]));
 
     for (const [symbol, svc] of this.services) {
       const st = svc.status();
       perSymbol[symbol] = { ...st, news: undefined };
       for (const key of COUNTERS) totals[key] += Number(st[key] || 0);
-      if (st.signalEnc) signals[symbol] = st.signalEnc;
     }
 
     const cooldownMs = this.cooldownRemainingMs();
@@ -193,7 +191,6 @@ export class AiAnalystManager {
       rateLimitFactor: this.factor,
       staggerMs: this.cfg.STAGGER_MS,
       managementEvery: this.cfg.MANAGEMENT_EVERY,
-      encrypted: [...this.services.values()].every((svc) => svc.secure) || false,
       running: this.running,
       cycle: this.cycle,
       catchupsUsed: this.catchupsUsed,
@@ -206,8 +203,6 @@ export class AiAnalystManager {
         .map(([symbol]) => symbol),
       ...totals,
       perSymbol,
-      /** symbol → sealed payload. Never plaintext when a key is configured. */
-      signals,
       news: this.news?.status?.() ?? null,
     };
   }
@@ -291,18 +286,17 @@ export class AiAnalystManager {
   /**
    * Reduce a per-symbol run to a summary that can be published safely.
    *
-   * The analyst's own return value carries the full signal object so that
-   * direct callers (tests, tools) can inspect it. On a sealed deployment that
-   * object is exactly what must not travel: `run()` results reach clients
-   * through GET /api/ai/analyze, and the manager keeps them in status().
+   * `run()` results reach clients through GET /api/ai/analyze and the manager
+   * keeps them in status(), so this stays a small summary rather than the full
+   * signal object — but the direction is part of that summary now that the feed
+   * is plaintext.
    *
    * @param {string} symbol
    * @param {object} r      what the service returned
-   * @param {object} svc    the service, for its seal state
+   * @param {object} svc    the service (unused, kept for call-site symmetry)
    * @param {string} [skipped]
    */
   #summarise(symbol, r, svc, skipped = null) {
-    const secure = Boolean(svc?.secure);
     const out = {
       symbol,
       ok: Boolean(r?.ok),
@@ -311,9 +305,7 @@ export class AiAnalystManager {
       effect: r?.effect ?? r?.kind ?? null,
       skipped: skipped ?? null,
     };
-    // BUY/SELL is half the signal: only the operator's own view (plaintext
-    // mode) may see it. Sealed clients get it after decrypting meta.enc.
-    if (!secure && r?.signal) out.action = r.signal.action ?? null;
+    if (r?.signal) out.action = r.signal.action ?? null;
     return out;
   }
 
@@ -339,8 +331,7 @@ export class AiAnalystManager {
       `AI analyst armed — ${this.cfg.MODEL} · ${this.symbols.join(', ')} ` +
         `every ${Math.round(this.baseIntervalMs / 60_000)}m ` +
         `(stagger ${Math.round(Number(this.cfg.STAGGER_MS) / 1000)}s, ` +
-        `management every ${this.cfg.MANAGEMENT_EVERY} cycle(s))` +
-        (this.symbols.some((s) => this.services.get(s).secure) ? ' · sealed' : '')
+        `management every ${this.cfg.MANAGEMENT_EVERY} cycle(s))`
     );
   }
 

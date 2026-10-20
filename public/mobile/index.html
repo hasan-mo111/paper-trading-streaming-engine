@@ -272,7 +272,7 @@
     const toastEl = $('toast');
 
     const state = {
-      pairs: FALLBACK_PAIRS, timeframes: FALLBACK_TFS, maxCandles: 100,
+      pairs: FALLBACK_PAIRS, timeframes: FALLBACK_TFS, maxCandles: 300,
       cache: new Map(), activeKey: null, activeSymbol: DEFAULT_PAIR,
       source: null, gotSnapshot: false, lastUpdateAt: null,
       signal: null, priceLines: [], overlayKey: '',
@@ -691,7 +691,7 @@
 
     function onSnapshot(msg) {
       state.gotSnapshot = true;
-      state.maxCandles = msg.maxCandles || 100;
+      state.maxCandles = msg.maxCandles || 300;
       if (msg.pairs?.length) state.pairs = msg.pairs;
       if (msg.timeframes?.length) state.timeframes = msg.timeframes;
 

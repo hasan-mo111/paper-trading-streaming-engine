@@ -414,13 +414,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
           : 'idle — OPENROUTER_API_KEY not set'
     }`
   );
-  log.raw(
-    `  AI payload  : ${
-      env.ai.ENC_KEY
-        ? `sealed for mobile (${env.ai.ENC_ALGO}) · Telegram plaintext`
-        : 'PLAINTEXT — set AI_SIGNAL_ENC_KEY to seal mobile payloads'
-    }`
-  );
+  log.raw('  AI payload  : PLAINTEXT on /stream (same connection as the candles)');
   log.raw(`  AI tracking : ${env.ai.TRACK_ENABLED ? 'one trade at a time · Telegram status every cycle' : 'signal-only (no tracking)'}`);
   log.raw(`  Calendar    : ${news.enabled ? `${env.news.MIN_IMPACT}+ events within ${env.news.HORIZON_H}h` : 'disabled'}`);
   log.raw(`  Streams     : /stream · /api/stream/prices · /api/stream/chat-events`);

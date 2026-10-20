@@ -3,11 +3,11 @@
  *  Developed by Eng Hasan Mohamad
  * -----------------------------------------------------------------------------
  *  Boots a mock upstream server, points server.js at it, then asserts:
- *    1. all 20 series backfill with exactly 100 closed candles + 1 forming
+ *    1. all 20 series backfill with exactly MAX_CANDLES closed candles + 1 forming
  *    2. /stream sends a full `snapshot` as the FIRST event
  *    3. live `update` events arrive, throttled to ~400ms, never faster
  *    4. tick → candle folding keeps close/high/low consistent
- *    5. candle rollover pushes a `closed` candle and keeps the ring at 100
+ *    5. candle rollover pushes a `closed` candle and keeps the ring capped
  *    6. SSE client filtering (?symbol=&interval=) works
  *    7. the dashboard HTML + REST endpoints are served
  *    8. exponential backoff reconnects after the upstream drops
@@ -31,6 +31,9 @@ const ROOT = path.join(__dirname, '..');
 const APP_PORT = 3199;
 const MOCK_PORT = 4599;
 const APP = `http://127.0.0.1:${APP_PORT}`;
+/* The server child inherits this environment, so both processes agree on the
+ * ring size. Keep the fallback in sync with env.js. */
+const RING = Number(process.env.MAX_CANDLES || 300);
 
 /* ------------------------------------------------------------------ utils */
 let passed = 0;
@@ -151,9 +154,9 @@ check('symbols subscribed upstream', health?.upstream?.subscribed === true);
 check('20 series (4 pairs × 5 timeframes)', health?.market?.series === 20, `got ${health?.market?.series}`);
 check('all series ready', health?.market?.ready === 20, `${health?.market?.ready}/${health?.market?.series}`);
 check(
-  'every series holds exactly 100 closed candles',
+  `every series holds exactly ${RING} closed candles`,
   (await get('/api/snapshot')).series &&
-    Object.values((await get('/api/snapshot')).series).every((s) => s.candles.length === 100),
+    Object.values((await get('/api/snapshot')).series).every((s) => s.candles.length === RING),
   'per-series ring size'
 );
 check('D1 series exist for the 50-day Donchian', (await get('/api/snapshot')).series['XAUUSD|86400'] !== undefined);
@@ -171,7 +174,7 @@ check('every series reports fresh data', allSeries.every((s) => s.fresh));
 
 const xau = await get('/api/market/candles?symbol=XAUUSD&interval=900');
 const LAST = () => xau.candles?.at(-1); // read lazily: may be empty if backfill failed
-check('REST /api/market/candles → 100 candles', xau.candles.length === 100, `got ${xau.candles.length}`);
+check(`REST /api/market/candles → ${RING} candles`, xau.candles.length === RING, `got ${xau.candles.length}`);
 check('candles are ascending by time', xau.candles.every((c, i, a) => i === 0 || c.time > a[i - 1].time));
 check('candles sit on the 900s grid', xau.candles.every((c) => c.time % 900 === 0));
 check('OHLC values are numbers', xau.candles.every((c) => [c.open, c.high, c.low, c.close].every(Number.isFinite)));
@@ -191,7 +194,7 @@ const events = await sseClient('/stream', { durationMs: 7000 });
 const first = events[0];
 check('first SSE event is `snapshot`', first?.event === 'snapshot', first?.event);
 check('snapshot contains 20 series', Object.keys(first?.json?.series ?? {}).length === 20, `${Object.keys(first?.json?.series ?? {}).length}`);
-check('snapshot has 100 candles per series', Object.values(first?.json?.series ?? {}).every((s) => s.candles.length === 100));
+check(`snapshot has ${RING} candles per series`, Object.values(first?.json?.series ?? {}).every((s) => s.candles.length === RING));
 check('snapshot advertises pairs + timeframes', first?.json?.pairs?.length === 4 && first?.json?.timeframes?.length === 5, `${first?.json?.pairs?.length}×${first?.json?.timeframes?.length}`);
 check('snapshot names its data source', typeof first?.json?.source === 'string', first?.json?.source);
 check('snapshot includes upstream status', typeof first?.json?.upstream?.connected === 'boolean');
@@ -227,11 +230,11 @@ check('all 20 series are streaming', Object.values((await get('/api/snapshot')).
 check('a forming candle exists on the daily series', !!(await get('/api/market/candles?symbol=XAUUSD&interval=86400')).current);
 
 /* ==================================================== 5. RING INTEGRITY */
-section('4) Candle ring integrity (100 max)');
+section(`4) Candle ring integrity (${RING} max)`);
 const ring = await get('/api/market/candles?symbol=XAUUSD&interval=300');
 const ringLast = ring.candles.at(-1);
 const ringGap = ring.current && ringLast ? ring.current.time - ringLast.time : null;
-check('ring is exactly 100 candles', ring.candles.length === 100, `got ${ring.candles.length}`);
+check(`ring is exactly ${RING} candles`, ring.candles.length === RING, `got ${ring.candles.length}`);
 check('ring stayed sorted', ring.candles.every((c, i, a) => i === 0 || c.time > a[i - 1].time));
 check('ring has no duplicate epochs', new Set(ring.candles.map((c) => c.time)).size === ring.candles.length);
 check('newest closed candle is adjacent to the forming candle', ringGap === 300, `gap ${ringGap}s`);
@@ -250,30 +253,32 @@ const { MarketAggregator } = await import(pathToFileURL(path.join(ROOT, 'server.
     timestamp: new Date((T0 + offsetSec) * 1000).toISOString(),
   });
 
-  // Seed the forming candle, then push 150 more candles through rollover
+  // Seed the forming candle, then push enough candles through rollover to
+  // overfill the ring (RING + 50), so trimming has actually happened.
   agg.applyTick('XAUUSD', tickAt(0, 100));
   const firstEpoch = slot.current.time;
   check('tick is snapped onto the timeframe grid', firstEpoch % 300 === 0, `epoch ${firstEpoch}`);
 
-  for (let i = 1; i <= 150; i++) agg.applyTick('XAUUSD', tickAt(i * 300, 100 + i));
+  const rolls = RING + 50;
+  for (let i = 1; i <= rolls; i++) agg.applyTick('XAUUSD', tickAt(i * 300, 100 + i));
 
-  check('ring stays at exactly 100 after 150 rollovers', slot.candles.length === 100, `got ${slot.candles.length}`);
+  check(`ring stays at exactly ${RING} after ${rolls} rollovers`, slot.candles.length === RING, `got ${slot.candles.length}`);
   check('oldest candles were discarded', slot.candles[0].time > firstEpoch, `oldest kept ${slot.candles[0].time}`);
   check('ring is contiguous after trimming', slot.candles.every((c, i, a) => i === 0 || c.time - a[i - 1].time === 300));
-  check('forming candle is the last epoch', slot.current.time === firstEpoch + 150 * 300);
+  check('forming candle is the last epoch', slot.current.time === firstEpoch + rolls * 300);
   check('only this symbol was touched', agg.store.get('EURUSD|300').candles.length === 0);
 
   // Rollovers must be reported so the client can append the closed candle
   agg.flush();
   let sawClosed = false;
-  agg.applyTick('XAUUSD', tickAt(151 * 300, 999));
+  agg.applyTick('XAUUSD', tickAt((rolls + 1) * 300, 999));
   sawClosed = agg.flush()?.items.some((i) => i.key === 'XAUUSD|300' && i.isNewCandle && !!i.closed);
   check('rollover reports the closed candle', sawClosed);
 
   // In-candle ticks mutate high/low/close, and never close the candle
   const before = { ...slot.current };
-  agg.applyTick('XAUUSD', tickAt(151 * 300 + 30, 1200)); // higher
-  agg.applyTick('XAUUSD', tickAt(151 * 300 + 60, 800));  // lower
+  agg.applyTick('XAUUSD', tickAt((rolls + 1) * 300 + 30, 1200)); // higher
+  agg.applyTick('XAUUSD', tickAt((rolls + 1) * 300 + 60, 800)); // lower
   const now = slot.current;
   check('in-candle tick raises high', now.high >= 1200 && now.high > before.high);
   check('in-candle tick lowers low', now.low <= 800 && now.low < before.low);
@@ -287,7 +292,7 @@ const { MarketAggregator } = await import(pathToFileURL(path.join(ROOT, 'server.
   const warnings = [];
   const realWarn = console.warn;
   console.warn = (...a) => warnings.push(a.join(' '));
-  agg.applyTick('XAUUSD', tickAt(151 * 300 + 300 * 10, 1050));
+  agg.applyTick('XAUUSD', tickAt((rolls + 1) * 300 + 300 * 10, 1050));
   console.warn = realWarn;
 
   const filled = slot.candles.filter((c) => c.time > gapFrom);
@@ -296,7 +301,7 @@ const { MarketAggregator } = await import(pathToFileURL(path.join(ROOT, 'server.
   check('filled candles carry the last known close', filled.every((c) => Number.isFinite(c.close) && c.close > 0));
   check('the 10th boundary became the forming candle', slot.current.time === gapFrom + 300 * 10);
   check('the new forming candle opened at the live price', slot.current.open === 1050);
-  check('ring is still exactly 100 after gap-filling', slot.candles.length === 100, `got ${slot.candles.length}`);
+  check(`ring is still exactly ${RING} after gap-filling`, slot.candles.length === RING, `got ${slot.candles.length}`);
   check('the gap was logged as a warning', warnings.some((w) => /gap of 10 candles/.test(w)), warnings[0]?.slice(0, 60));
 }
 
@@ -348,7 +353,7 @@ check('the failure was surfaced as a risk event on the chat stream', /feed error
 check('the disconnect triggered a re-backfill', /backfill complete/i.test(log));
 const after = await get('/health');
 check('state survived the reconnect', after.market.ready === 20, `${after.market.ready}/${after.market.series}`);
-check('candle ring still exactly 100 after reconnect', (await get('/api/market/candles?symbol=XAUUSD&interval=900')).candles.length === 100);
+check(`candle ring still exactly ${RING} after reconnect`, (await get('/api/market/candles?symbol=XAUUSD&interval=900')).candles.length === RING);
 
 /* ================================================= 9. STRATEGY ENGINE BOOT */
 section('8) Strategy engine — indicators and lifecycle');
