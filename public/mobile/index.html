@@ -503,7 +503,7 @@
       updateStatus();
     }
 
-    pairSel.addEventListener('change', () => { render(); renderSignal(); });
+    pairSel.addEventListener('change', () => { render(); renderSignal(); refreshSignal(); });
     tfSel.addEventListener('change', () => { render(); });
 
     /* ==================================================================
@@ -653,13 +653,20 @@
       ].map(([c, k, v]) => `<div class="row"><span class="sw" style="background:${c}"></span><span class="k">${k}</span><span class="v">${v}</span></div>`).join('') : '';
     }
 
-    /** Pull the authoritative last signal (carries `reasoning`, which the SSE meta omits). */
-    async function refreshSignal() {
+    /**
+     * Pull the authoritative record for one pair. The status is multi-symbol,
+     * so the trade lives under `perSymbol[SYMBOL]`; the flat `lastSignal` is
+     * only a legacy fallback. Called on load, on pair change and after a frame
+     * that carried no reasoning text.
+     */
+    async function refreshSignal(symbol = state.activeSymbol) {
       try {
         const res = await fetch('/api/ai/signal', { cache: 'no-store' });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const j = await res.json();
-        if (j && j.lastSignal) setSignal(j.lastSignal);
+        const key = Object.keys(j?.perSymbol ?? {}).find((k) => sameSymbol(k, symbol));
+        const sig = (key ? j.perSymbol[key].lastSignal : null) ?? j?.lastSignal ?? null;
+        setSignal(sig);
       } catch (e) {
         if (!state.signal) sigWaiting.textContent = 'Waiting for a signal… (server unreachable)';
       }
@@ -759,7 +766,7 @@
           const m = JSON.parse(e.data);
           if (m?.type === 'AI_SIGNAL') {
             setSignal(m.meta || null);
-            if (!m.meta?.reasoning) refreshSignal();   // pull the full record
+            if (!m.meta?.reasoning) refreshSignal(m.meta?.symbol);   // pull the full record
             toast(`AI signal · ${m.meta?.action || ''} ${m.meta?.symbol || ''}`.trim());
             if (navigator.vibrate) navigator.vibrate(35);
           }
