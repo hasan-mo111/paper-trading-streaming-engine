@@ -114,10 +114,18 @@ services:
         value: auto
       - key: GROQ_API_KEY
         sync: false
+      # Extra accounts: also add GROQ_API_KEY_2 (and _3 …) in the dashboard.
+      # A key that answers 429 is parked and the next one is used automatically.
+      - key: GROQ_API_KEY_2
+        sync: false
       - key: AI_SIGNAL_ENABLED
         value: "true"
       - key: AI_SIGNAL_MODEL
         value: llama-3.3-70b-versatile
+      - key: AI_SIGNAL_FALLBACK_MODELS
+        value: llama-3.1-8b-instant,openai/gpt-oss-120b,openai/gpt-oss-20b
+      - key: AI_SIGNAL_MAX_CALLS_PER_CYCLE
+        value: "6"
       - key: AI_SIGNAL_SYMBOL
         value: XAUUSD
       - key: AI_SIGNAL_INTERVAL_MS

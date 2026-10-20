@@ -22,6 +22,7 @@ import assert from 'node:assert/strict';
 
 import { AiSignalService, SYSTEM_PROMPT, formatChat, formatTelegram, JSON_CORRECTION } from '../src/services/aiSignal.js';
 import { CHAT_TYPES } from '../src/services/sseDispatcher.js';
+import { KeyPool, cooldownForMessage } from '../src/services/keyPool.js';
 
 /* ------------------------------------------------------------ test harness */
 
@@ -414,6 +415,136 @@ await test('an empty completion from the primary model falls back to the provide
   assert.equal(fetchFn.calls[1].body.model, 'llama-3.1-8b-instant');
   assert.ok(fetchFn.calls[1].body.max_tokens >= 8000, 'fallback gets extra headroom');
   assert.equal(svc.stats.fallbacks, 1);
+});
+
+/* ---- 5c. credential rotation + model breadth ---------------------------- */
+
+await testAsync('a 429 parks the first key and retries the same model on the next key', async () => {
+  const calls = [];
+  const fetchFn = async (url, opts) => {
+    calls.push({ url, opts, body: JSON.parse(opts.body) });
+    if (opts.headers.Authorization === 'Bearer key-one') {
+      return {
+        ok: false,
+        status: 429,
+        text: async () =>
+          JSON.stringify({
+            error: {
+              message:
+                'Rate limit reached for model `llama-3.3-70b-versatile` on tokens per day (TPD): Limit 100000',
+            },
+          }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ choices: [{ message: { content: buySignal() } }] }),
+    };
+  };
+  const env = { ai: baseCfg({ API_KEY: 'key-one', API_KEYS: ['key-one', 'key-two'] }) };
+  const svc = new AiSignalService({
+    market: fakeMarket({ price: 2400 }),
+    dispatcher: fakeDispatcher(),
+    telegram: fakeTelegram(),
+    env,
+    fetchFn,
+  });
+  const res = await svc.run('manual');
+
+  assert.equal(res.ok, true, 'the second key should recover the cycle');
+  assert.equal(calls.length, 2, 'one rejected key + one good key');
+  assert.equal(calls[0].opts.headers.Authorization, 'Bearer key-one');
+  assert.equal(calls[1].opts.headers.Authorization, 'Bearer key-two');
+  assert.equal(calls[1].body.model, calls[0].body.model, 'same model, different credential');
+  assert.equal(svc.stats.keyRotations, 1);
+  assert.equal(svc.keyPool.status().available, 1, 'the spent key is parked until the daily reset');
+});
+
+await testAsync('when every key is cooling the run reports rate-limited instead of retrying', async () => {
+  let calls = 0;
+  const fetchFn = async () => {
+    calls += 1;
+    return {
+      ok: false,
+      status: 429,
+      text: async () =>
+        JSON.stringify({ error: { message: 'Rate limit reached on requests per day (RPD)' } }),
+    };
+  };
+  const env = { ai: baseCfg({ API_KEY: 'key-one', API_KEYS: ['key-one', 'key-two'] }) };
+  const svc = new AiSignalService({
+    market: fakeMarket({ price: 2400 }),
+    dispatcher: fakeDispatcher(),
+    telegram: fakeTelegram(),
+    env,
+    fetchFn,
+  });
+  const res = await svc.run('manual');
+
+  assert.equal(res.ok, false);
+  assert.equal(res.error, 'rate-limited');
+  assert.equal(calls, 2, 'each key is tried exactly once');
+  assert.equal(svc.keyPool.status().available, 0);
+  assert.equal(svc.stats.keyRotations, 2);
+});
+
+await testAsync('a decommissioned model walks to the next model in the chain', async () => {
+  const calls = [];
+  const fetchFn = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    calls.push({ url, opts, body });
+    if (body.model === 'gone/model') {
+      return {
+        ok: false,
+        status: 404,
+        text: async () => JSON.stringify({ error: { message: 'The model `gone/model` does not exist' } }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ choices: [{ message: { content: buySignal() } }] }),
+    };
+  };
+  const env = {
+    ai: baseCfg({ MODEL: 'gone/model', FALLBACK_MODELS: ['llama-3.1-8b-instant'] }),
+  };
+  const svc = new AiSignalService({
+    market: fakeMarket({ price: 2400 }),
+    dispatcher: fakeDispatcher(),
+    telegram: fakeTelegram(),
+    env,
+    fetchFn,
+  });
+  const res = await svc.run('manual');
+
+  assert.equal(res.ok, true);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].body.model, 'llama-3.1-8b-instant');
+  assert.equal(svc.stats.keyRotations, 0, 'a missing model is not a credential problem');
+});
+
+await test('cooldownForMessage separates daily limits from per-minute ones', () => {
+  const now = Date.UTC(2026, 0, 2, 12, 0, 0);
+  const daily = cooldownForMessage('tokens per day (TPD) exhausted', now);
+  assert.equal(daily, 12 * 3_600_000, 'daily limits sleep until 00:00 UTC');
+  const minute = cooldownForMessage('Rate limit reached for requests per minute (RPM)', now);
+  assert.equal(minute, 60_000);
+  assert.equal(cooldownForMessage('429 Too Many Requests', now), 5 * 60_000);
+});
+
+await test('KeyPool skips parked slots and wraps around', () => {
+  const pool = new KeyPool(['a', 'b', 'c']);
+  assert.equal(pool.current().key, 'a');
+  pool.markLimited('a', 60_000);
+  assert.equal(pool.current().key, 'b');
+  pool.markLimited('b', 60_000);
+  assert.equal(pool.current().key, 'c');
+  pool.markLimited('c', 60_000);
+  assert.equal(pool.hasAvailable(), false);
+  assert.deepEqual(pool.status().available, 0);
+  assert.equal(pool.status().rotations, 3);
 });
 
 await test('reasoning_content is used when content is empty', async () => {

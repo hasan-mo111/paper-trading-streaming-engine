@@ -276,19 +276,39 @@ const AI_PROVIDERS = Object.freeze({
     label: 'Groq',
     endpoint: 'https://api.groq.com/openai/v1/chat/completions',
     defaultModel: 'llama-3.3-70b-versatile',
-    fallbackModel: 'llama-3.1-8b-instant',
+    /** Free models from the same provider, tried in order. They live on
+     *  different token buckets, so a model that is momentarily throttled does
+     *  not take the whole analyst down with it. */
+    fallbackModels: ['llama-3.1-8b-instant', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
   },
   openrouter: {
     label: 'OpenRouter',
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
     defaultModel: 'openrouter/free',
-    fallbackModel: 'openrouter/free',
+    fallbackModels: ['openrouter/free'],
   },
 });
 
+/**
+ * Collect one or more credentials from:
+ *   GROQ_API_KEY            first key
+ *   GROQ_API_KEY_2 … _8     extra keys (another account each)
+ *   GROQ_API_KEYS=a,b,c     comma-separated alternative
+ *
+ * Order is stable and duplicates are removed. Values never leave the process:
+ * status output reports slot counts only.
+ */
+const keyList = (name) => {
+  const numbered = [];
+  for (let i = 2; i <= 8; i++) numbered.push(process.env[`${name}_${i}`]);
+  return [...new Set([process.env[name], ...numbered, ...list(process.env[`${name}S`])]
+    .map((k) => secret(k))
+    .filter(Boolean))];
+};
+
 const aiKeys = {
-  groq: secret(process.env.GROQ_API_KEY),
-  openrouter: secret(process.env.OPENROUTER_API_KEY),
+  groq: keyList('GROQ_API_KEY'),
+  openrouter: keyList('OPENROUTER_API_KEY'),
 };
 
 /*
@@ -299,9 +319,9 @@ const aiKeys = {
 const requestedProvider = (process.env.AI_SIGNAL_PROVIDER || 'auto').trim().toLowerCase();
 const providerName =
   requestedProvider === 'auto'
-    ? aiKeys.groq
+    ? aiKeys.groq.length
       ? 'groq'
-      : aiKeys.openrouter
+      : aiKeys.openrouter.length
         ? 'openrouter'
         : 'groq'
     : AI_PROVIDERS[requestedProvider]
@@ -317,11 +337,17 @@ const ai = {
   PROVIDER_LABEL: provider.label,
   /** OpenAI-compatible chat-completions endpoint. */
   ENDPOINT: process.env.AI_SIGNAL_ENDPOINT?.trim() || provider.endpoint,
-  /** The key the endpoint expects. Absent ⇒ `configured:false`, loop never fires. */
-  API_KEY: aiKeys[providerName],
-  /** Raw keys, kept so the boot log can name the one that is missing. */
-  GROQ_API_KEY: aiKeys.groq,
-  OPENROUTER_API_KEY: aiKeys.openrouter,
+  /** The first key the endpoint expects. Absent ⇒ `configured:false`. */
+  API_KEY: aiKeys[providerName][0] || '',
+  /** Every key for the active provider, in order. The analyst rotates through
+   *  them when one answers 429/402 (or is rejected outright). */
+  API_KEYS: aiKeys[providerName],
+  /** Raw key lists, kept so the boot log can say which credential is missing
+   *  and so a provider switch can be made without a restart. */
+  GROQ_API_KEY: aiKeys.groq[0] || '',
+  GROQ_API_KEYS: aiKeys.groq,
+  OPENROUTER_API_KEY: aiKeys.openrouter[0] || '',
+  OPENROUTER_API_KEYS: aiKeys.openrouter,
   /** Model id — defaults to the provider's model when AI_SIGNAL_MODEL is unset. */
   MODEL: process.env.AI_SIGNAL_MODEL?.trim() || provider.defaultModel,
   /** Instrument the analyst reads. Kept for single-symbol deployments and for
@@ -382,16 +408,23 @@ const ai = {
   TELEGRAM_CHAT_ID: secret(process.env.AI_SIGNAL_CHAT_ID ?? process.env.TELEGRAM_CHAT_ID),
   /** Model calls attempted within a single cycle before it is declared failed.
    *  Two (ask, then correct) is the quota-sane default: every extra attempt is
-   *  a real request against a free daily cap. */
+   *  a real request against a free daily cap. The effective ceiling is
+   *  `max(MAX_ATTEMPTS, model chain length)`, capped by MAX_CALLS_PER_CYCLE, so
+   *  every configured model gets at least one shot. */
   MAX_ATTEMPTS: int(process.env.AI_SIGNAL_MAX_ATTEMPTS, 2, 1, 6),
+  /** Hard ceiling on model calls per symbol per cycle. Key rotation (same model,
+   *  next credential) does not consume this budget — only model attempts do. */
+  MAX_CALLS_PER_CYCLE: int(process.env.AI_SIGNAL_MAX_CALLS_PER_CYCLE, 6, 1, 20),
   /** Extra model ids tried, in order, once the primary model has failed.
-   *  Pinning two or three instruction-following models lifts the cycle success
-   *  rate far more than re-asking the same random router. */
-  FALLBACK_MODELS: list(process.env.AI_SIGNAL_FALLBACK_MODELS, []),
+   *  Defaults to the provider's free model line-up: different model families
+   *  are metered on separate token buckets, so one throttled model does not
+   *  take the analyst down. */
+  FALLBACK_MODELS: list(process.env.AI_SIGNAL_FALLBACK_MODELS, provider.fallbackModels),
   /** Last-resort model for the active provider, appended after FALLBACK_MODELS.
-   *  Groq: `llama-3.1-8b-instant` (fast, and metered on its own token bucket);
-   *  OpenRouter: the generic free-models router. */
-  FALLBACK_MODEL: process.env.AI_SIGNAL_FALLBACK_MODEL?.trim() || provider.fallbackModel,
+   *  Defaults to the provider's slowest-but-cheapest free model; a deliberate
+   *  `AI_SIGNAL_FALLBACK_MODEL` adds one extra id beyond the configured list. */
+  FALLBACK_MODEL:
+    process.env.AI_SIGNAL_FALLBACK_MODEL?.trim() || provider.fallbackModels.slice(-1)[0] || '',
   /** When a whole cycle fails, retry it sooner than the next interval — a
    *  dropped cycle otherwise means a silent 30-minute hole in the feed. */
   CATCHUP_ENABLED: bool(process.env.AI_SIGNAL_CATCHUP, true),
@@ -490,6 +523,10 @@ export function publicEnv() {
       provider: ai.PROVIDER,
       providerLabel: ai.PROVIDER_LABEL,
       model: ai.MODEL,
+      models: [ai.MODEL, ...ai.FALLBACK_MODELS, ai.FALLBACK_MODEL].filter(
+        (m, i, all) => m && all.indexOf(m) === i
+      ),
+      keys: ai.API_KEYS.length,
       symbol: ai.SYMBOL,
       symbols: ai.SYMBOLS,
       staggerMs: ai.STAGGER_MS,

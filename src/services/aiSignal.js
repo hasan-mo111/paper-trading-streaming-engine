@@ -31,6 +31,7 @@
 import { getSymbolSpec, roundPrice } from '../config/db.js';
 import { createLogger } from './logger.js';
 import { CHAT_TYPES } from './sseDispatcher.js';
+import { KeyPool, cooldownForMessage } from './keyPool.js';
 
 const log = createLogger('ai');
 
@@ -48,6 +49,24 @@ export function isRateLimitError(err) {
   const message = typeof err === 'string' ? err : (err && err.message) || '';
   return /(^|\D)(429|402)(\D|$)|rate.?limit|quota|too many requests|insufficient.?credit/i.test(
     String(message)
+  );
+}
+
+/**
+ * Is this a CREDENTIAL problem rather than a model problem? Quota exhaustion
+ * (429/402) and rejected keys (401/403) are cured by rotating to the next slot;
+ * a timeout, a 500 or a malformed completion is not.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isKeyError(err) {
+  const message = typeof err === 'string' ? err : (err && err.message) || '';
+  return (
+    isRateLimitError(message) ||
+    /(^|\D)(401|403)(\D|$)|invalid[_\s-]?api[_\s-]?key|unauthori[sz]ed|authentication|incorrect api key/i.test(
+      String(message)
+    )
   );
 }
 
@@ -146,8 +165,18 @@ export class AiSignalService {
    * @param {object}  [opts.telegram]      Telegram gateway handle ({ notifyAll })
    * @param {Function} [opts.fetchFn]      fetch override (tests)
    * @param {object}  [opts.news]          EconomicNewsService (optional)
+   * @param {object}  [opts.keyPool]       shared KeyPool (the manager passes one
+   *                                       so all symbols rotate together)
    */
-  constructor({ market, dispatcher, env = null, telegram = null, fetchFn = null, news = null } = {}) {
+  constructor({
+    market,
+    dispatcher,
+    env = null,
+    telegram = null,
+    fetchFn = null,
+    news = null,
+    keyPool = null,
+  } = {}) {
     if (!market) throw new Error('AiSignalService requires a market aggregator');
     if (!dispatcher) throw new Error('AiSignalService requires an SSE dispatcher');
 
@@ -163,7 +192,13 @@ export class AiSignalService {
     this.telegram = telegram;
     this.fetchFn = fetchFn ?? globalThis.fetch;
 
-    this.enabled = Boolean(this.cfg.ENABLED && this.#apiKey());
+    // One pool per process, not per symbol: four services sharing a single key
+    // list means key 1's daily budget is spent once, not re-discovered by four
+    // independent loops. Standalone use (tests, embedded) builds its own.
+    this.keyPool =
+      keyPool ?? new KeyPool(this.#configuredKeys(this.cfg));
+
+    this.enabled = Boolean(this.cfg.ENABLED && this.keyPool.size);
 
     /** Guard so a slow model call cannot be overlapped by the next tick. */
     this.running = false;
@@ -186,6 +221,8 @@ export class AiSignalService {
       reversals: 0,
       statuses: 0,
       rateLimits: 0,
+      /** Times a quota/credential error moved the analyst to the next key. */
+      keyRotations: 0,
       lastRunAt: null,
       lastError: null,
       lastModel: null,
@@ -216,16 +253,31 @@ export class AiSignalService {
 
   /* ------------------------------------------------------------- lifecycle */
 
-  /** The provider key actually in use (blank ⇒ the analyst stays idle). */
-  #apiKey() {
-    return String(this.cfg.API_KEY || this.cfg.OPENROUTER_API_KEY || '').trim();
+  /**
+   * Keys the environment gave us for this provider. `API_KEYS` is the resolved
+   * list (one or more accounts); `API_KEY` is the single-key fallback used by
+   * tests and older boot paths.
+   *
+   * @param {object} cfg
+   * @returns {string[]}
+   */
+  #configuredKeys(cfg = this.cfg) {
+    const list = Array.isArray(cfg.API_KEYS) ? cfg.API_KEYS : [];
+    const keys = list.map((k) => String(k || '').trim()).filter(Boolean);
+    if (keys.length) return keys;
+    // Older call sites only set the provider-specific key, never API_KEY. Never
+    // borrow the OTHER provider's credential: that would enable the analyst with
+    // a token the active endpoint rejects.
+    const legacy = cfg.PROVIDER === 'openrouter' ? cfg.OPENROUTER_API_KEY : cfg.GROQ_API_KEY;
+    const single = String(cfg.API_KEY || legacy || '').trim();
+    return single ? [single] : [];
   }
 
   /** Schedule the automatic loop. No-op when disabled or unconfigured. */
   start() {
     if (!this.enabled) {
       log.info(
-        this.#apiKey()
+        this.keyPool.size
           ? 'AI analyst disabled (AI_SIGNAL_ENABLED=false)'
           : `AI analyst idle — no ${this.cfg.PROVIDER_LABEL || 'provider'} API key ` +
               `(${this.cfg.PROVIDER === 'groq' ? 'GROQ_API_KEY' : 'AI provider key'} not set)`
@@ -273,12 +325,16 @@ export class AiSignalService {
   status() {
     return {
       enabled: this.enabled,
-      configured: Boolean(this.#apiKey()),
+      configured: this.keyPool.size > 0,
       provider: this.cfg.PROVIDER,
       providerLabel: this.cfg.PROVIDER_LABEL,
       running: this.running,
       symbol: this.cfg.SYMBOL,
       model: this.cfg.MODEL,
+      /** Full attempt order, so a failing model is visible without a log dive. */
+      modelChain: this.#modelChain(),
+      /** Slot counts only — never key material. */
+      keys: this.keyPool.status(),
       intervalMs: this.cfg.INTERVAL_MS,
       bootDelayMs: this.cfg.BOOT_DELAY_MS,
       maxTokens: this.cfg.MAX_TOKENS,
@@ -337,7 +393,9 @@ export class AiSignalService {
         newsLines = this.news.forPrompt();
       }
 
-      const attempt = await this.#askWithRetries(snapshot, newsLines);
+      const attempt = await this.#askWithRetries(snapshot, newsLines, {
+        force: reason === 'manual',
+      });
 
       if (!attempt.parsed.ok) {
         const rateLimited = Boolean(attempt.rateLimited);
@@ -605,7 +663,12 @@ export class AiSignalService {
 
   /* ============================================================== model call */
 
-  async #askModel(snapshot, model = this.cfg.MODEL, maxTokens = this.cfg.MAX_TOKENS, { correction = null, news = [] } = {}) {
+  async #askModel(
+    snapshot,
+    model = this.cfg.MODEL,
+    maxTokens = this.cfg.MAX_TOKENS,
+    { correction = null, news = [], key = '' } = {}
+  ) {
     const user = buildUserMessage(snapshot, news);
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
@@ -632,7 +695,7 @@ export class AiSignalService {
       }
 
       const headers = {
-        Authorization: `Bearer ${this.#apiKey()}`,
+        Authorization: `Bearer ${key}`,
         'Content-Type': 'application/json',
       };
       // OpenRouter attribution headers — optional, but they help the free tier
@@ -693,47 +756,95 @@ export class AiSignalService {
   }
 
   /**
-   * Ask the model chain until one reply parses, correcting a prose answer and
-   * escalating models on failure.
+   * Ask the model chain until one reply parses, rotating credentials on quota
+   * errors and escalating models on everything else.
    *
-   * Free routers are flaky in two different ways, and they need different
-   * responses:
-   *   • the call itself fails (timeout, 429, empty completion) → try the next
-   *     model in the chain, with extra headroom for reasoning variants;
-   *   • the call succeeds but answers in prose → re-ask with the JSON-only
-   *     correction turn. Re-asking the same model is what actually recovers a
-   *     chatty reply, so a repeat model is deliberate, not a bug.
+   * Two independent failure axes, two different responses:
+   *   • the CREDENTIAL is out (429/402, or a rejected 401/403) → park that key,
+   *     retry the same model with the next slot. This does not consume model
+   *     budget and does not count as a fallback.
+   *   • the MODEL cannot answer (timeout, empty completion, a malformed reply,
+   *     a decommissioned id) → walk to the next model in the chain, giving it
+   *     the JSON-only correction turn and extra token headroom.
    *
-   * @returns {Promise<{call:object, parsed:object, attempts:number}>}
+   * The loop only reports `rateLimited` when every key is cooling down — that is
+   * a real quota wall, and the manager should stretch the whole cycle interval.
+   *
+   * @returns {Promise<{call:object, parsed:object, attempts:number, rateLimited?:boolean}>}
    */
-  async #askWithRetries(snapshot, newsLines = []) {
+  async #askWithRetries(snapshot, newsLines = [], { force = false } = {}) {
     const chain = this.#modelChain();
-    const maxAttempts = Math.max(1, this.cfg.MAX_ATTEMPTS);
+    // Every configured model gets at least one shot; MAX_ATTEMPTS still buys a
+    // correction turn when the chain is short. The hard ceiling protects the
+    // daily quota from a pathological all-fail cycle.
+    const maxCalls = Math.max(
+      1,
+      Math.min(
+        Math.max(1, Number(this.cfg.MAX_CALLS_PER_CYCLE) || 6),
+        Math.max(1, Number(this.cfg.MAX_ATTEMPTS) || 1, chain.length)
+      )
+    );
     let call = { content: '', model: chain[0] };
     let parsed = { ok: false, error: 'no attempt made' };
+    let i = 0;
+    // A manual ask may wake a parked key once; automatic cycles never do.
+    let mayForce = Boolean(force);
 
-    for (let i = 0; i < maxAttempts; i++) {
+    while (i < maxCalls) {
       const model = chain[Math.min(i, chain.length - 1)];
       // Attempt 0 asks cleanly; every later attempt spells out the contract and
       // buys extra headroom in case a preamble ate the token budget.
       const correction = i === 0 ? null : JSON_CORRECTION;
-      const maxTokens = i === 0 ? this.cfg.MAX_TOKENS : Math.max(this.cfg.MAX_TOKENS, 4_000);
+      const maxTokens = i === 0 ? this.cfg.MAX_TOKENS : Math.max(this.cfg.MAX_TOKENS, 8_000);
+
+      // Pick a credential for this attempt. `current()` throws only when every
+      // slot is cooling down, which means the quota is genuinely spent.
+      let slot;
+      try {
+        slot = this.keyPool.current(Date.now(), { force: mayForce });
+        mayForce = false;
+      } catch (e) {
+        this.stats.rateLimits += 1;
+        this.stats.lastError = `rate-limit: ${e.message}`;
+        return { call, parsed: { ok: false, error: e.message }, attempts: i, rateLimited: true };
+      }
 
       try {
-        call = await this.#askModel(snapshot, model, maxTokens, { correction, news: newsLines });
+        call = await this.#askModel(snapshot, model, maxTokens, {
+          correction,
+          news: newsLines,
+          key: slot.key,
+        });
         parsed = this.#parseJson(call.content);
-        if (parsed.ok) return { call, parsed, attempts: i + 1 };
+        if (parsed.ok) {
+          this.keyPool.markOk(slot.key);
+          return { call, parsed, attempts: i + 1 };
+        }
         log.warn(
-          `AI analyst: attempt ${i + 1}/${maxAttempts} on "${model}" was not JSON ` +
+          `AI analyst: attempt ${i + 1}/${maxCalls} on "${model}" was not JSON ` +
             `(${parsed.error}; finish_reason=${call.finishReason ?? 'unknown'})`
         );
       } catch (e) {
-        log.warn(`AI analyst: attempt ${i + 1}/${maxAttempts} on "${model}" failed — ${e.message}`);
+        log.warn(
+          `AI analyst: attempt ${i + 1}/${maxCalls} on "${model}" ` +
+            `(key ${slot.slot}/${this.keyPool.size}) failed — ${e.message}`
+        );
         parsed = { ok: false, error: e.message };
-        // A quota rejection is not a malformed reply: retrying (or walking the
-        // fallback chain) would burn more of a quota that is already spent and
-        // only deepen the hole. Stop here and let the caller back off.
-        if (isRateLimitError(e.message)) {
+
+        if (isKeyError(e.message)) {
+          const quota = isRateLimitError(e.message);
+          // Daily counters reset at 00:00 UTC; per-minute limits in a minute.
+          // A rejected credential is parked for a day: it will not heal itself.
+          const cooldownMs = quota ? cooldownForMessage(e.message) : 24 * 3_600_000;
+          this.keyPool.markLimited(slot.key, cooldownMs);
+          this.stats.keyRotations += 1;
+          this.stats.lastError = `key ${slot.slot}: ${e.message}`;
+
+          if (this.keyPool.hasAvailable()) {
+            // Same attempt index, same model, next credential.
+            continue;
+          }
+
           this.stats.rateLimits += 1;
           this.stats.lastError = `rate-limit: ${e.message}`;
           return { call, parsed, attempts: i + 1, rateLimited: true };
@@ -741,8 +852,9 @@ export class AiSignalService {
       }
 
       if (i > 0) this.stats.fallbacks += 1;
+      i += 1;
     }
-    return { call, parsed, attempts: maxAttempts };
+    return { call, parsed, attempts: maxCalls };
   }
 
   /**
@@ -1062,6 +1174,7 @@ const DEFAULTS = Object.freeze({
   PROVIDER_LABEL: 'Groq',
   ENDPOINT: 'https://api.groq.com/openai/v1/chat/completions',
   API_KEY: '',
+  API_KEYS: [],
   MODEL: 'llama-3.3-70b-versatile',
   SYMBOL: 'XAUUSD',
   SYMBOLS: ['XAUUSD', 'EURUSD', 'USDJPY', 'GBPUSD'],
@@ -1080,6 +1193,7 @@ const DEFAULTS = Object.freeze({
   TELEGRAM: false,
   TELEGRAM_CHAT_ID: '',
   MAX_ATTEMPTS: 2,
+  MAX_CALLS_PER_CYCLE: 6,
   FALLBACK_MODELS: [],
   FALLBACK_MODEL: 'llama-3.1-8b-instant',
   CATCHUP_ENABLED: true,

@@ -408,11 +408,18 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   log.raw(
     `  AI analyst  : ${
       aiSignal.enabled
-        ? `${env.ai.MODEL} on ${env.ai.PROVIDER_LABEL} every ${Math.round(env.ai.INTERVAL_MS / 60_000)}m on ${aiSignal.symbols.join(', ')}`
+        ? `${env.ai.MODEL} on ${env.ai.PROVIDER_LABEL} · ` +
+          `${env.ai.API_KEYS.length} key${env.ai.API_KEYS.length === 1 ? '' : 's'} · ` +
+          `every ${Math.round(env.ai.INTERVAL_MS / 60_000)}m on ${aiSignal.symbols.join(', ')}`
         : env.ai.API_KEY
           ? 'disabled (AI_SIGNAL_ENABLED=false)'
           : `idle — ${env.ai.PROVIDER === 'groq' ? 'GROQ_API_KEY' : 'OPENROUTER_API_KEY'} not set`
     }`
+  );
+  log.raw(
+    `  AI models   : ${[env.ai.MODEL, ...(env.ai.FALLBACK_MODELS || []), env.ai.FALLBACK_MODEL]
+      .filter((m, i, all) => m && all.indexOf(m) === i)
+      .join(' → ')}`
   );
   log.raw('  AI payload  : PLAINTEXT on /stream (same connection as the candles)');
   log.raw(`  AI tracking : ${env.ai.TRACK_ENABLED ? 'one trade at a time · Telegram status every cycle' : 'signal-only (no tracking)'}`);

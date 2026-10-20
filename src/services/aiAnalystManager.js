@@ -37,6 +37,7 @@
  * ============================================================================= */
 
 import { AiSignalService } from './aiSignal.js';
+import { KeyPool } from './keyPool.js';
 import { SYMBOL_SPECS } from '../config/db.js';
 import { createLogger } from './logger.js';
 
@@ -59,6 +60,7 @@ const COUNTERS = [
   'reversals',
   'statuses',
   'rateLimits',
+  'keyRotations',
 ];
 
 export class AiAnalystManager {
@@ -87,6 +89,18 @@ export class AiAnalystManager {
 
     /** @type {Map<string, AiSignalService>} */
     this.services = new Map();
+
+    // One credential pool for the whole manager. A key that XAUUSD just found
+    // exhausted must be parked for EURUSD too; per-symbol pools would each
+    // rediscover the same spent key and quadruple the wasted requests.
+    this.keyPool = new KeyPool(
+      Array.isArray(this.cfg.API_KEYS) && this.cfg.API_KEYS.length
+        ? this.cfg.API_KEYS
+        : this.cfg.API_KEY
+          ? [this.cfg.API_KEY]
+          : []
+    );
+
     for (const symbol of this.symbols) {
       // Catch-up is a manager concern now: a per-symbol retry timer would fire
       // off-clock and fight the shared one. Everything else is inherited.
@@ -96,7 +110,15 @@ export class AiAnalystManager {
       };
       this.services.set(
         symbol,
-        new AiSignalService({ market, dispatcher, env: scopedEnv, news, telegram, fetchFn })
+        new AiSignalService({
+          market,
+          dispatcher,
+          env: scopedEnv,
+          news,
+          telegram,
+          fetchFn,
+          keyPool: this.keyPool,
+        })
       );
     }
 
@@ -122,7 +144,7 @@ export class AiAnalystManager {
   }
 
   get configured() {
-    return Boolean(this.cfg.API_KEY);
+    return this.keyPool.size > 0;
   }
 
   get baseIntervalMs() {
@@ -188,6 +210,11 @@ export class AiAnalystManager {
       provider: this.cfg.PROVIDER,
       providerLabel: this.cfg.PROVIDER_LABEL,
       model: this.cfg.MODEL,
+      models: [this.cfg.MODEL, ...(this.cfg.FALLBACK_MODELS || []), this.cfg.FALLBACK_MODEL].filter(
+        (m, i, all) => m && all.indexOf(m) === i
+      ),
+      /** Slot counts only — never key material. */
+      keys: this.keyPool.status(),
       intervalMs: this.intervalMs(),
       baseIntervalMs: this.baseIntervalMs,
       rateLimitFactor: this.factor,
@@ -333,7 +360,9 @@ export class AiAnalystManager {
       `AI analyst armed — ${this.cfg.MODEL} on ${this.cfg.PROVIDER_LABEL || 'provider'} · ` +
         `${this.symbols.join(', ')} every ${Math.round(this.baseIntervalMs / 60_000)}m ` +
         `(stagger ${Math.round(Number(this.cfg.STAGGER_MS) / 1000)}s, ` +
-        `management every ${this.cfg.MANAGEMENT_EVERY} cycle(s))`
+        `management every ${this.cfg.MANAGEMENT_EVERY} cycle(s), ` +
+        `${this.keyPool.size} key${this.keyPool.size === 1 ? '' : 's'}, ` +
+        `${this.services.get(this.symbols[0])?.status().modelChain.length || 1} model(s))`
     );
   }
 
