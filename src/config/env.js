@@ -257,25 +257,73 @@ const market = {
 /*
  *  The AI analyst is a SECOND, independent reader of the same candles the
  *  strategy trades: it sends a multi-timeframe snapshot (D1/H4/H1/M15/M5) to a
- *  model on OpenRouter and publishes the strict-JSON verdict it gets back as a
- *  chat message and, optionally, a Telegram alert.
+ *  chat model and publishes the strict-JSON verdict it gets back as a chat
+ *  message and, optionally, a Telegram alert.
+ *
+ *  Every provider below speaks the OpenAI chat-completions dialect, so switching
+ *  is a URL + key + model swap and nothing else in the analyst changes. Groq is
+ *  the default — fast, and its free tier is a daily TOKEN budget instead of a
+ *  request count — and OpenRouter stays one env var away
+ *  (AI_SIGNAL_PROVIDER=openrouter).
  *
  *  It never places an order. The model's `action` is text on a screen; the
  *  strategy engine remains the only thing that can move a position. That is why
  *  every value here is a display/behaviour knob, not an execution one.
  */
 
+const AI_PROVIDERS = Object.freeze({
+  groq: {
+    label: 'Groq',
+    endpoint: 'https://api.groq.com/openai/v1/chat/completions',
+    defaultModel: 'llama-3.3-70b-versatile',
+    fallbackModel: 'llama-3.1-8b-instant',
+  },
+  openrouter: {
+    label: 'OpenRouter',
+    endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+    defaultModel: 'openrouter/free',
+    fallbackModel: 'openrouter/free',
+  },
+});
+
+const aiKeys = {
+  groq: secret(process.env.GROQ_API_KEY),
+  openrouter: secret(process.env.OPENROUTER_API_KEY),
+};
+
+/*
+ * `auto` (the default) prefers Groq and falls back to OpenRouter when only that
+ * key is present. An explicit name wins even without a key, so a wrong value is
+ * visible in the boot log instead of silently switching provider.
+ */
+const requestedProvider = (process.env.AI_SIGNAL_PROVIDER || 'auto').trim().toLowerCase();
+const providerName =
+  requestedProvider === 'auto'
+    ? aiKeys.groq
+      ? 'groq'
+      : aiKeys.openrouter
+        ? 'openrouter'
+        : 'groq'
+    : AI_PROVIDERS[requestedProvider]
+      ? requestedProvider
+      : 'groq';
+const provider = AI_PROVIDERS[providerName];
+
 const ai = {
   /** Master switch — the analyst idles unless enabled AND a key is present. */
   ENABLED: bool(process.env.AI_SIGNAL_ENABLED, true),
-  /** OpenRouter key. Absent ⇒ `configured:false`, the loop never fires. */
-  OPENROUTER_API_KEY: secret(process.env.OPENROUTER_API_KEY),
-  /** OpenRouter model id — any `:free` model works, the name is configurable.
-   *  `openrouter/free` is the free-models router: it always resolves to a
-   *  currently-available free model, so the feature survives model rotation.
-   *  Pin a specific id (e.g. `nvidia/nemotron-3-ultra-550b-a55b:free`) if you
-   *  want deterministic behaviour. */
-  MODEL: process.env.AI_SIGNAL_MODEL?.trim() || 'openrouter/free',
+  /** Provider actually in use: 'groq' | 'openrouter'. */
+  PROVIDER: providerName,
+  PROVIDER_LABEL: provider.label,
+  /** OpenAI-compatible chat-completions endpoint. */
+  ENDPOINT: process.env.AI_SIGNAL_ENDPOINT?.trim() || provider.endpoint,
+  /** The key the endpoint expects. Absent ⇒ `configured:false`, loop never fires. */
+  API_KEY: aiKeys[providerName],
+  /** Raw keys, kept so the boot log can name the one that is missing. */
+  GROQ_API_KEY: aiKeys.groq,
+  OPENROUTER_API_KEY: aiKeys.openrouter,
+  /** Model id — defaults to the provider's model when AI_SIGNAL_MODEL is unset. */
+  MODEL: process.env.AI_SIGNAL_MODEL?.trim() || provider.defaultModel,
   /** Instrument the analyst reads. Kept for single-symbol deployments and for
    *  the per-symbol service inside the multi-symbol manager. */
   SYMBOL: upper(process.env.AI_SIGNAL_SYMBOL, 'XAUUSD'),
@@ -336,10 +384,14 @@ const ai = {
    *  Two (ask, then correct) is the quota-sane default: every extra attempt is
    *  a real request against a free daily cap. */
   MAX_ATTEMPTS: int(process.env.AI_SIGNAL_MAX_ATTEMPTS, 2, 1, 6),
-  /** Extra OpenRouter ids tried, in order, once the primary model has failed.
+  /** Extra model ids tried, in order, once the primary model has failed.
    *  Pinning two or three instruction-following models lifts the cycle success
    *  rate far more than re-asking the same random router. */
   FALLBACK_MODELS: list(process.env.AI_SIGNAL_FALLBACK_MODELS, []),
+  /** Last-resort model for the active provider, appended after FALLBACK_MODELS.
+   *  Groq: `llama-3.1-8b-instant` (fast, and metered on its own token bucket);
+   *  OpenRouter: the generic free-models router. */
+  FALLBACK_MODEL: process.env.AI_SIGNAL_FALLBACK_MODEL?.trim() || provider.fallbackModel,
   /** When a whole cycle fails, retry it sooner than the next interval — a
    *  dropped cycle otherwise means a silent 30-minute hole in the feed. */
   CATCHUP_ENABLED: bool(process.env.AI_SIGNAL_CATCHUP, true),
@@ -430,11 +482,13 @@ export function publicEnv() {
       leg2Pct: strategy.LEG2_PCT,
       leg1AtrMult: strategy.LEG1_ATR_MULT,
     },
-    // Non-secret AI analyst summary: whether it is live, which model, cadence.
-    // The API key itself never appears here.
+    // Non-secret AI analyst summary: whether it is live, which provider/model,
+    // cadence. The API key itself never appears here.
     ai: {
-      enabled: ai.ENABLED && Boolean(ai.OPENROUTER_API_KEY),
-      configured: Boolean(ai.OPENROUTER_API_KEY),
+      enabled: ai.ENABLED && Boolean(ai.API_KEY),
+      configured: Boolean(ai.API_KEY),
+      provider: ai.PROVIDER,
+      providerLabel: ai.PROVIDER_LABEL,
       model: ai.MODEL,
       symbol: ai.SYMBOL,
       symbols: ai.SYMBOLS,
@@ -510,10 +564,15 @@ export function auditEnv() {
 
   // The AI analyst is optional: missing key disables it rather than blocking
   // boot, but saying so out loud beats a silently idle feature.
-  if (ai.ENABLED && !ai.OPENROUTER_API_KEY) {
+  if (ai.ENABLED && !ai.API_KEY) {
     warnings.push(
-      'AI_SIGNAL_ENABLED is on but OPENROUTER_API_KEY is not set — the AI analyst stays idle. ' +
-        'Add the key in Render → Environment to activate it.'
+      `AI_SIGNAL_ENABLED is on but ${ai.PROVIDER === 'groq' ? 'GROQ_API_KEY' : 'OPENROUTER_API_KEY'} ` +
+        `is not set — the AI analyst stays idle. Add it in Render → Environment to activate ${ai.MODEL}.`
+    );
+  }
+  if (requestedProvider !== 'auto' && !AI_PROVIDERS[requestedProvider]) {
+    warnings.push(
+      `AI_SIGNAL_PROVIDER="${requestedProvider}" is not a known provider — using ${provider.label} instead.`
     );
   }
 

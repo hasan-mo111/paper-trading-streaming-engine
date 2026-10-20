@@ -408,10 +408,10 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   log.raw(
     `  AI analyst  : ${
       aiSignal.enabled
-        ? `${env.ai.MODEL} every ${Math.round(env.ai.INTERVAL_MS / 60_000)}m on ${aiSignal.symbols.join(', ')}`
-        : env.ai.OPENROUTER_API_KEY
+        ? `${env.ai.MODEL} on ${env.ai.PROVIDER_LABEL} every ${Math.round(env.ai.INTERVAL_MS / 60_000)}m on ${aiSignal.symbols.join(', ')}`
+        : env.ai.API_KEY
           ? 'disabled (AI_SIGNAL_ENABLED=false)'
-          : 'idle — OPENROUTER_API_KEY not set'
+          : `idle — ${env.ai.PROVIDER === 'groq' ? 'GROQ_API_KEY' : 'OPENROUTER_API_KEY'} not set`
     }`
   );
   log.raw('  AI payload  : PLAINTEXT on /stream (same connection as the candles)');

@@ -8,7 +8,8 @@
  *  WHAT IT DOES
  *  ------------
  *    1. Snapshots five timeframes (D1, H4, H1, M15, M5) for one instrument.
- *    2. Sends them to an OpenRouter model with a strict-JSON system prompt.
+ *    2. Sends them to an OpenAI-compatible chat endpoint (Groq by default,
+ *       OpenRouter available) with a strict-JSON system prompt.
  *    3. Parses the reply and VALIDATES it like any other untrusted input:
  *       direction ∈ {BUY,SELL,HOLD}, prices finite and ordered, entry near the
  *       live quote, reward:risk ≥ MIN_RR. A signal that fails validation is
@@ -34,11 +35,11 @@ import { CHAT_TYPES } from './sseDispatcher.js';
 const log = createLogger('ai');
 
 /**
- * Does this error mean "you have spent your quota"? OpenRouter answers 429 for
- * per-minute/per-day limits and 402 when free credits run out; third-party
- * proxies phrase it as "rate limit" / "quota exceeded". Kept as a module-level
- * export so the multi-symbol manager can back off on the same definition the
- * analyst uses to stop retrying.
+ * Does this error mean "you have spent your quota"? Every provider answers 429
+ * for per-minute/per-day limits (OpenRouter: request/day; Groq: tokens/day),
+ * 402 when credits run out, and third-party proxies phrase it as "rate limit" /
+ * "quota exceeded". Kept as a module-level export so the multi-symbol manager
+ * can back off on the same definition the analyst uses to stop retrying.
  *
  * @param {unknown} err
  * @returns {boolean}
@@ -69,19 +70,10 @@ const FRAMES = Object.freeze([
 const MIN_BARS = 20;
 
 /**
- * The generic OpenRouter free-model router. Used once, as a fallback, whenever
- * the configured model returns an unusable (typically empty) completion — free
- * models rotate and reasoning variants sometimes burn their whole token budget
- * on thought without emitting an answer. One retry keeps the analyst alive.
- */
-export const FALLBACK_MODEL = 'openrouter/free';
-
-/**
- * Appended as an extra user turn when a model answers with prose instead of the
- * JSON contract. Free routers (openrouter/free) pick a model at random, and some
- * open with "Here's the setup…" and never emit an object at all — the parser
- * then has nothing to salvage. One explicit correction recovers the cycle
- * instead of burning a whole interval.
+ * Extra user turn appended when a model answers with prose instead of the JSON
+ * contract. Some open-weights deployments open with "Here's the setup…" and
+ * never emit an object at all — the parser then has nothing to salvage. One
+ * explicit correction recovers the cycle instead of burning a whole interval.
  */
 export const JSON_CORRECTION =
   'Your previous reply was not valid JSON. Reply with ONLY the JSON object described ' +
@@ -89,7 +81,7 @@ export const JSON_CORRECTION =
   'The reply must start with "{" and end with "}".';
 
 /**
- * Pull the answer out of a chat message. OpenRouter keeps the final text in
+ * Pull the answer out of a chat message. Providers keep the final text in
  * `content`, but reasoning models may stash it in `reasoning_content` when the
  * token budget runs out first. Returns a trimmed string, or '' when there is
  * genuinely nothing usable.
@@ -171,7 +163,7 @@ export class AiSignalService {
     this.telegram = telegram;
     this.fetchFn = fetchFn ?? globalThis.fetch;
 
-    this.enabled = Boolean(this.cfg.ENABLED && this.cfg.OPENROUTER_API_KEY);
+    this.enabled = Boolean(this.cfg.ENABLED && this.#apiKey());
 
     /** Guard so a slow model call cannot be overlapped by the next tick. */
     this.running = false;
@@ -224,13 +216,19 @@ export class AiSignalService {
 
   /* ------------------------------------------------------------- lifecycle */
 
+  /** The provider key actually in use (blank ⇒ the analyst stays idle). */
+  #apiKey() {
+    return String(this.cfg.API_KEY || this.cfg.OPENROUTER_API_KEY || '').trim();
+  }
+
   /** Schedule the automatic loop. No-op when disabled or unconfigured. */
   start() {
     if (!this.enabled) {
       log.info(
-        this.cfg.OPENROUTER_API_KEY
+        this.#apiKey()
           ? 'AI analyst disabled (AI_SIGNAL_ENABLED=false)'
-          : 'AI analyst idle — OPENROUTER_API_KEY not set'
+          : `AI analyst idle — no ${this.cfg.PROVIDER_LABEL || 'provider'} API key ` +
+              `(${this.cfg.PROVIDER === 'groq' ? 'GROQ_API_KEY' : 'AI provider key'} not set)`
       );
       return;
     }
@@ -275,7 +273,9 @@ export class AiSignalService {
   status() {
     return {
       enabled: this.enabled,
-      configured: Boolean(this.cfg.OPENROUTER_API_KEY),
+      configured: Boolean(this.#apiKey()),
+      provider: this.cfg.PROVIDER,
+      providerLabel: this.cfg.PROVIDER_LABEL,
       running: this.running,
       symbol: this.cfg.SYMBOL,
       model: this.cfg.MODEL,
@@ -614,31 +614,45 @@ export class AiSignalService {
     // A reply we could not parse gets one follow-up turn spelling out the
     // contract; models that add a preamble usually comply on the second ask.
     if (correction) messages.push({ role: 'user', content: correction });
-    const body = {
-      model,
-      temperature: 0.2,
-      max_tokens: maxTokens,
-      // Best-effort JSON mode. Free models may ignore it; the parser is strict
-      // either way, so an ignored flag degrades gracefully.
-      response_format: { type: 'json_object' },
-      messages,
+
+    // Groq and OpenRouter both speak this dialect, but not every deployment
+    // honours JSON mode; a 400 that names `response_format` is retried once
+    // without it rather than losing the cycle.
+    const ask = (withJsonMode) => {
+      const body = {
+        model,
+        temperature: 0.2,
+        max_tokens: maxTokens,
+        messages,
+      };
+      if (withJsonMode) {
+        // Best-effort JSON mode. The parser is strict either way, so an ignored
+        // flag degrades gracefully.
+        body.response_format = { type: 'json_object' };
+      }
+
+      const headers = {
+        Authorization: `Bearer ${this.#apiKey()}`,
+        'Content-Type': 'application/json',
+      };
+      // OpenRouter attribution headers — optional, but they help the free tier
+      // identify the caller. Other providers reject nothing but do not need them.
+      if (String(this.cfg.ENDPOINT).includes('openrouter.ai')) {
+        headers['HTTP-Referer'] = 'https://github.com/hasan-mo111/paper-trading-streaming-engine';
+        headers['X-Title'] = 'Aetheron Core AI Analyst';
+      }
+
+      return this.fetchFn(this.cfg.ENDPOINT, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.cfg.TIMEOUT_MS),
+      });
     };
 
-    const res = await this.fetchFn('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.cfg.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        // OpenRouter attribution headers — optional, but they help the free
-        // tier identify the caller.
-        'HTTP-Referer': 'https://github.com/hasan-mo111/paper-trading-streaming-engine',
-        'X-Title': 'Aetheron Core AI Analyst',
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.cfg.TIMEOUT_MS),
-    });
-
-    const text = await res.text();
+    const label = this.cfg.PROVIDER_LABEL || 'Provider';
+    let res = await ask(true);
+    let text = await res.text();
     let json = null;
     try {
       json = JSON.parse(text);
@@ -646,9 +660,22 @@ export class AiSignalService {
       /* fall through to the error below */
     }
 
+    // JSON mode unsupported? Ask again without it before declaring failure.
+    if (!res.ok && res.status === 400 && /response_format|json_object|json mode/i.test(text)) {
+      log.warn(`${label} rejected JSON mode for "${model}" — retrying without response_format`);
+      res = await ask(false);
+      text = await res.text();
+      json = null;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        /* fall through to the error below */
+      }
+    }
+
     if (!res.ok) {
       const detail = json?.error?.message ?? text.slice(0, 200) ?? res.status;
-      throw new Error(`OpenRouter ${res.status}: ${detail}`);
+      throw new Error(`${label} ${res.status}: ${detail}`);
     }
 
     const msg = json?.choices?.[0]?.message ?? {};
@@ -720,12 +747,12 @@ export class AiSignalService {
 
   /**
    * Ordered list of models to try: the configured primary, then any explicitly
-   * configured fallbacks, then the generic free router. Deduplicated so the
-   * primary is never tried twice in a row by accident.
+   * configured fallbacks, then the provider's last-resort model. Deduplicated so
+   * the primary is never tried twice in a row by accident.
    */
   #modelChain() {
     const extra = Array.isArray(this.cfg.FALLBACK_MODELS) ? this.cfg.FALLBACK_MODELS : [];
-    const chain = [this.cfg.MODEL, ...extra, FALLBACK_MODEL].filter(Boolean);
+    const chain = [this.cfg.MODEL, ...extra, this.cfg.FALLBACK_MODEL].filter(Boolean);
     return [...new Set(chain)];
   }
 
@@ -1028,11 +1055,14 @@ export class AiSignalService {
 
 /* ================================================================== helpers */
 
-/** OpenRouter default when a partial env is supplied (tests). */
+/** Provider defaults when a partial env is supplied (tests, embedded use). */
 const DEFAULTS = Object.freeze({
   ENABLED: false,
-  OPENROUTER_API_KEY: '',
-  MODEL: 'openrouter/free',
+  PROVIDER: 'groq',
+  PROVIDER_LABEL: 'Groq',
+  ENDPOINT: 'https://api.groq.com/openai/v1/chat/completions',
+  API_KEY: '',
+  MODEL: 'llama-3.3-70b-versatile',
   SYMBOL: 'XAUUSD',
   SYMBOLS: ['XAUUSD', 'EURUSD', 'USDJPY', 'GBPUSD'],
   STAGGER_MS: 12_000,
@@ -1051,6 +1081,7 @@ const DEFAULTS = Object.freeze({
   TELEGRAM_CHAT_ID: '',
   MAX_ATTEMPTS: 2,
   FALLBACK_MODELS: [],
+  FALLBACK_MODEL: 'llama-3.1-8b-instant',
   CATCHUP_ENABLED: true,
   CATCHUP_DELAY_MS: 180_000,
   CATCHUP_MAX: 3,

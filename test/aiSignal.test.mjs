@@ -86,8 +86,8 @@ const bucketOf = (seconds) =>
 function baseCfg(over = {}) {
   return {
     ENABLED: true,
-    OPENROUTER_API_KEY: 'sk-test',
-    MODEL: 'openrouter/free',
+    API_KEY: 'sk-test',
+    MODEL: 'llama-3.3-70b-versatile',
     SYMBOL: 'XAUUSD',
     INTERVAL_MS: 1_800_000,
     MANUAL_COOLDOWN_S: 60,
@@ -179,12 +179,13 @@ await test('service reports its configuration through status()', () => {
   const s = svc.status();
   assert.equal(s.enabled, true);
   assert.equal(s.symbol, 'XAUUSD');
-  assert.equal(s.model, 'openrouter/free');
+  assert.equal(s.model, 'llama-3.3-70b-versatile');
+  assert.equal(s.provider, 'groq');
   assert.equal(s.maxTokens, 2000);
   assert.equal(s.lastSignal, null);
 });
 
-await testAsync('run() sends the system prompt and a compact user turn to OpenRouter', async () => {
+await testAsync('run() sends the system prompt and a compact user turn to Groq', async () => {
   const market = fakeMarket({ price: 2400 });
   const fetchFn = fakeFetch(buySignal());
   const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), telegram: fakeTelegram(), fetchFn });
@@ -193,9 +194,9 @@ await testAsync('run() sends the system prompt and a compact user turn to OpenRo
   assert.equal(res.ok, true, 'run should succeed');
 
   const [call] = fetchFn.calls;
-  assert.match(call.url, /openrouter\.ai\/api\/v1\/chat\/completions/);
+  assert.match(call.url, /api\.groq\.com\/openai\/v1\/chat\/completions/);
   assert.equal(call.opts.headers.Authorization, 'Bearer sk-test');
-  assert.equal(call.body.model, 'openrouter/free');
+  assert.equal(call.body.model, 'llama-3.3-70b-versatile');
   assert.equal(call.body.messages[0].role, 'system');
   assert.equal(call.body.messages[0].content, SYSTEM_PROMPT);
   assert.equal(call.body.response_format.type, 'json_object');
@@ -354,7 +355,7 @@ await testAsync('an unchanged trade is not re-sent to Telegram', async () => {
 await testAsync('unconfigured service idles (no key)', async () => {
   const market = fakeMarket();
   const fetchFn = fakeFetch(buySignal());
-  const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), env: { ai: baseCfg({ OPENROUTER_API_KEY: '' }) }, fetchFn });
+  const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), env: { ai: baseCfg({ API_KEY: '' }) }, fetchFn });
   const res = await svc.run('manual');
   assert.equal(res.ok, false);
   assert.equal(res.error, 'disabled');
@@ -400,17 +401,17 @@ await testAsync('a slow model call cannot be overlapped (busy guard)', async () 
 
 /* ---- 5b. fallback + reasoning ------------------------------------------- */
 
-await test('an empty completion from the primary model falls back to openrouter/free', async () => {
+await test('an empty completion from the primary model falls back to the provider fallback', async () => {
   const market = fakeMarket({ price: 2400 });
   const fetchFn = sequenceFetch([EMPTY, { content: buySignal() }]);
-  const env = { ai: baseCfg({ MODEL: 'nvidia/nemotron-3-ultra-550b-a55b:free' }) };
+  const env = { ai: baseCfg({ MODEL: 'openai/gpt-oss-120b' }) };
   const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), telegram: fakeTelegram(), env, fetchFn });
   const res = await svc.run('manual');
   assert.equal(res.ok, true, 'fallback should recover');
   assert.equal(fetchFn.calls.length, 2, 'primary + fallback = 2 calls');
   // First call is the configured model, second is the fallback with more room.
-  assert.equal(fetchFn.calls[0].body.model, 'nvidia/nemotron-3-ultra-550b-a55b:free');
-  assert.equal(fetchFn.calls[1].body.model, 'openrouter/free');
+  assert.equal(fetchFn.calls[0].body.model, 'openai/gpt-oss-120b');
+  assert.equal(fetchFn.calls[1].body.model, 'llama-3.1-8b-instant');
   assert.ok(fetchFn.calls[1].body.max_tokens >= 8000, 'fallback gets extra headroom');
   assert.equal(svc.stats.fallbacks, 1);
 });
@@ -442,7 +443,7 @@ await test('empty completion on the fallback model surfaces a diagnostic', async
 await test('no second attempt when the primary IS the fallback model', async () => {
   const market = fakeMarket({ price: 2400 });
   const fetchFn = sequenceFetch([EMPTY]);
-  const env = { ai: baseCfg({ MODEL: 'openrouter/free', MAX_ATTEMPTS: 1 }) };
+  const env = { ai: baseCfg({ MODEL: 'llama-3.1-8b-instant', MAX_ATTEMPTS: 1 }) };
   const svc = new AiSignalService({ market, dispatcher: fakeDispatcher(), env, fetchFn });
   const res = await svc.run('manual');
   assert.equal(res.ok, false);
@@ -480,7 +481,7 @@ await test('a prose reply with no JSON triggers a corrected retry that recovers'
   assert.equal(svc.stats.errors, 0, 'a recovered cycle is not counted as an error');
 });
 
-await test('a prose reply on a non-fallback model retries on openrouter/free', async () => {
+await test('a prose reply on a non-fallback model retries on the provider fallback', async () => {
   const market = fakeMarket({ price: 2400 });
   const fetchFn = sequenceFetch([{ content: 'Sure, let me walk you through it.' }, { content: buySignal() }]);
   const env = { ai: baseCfg({ MODEL: 'some/chatty-model:free', MAX_ATTEMPTS: 2 }) };
@@ -489,7 +490,7 @@ await test('a prose reply on a non-fallback model retries on openrouter/free', a
 
   assert.equal(res.ok, true);
   assert.equal(fetchFn.calls[0].body.model, 'some/chatty-model:free');
-  assert.equal(fetchFn.calls[1].body.model, 'openrouter/free', 'retry uses the fallback model');
+  assert.equal(fetchFn.calls[1].body.model, 'llama-3.1-8b-instant', 'retry uses the fallback model');
 });
 
 await test('prose on both attempts fails cleanly and publishes nothing', async () => {

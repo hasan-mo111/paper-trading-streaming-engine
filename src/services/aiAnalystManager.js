@@ -122,7 +122,7 @@ export class AiAnalystManager {
   }
 
   get configured() {
-    return Boolean(this.cfg.OPENROUTER_API_KEY);
+    return Boolean(this.cfg.API_KEY);
   }
 
   get baseIntervalMs() {
@@ -185,6 +185,8 @@ export class AiAnalystManager {
       configured: this.configured,
       multiSymbol: true,
       symbols: [...this.symbols],
+      provider: this.cfg.PROVIDER,
+      providerLabel: this.cfg.PROVIDER_LABEL,
       model: this.cfg.MODEL,
       intervalMs: this.intervalMs(),
       baseIntervalMs: this.baseIntervalMs,
@@ -317,7 +319,7 @@ export class AiAnalystManager {
       log.warn(
         this.configured
           ? 'AI analyst disabled (AI_SIGNAL_ENABLED=false)'
-          : 'AI analyst idle — OPENROUTER_API_KEY not set'
+          : `AI analyst idle — ${this.cfg.PROVIDER === 'groq' ? 'GROQ_API_KEY' : 'OPENROUTER_API_KEY'} not set`
       );
       return;
     }
@@ -328,8 +330,8 @@ export class AiAnalystManager {
     this.timer.unref?.();
 
     log.ok(
-      `AI analyst armed — ${this.cfg.MODEL} · ${this.symbols.join(', ')} ` +
-        `every ${Math.round(this.baseIntervalMs / 60_000)}m ` +
+      `AI analyst armed — ${this.cfg.MODEL} on ${this.cfg.PROVIDER_LABEL || 'provider'} · ` +
+        `${this.symbols.join(', ')} every ${Math.round(this.baseIntervalMs / 60_000)}m ` +
         `(stagger ${Math.round(Number(this.cfg.STAGGER_MS) / 1000)}s, ` +
         `management every ${this.cfg.MANAGEMENT_EVERY} cycle(s))`
     );

@@ -99,21 +99,25 @@ services:
       - key: SSE_HEARTBEAT_MS
         value: "15000"
       - key: MAX_CANDLES
-        value: "100"
+        value: "300"
       - key: BOOTSTRAP_DAILY_CANDLES
         value: "100"
 
-      # ── AI analyst (OpenRouter) ────────────────────────────────────────
-      # Set OPENROUTER_API_KEY as a SECRET in the Render dashboard.
-      # Any `:free` model id works; swap AI_SIGNAL_MODEL if the chosen model
-      # is retired. The analyst never places orders — it only publishes a
-      # multi-timeframe read to the chat stream and (optionally) Telegram.
-      - key: OPENROUTER_API_KEY
+      # ── AI analyst (Groq) ─────────────────────────────────────────────
+      # Set GROQ_API_KEY as a SECRET in the Render dashboard.
+      # Primary model: llama-3.3-70b-versatile; llama-3.1-8b-instant is the
+      # automatic last-resort fallback. OpenRouter is still available: set
+      # AI_SIGNAL_PROVIDER=openrouter and OPENROUTER_API_KEY instead.
+      # The analyst never places orders — it only publishes a multi-timeframe
+      # read to the chat stream and (optionally) Telegram.
+      - key: AI_SIGNAL_PROVIDER
+        value: auto
+      - key: GROQ_API_KEY
         sync: false
       - key: AI_SIGNAL_ENABLED
         value: "true"
       - key: AI_SIGNAL_MODEL
-        value: openrouter/free
+        value: llama-3.3-70b-versatile
       - key: AI_SIGNAL_SYMBOL
         value: XAUUSD
       - key: AI_SIGNAL_INTERVAL_MS

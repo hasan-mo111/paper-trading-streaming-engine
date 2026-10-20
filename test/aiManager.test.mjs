@@ -50,8 +50,8 @@ const PAIRS = [
 function baseCfg(over = {}) {
   return {
     ENABLED: true,
-    OPENROUTER_API_KEY: 'sk-test',
-    MODEL: 'openrouter/free',
+    API_KEY: 'sk-test',
+    MODEL: 'llama-3.3-70b-versatile',
     SYMBOL: 'XAUUSD',
     SYMBOLS: ['XAUUSD', 'EURUSD', 'USDJPY', 'GBPUSD'],
     STAGGER_MS: 0,
