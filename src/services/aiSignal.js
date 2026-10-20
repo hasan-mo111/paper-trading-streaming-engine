@@ -70,6 +70,34 @@ export function isKeyError(err) {
   );
 }
 
+/**
+ * A per-MODEL quota rejection. Groq names the model in its 429 — "Rate limit
+ * reached for model `llama-3.3-70b-versatile` … on tokens per day (TPD)" — and
+ * meters each model separately. OpenRouter's account-wide "free-models-per-day"
+ * names no model, so it stays a key-level problem.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isModelQuotaError(err) {
+  const message = typeof err === 'string' ? err : (err && err.message) || '';
+  return isRateLimitError(message) && /for model|model `|model "|model id/i.test(String(message));
+}
+
+/**
+ * A model id that no longer exists (decommissioned, renamed, typo). Retrying it
+ * every cycle spends one request per symbol for nothing; park it for hours.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isModelMissingError(err) {
+  const message = typeof err === 'string' ? err : (err && err.message) || '';
+  return /(^|\D)404(\D|$)|model.*(not found|does not exist|decommissioned|not supported)/i.test(
+    String(message)
+  );
+}
+
 /* --------------------------------------------------------------- timeframes */
 
 /**
@@ -223,6 +251,8 @@ export class AiSignalService {
       rateLimits: 0,
       /** Times a quota/credential error moved the analyst to the next key. */
       keyRotations: 0,
+      /** Times a per-model daily bucket moved the analyst to the next model. */
+      modelLimits: 0,
       lastRunAt: null,
       lastError: null,
       lastModel: null,
@@ -756,25 +786,43 @@ export class AiSignalService {
   }
 
   /**
-   * Ask the model chain until one reply parses, rotating credentials on quota
-   * errors and escalating models on everything else.
+   * Ask the model chain until one reply parses. There are three independent
+   * failure axes and each gets its own response:
    *
-   * Two independent failure axes, two different responses:
-   *   • the CREDENTIAL is out (429/402, or a rejected 401/403) → park that key,
-   *     retry the same model with the next slot. This does not consume model
-   *     budget and does not count as a fallback.
-   *   • the MODEL cannot answer (timeout, empty completion, a malformed reply,
-   *     a decommissioned id) → walk to the next model in the chain, giving it
-   *     the JSON-only correction turn and extra token headroom.
+   *   • the CREDENTIAL is out (401/403, or an account-wide 429/402) → park that
+   *     key for every model and retry the same model with the next slot.
+   *   • the (KEY, MODEL) pair is out — Groq's per-model daily token bucket →
+   *     park only that pair; another account may still serve the same model,
+   *     otherwise walk to the next model.
+   *   • the MODEL cannot answer (timeout, empty completion, a malformed reply, a
+   *     decommissioned id) → walk to the next model, giving it the JSON-only
+   *     correction turn and extra token headroom.
    *
-   * The loop only reports `rateLimited` when every key is cooling down — that is
-   * a real quota wall, and the manager should stretch the whole cycle interval.
+   * The loop only reports `rateLimited` when no (key, model) pair is usable —
+   * a real quota wall, and the manager should stretch the whole interval.
    *
    * @returns {Promise<{call:object, parsed:object, attempts:number, rateLimited?:boolean}>}
    */
   async #askWithRetries(snapshot, newsLines = [], { force = false } = {}) {
-    const chain = this.#modelChain();
-    // Every configured model gets at least one shot; MAX_ATTEMPTS still buys a
+    const configured = this.#modelChain();
+    // Skip models whose every account is already parked. This is what makes the
+    // second, third and fourth model actually get used instead of re-asking an
+    // exhausted primary every cycle. A manual ask is the exception: it may wake
+    // one parked slot to test whether the quota came back.
+    const usable = configured.filter((m) => this.keyPool.hasModelAvailable(m));
+    const chain = usable.length || !force ? usable : configured;
+    if (!chain.length) {
+      this.stats.rateLimits += 1;
+      this.stats.lastError = 'rate-limit: every model is cooling down';
+      return {
+        call: { content: '', model: configured[0] ?? this.cfg.MODEL },
+        parsed: { ok: false, error: 'every model is cooling down' },
+        attempts: 0,
+        rateLimited: true,
+      };
+    }
+
+    // Every usable model gets at least one shot; MAX_ATTEMPTS still buys a
     // correction turn when the chain is short. The hard ceiling protects the
     // daily quota from a pathological all-fail cycle.
     const maxCalls = Math.max(
@@ -797,16 +845,15 @@ export class AiSignalService {
       const correction = i === 0 ? null : JSON_CORRECTION;
       const maxTokens = i === 0 ? this.cfg.MAX_TOKENS : Math.max(this.cfg.MAX_TOKENS, 8_000);
 
-      // Pick a credential for this attempt. `current()` throws only when every
-      // slot is cooling down, which means the quota is genuinely spent.
+      // Pick a credential that still has budget for THIS model.
       let slot;
       try {
-        slot = this.keyPool.current(Date.now(), { force: mayForce });
+        slot = this.keyPool.current(Date.now(), { force: mayForce, model });
         mayForce = false;
-      } catch (e) {
-        this.stats.rateLimits += 1;
-        this.stats.lastError = `rate-limit: ${e.message}`;
-        return { call, parsed: { ok: false, error: e.message }, attempts: i, rateLimited: true };
+      } catch {
+        // Every account is parked for this model already → next model.
+        i += 1;
+        continue;
       }
 
       try {
@@ -817,7 +864,7 @@ export class AiSignalService {
         });
         parsed = this.#parseJson(call.content);
         if (parsed.ok) {
-          this.keyPool.markOk(slot.key);
+          this.keyPool.markOk(slot.key, { model });
           return { call, parsed, attempts: i + 1 };
         }
         log.warn(
@@ -831,6 +878,18 @@ export class AiSignalService {
         );
         parsed = { ok: false, error: e.message };
 
+        // Per-model daily bucket: park only this (key, model) pair.
+        if (isModelQuotaError(e.message)) {
+          this.keyPool.markLimited(slot.key, cooldownForMessage(e.message), { model });
+          this.stats.modelLimits += 1;
+          this.stats.lastError = `model ${model}: ${e.message}`;
+          if (this.keyPool.hasModelAvailable(model)) continue; // another account
+          this.stats.fallbacks += 1;
+          i += 1; // next model
+          continue;
+        }
+
+        // Credential problem: park the key for every model.
         if (isKeyError(e.message)) {
           const quota = isRateLimitError(e.message);
           // Daily counters reset at 00:00 UTC; per-minute limits in a minute.
@@ -839,22 +898,32 @@ export class AiSignalService {
           this.keyPool.markLimited(slot.key, cooldownMs);
           this.stats.keyRotations += 1;
           this.stats.lastError = `key ${slot.slot}: ${e.message}`;
-
+          if (this.keyPool.hasModelAvailable(model)) continue; // next credential
           if (this.keyPool.hasAvailable()) {
-            // Same attempt index, same model, next credential.
+            this.stats.fallbacks += 1;
+            i += 1; // next model, same working accounts
             continue;
           }
-
           this.stats.rateLimits += 1;
           this.stats.lastError = `rate-limit: ${e.message}`;
           return { call, parsed, attempts: i + 1, rateLimited: true };
+        }
+
+        // A retired model id must not be retried every cycle.
+        if (isModelMissingError(e.message)) {
+          this.keyPool.markModelDisabled(model, 6 * 3_600_000);
+          this.stats.fallbacks += 1;
+          i += 1;
+          continue;
         }
       }
 
       if (i > 0) this.stats.fallbacks += 1;
       i += 1;
     }
-    return { call, parsed, attempts: maxCalls };
+
+    const stillUsable = configured.filter((m) => this.keyPool.hasModelAvailable(m));
+    return { call, parsed, attempts: maxCalls, rateLimited: stillUsable.length === 0 };
   }
 
   /**

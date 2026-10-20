@@ -419,7 +419,7 @@ await test('an empty completion from the primary model falls back to the provide
 
 /* ---- 5c. credential rotation + model breadth ---------------------------- */
 
-await testAsync('a 429 parks the first key and retries the same model on the next key', async () => {
+await testAsync('a per-model 429 retries the same model on the next account before switching models', async () => {
   const calls = [];
   const fetchFn = async (url, opts) => {
     calls.push({ url, opts, body: JSON.parse(opts.body) });
@@ -457,8 +457,63 @@ await testAsync('a 429 parks the first key and retries the same model on the nex
   assert.equal(calls[0].opts.headers.Authorization, 'Bearer key-one');
   assert.equal(calls[1].opts.headers.Authorization, 'Bearer key-two');
   assert.equal(calls[1].body.model, calls[0].body.model, 'same model, different credential');
-  assert.equal(svc.stats.keyRotations, 1);
-  assert.equal(svc.keyPool.status().available, 1, 'the spent key is parked until the daily reset');
+  assert.equal(svc.stats.modelLimits, 1, 'a per-model daily limit is a model problem…');
+  assert.equal(svc.stats.keyRotations, 0, '…not a dead credential');
+  assert.equal(svc.keyPool.status().pairsCooling, 1, 'the key/model pair is parked until the reset');
+  assert.equal(svc.keyPool.status().available, 2, 'the key itself still serves the other models');
+});
+
+await testAsync('a per-model daily limit walks the model chain instead of burning the second key', async () => {
+  const calls = [];
+  const fetchFn = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    calls.push({ url, opts, body });
+    if (body.model === 'llama-3.3-70b-versatile') {
+      return {
+        ok: false,
+        status: 429,
+        text: async () =>
+          JSON.stringify({
+            error: {
+              message:
+                'Rate limit reached for model `llama-3.3-70b-versatile` in organization org_x on tokens per day (TPD): Limit 100000',
+            },
+          }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ choices: [{ message: { content: buySignal() } }] }),
+    };
+  };
+  const env = {
+    ai: baseCfg({
+      API_KEYS: ['key-one', 'key-two'],
+      FALLBACK_MODELS: ['llama-3.1-8b-instant'],
+    }),
+  };
+  const svc = new AiSignalService({
+    market: fakeMarket({ price: 2400 }),
+    dispatcher: fakeDispatcher(),
+    telegram: fakeTelegram(),
+    env,
+    fetchFn,
+  });
+  const res = await svc.run('schedule');
+
+  assert.equal(res.ok, true, 'the next model should recover the cycle');
+  assert.equal(calls.length, 3, 'both accounts on model 1, then model 2');
+  assert.equal(calls[0].body.model, 'llama-3.3-70b-versatile');
+  assert.equal(calls[1].body.model, 'llama-3.3-70b-versatile');
+  assert.notEqual(
+    calls[1].opts.headers.Authorization,
+    calls[0].opts.headers.Authorization,
+    'the second account is tried before abandoning the model'
+  );
+  assert.equal(calls[2].body.model, 'llama-3.1-8b-instant');
+  assert.equal(svc.stats.modelLimits, 2);
+  assert.equal(svc.stats.keyRotations, 0);
 });
 
 await testAsync('when every key is cooling the run reports rate-limited instead of retrying', async () => {

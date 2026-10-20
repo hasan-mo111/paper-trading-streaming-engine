@@ -61,6 +61,7 @@ const COUNTERS = [
   'statuses',
   'rateLimits',
   'keyRotations',
+  'modelLimits',
 ];
 
 export class AiAnalystManager {
