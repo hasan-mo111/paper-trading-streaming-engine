@@ -275,11 +275,18 @@ const AI_PROVIDERS = Object.freeze({
   groq: {
     label: 'Groq',
     endpoint: 'https://api.groq.com/openai/v1/chat/completions',
-    defaultModel: 'llama-3.3-70b-versatile',
+    // The gpt-oss pair is what responds on current free-tier accounts; the
+    // llama ids stay at the tail as a last resort and are parked for 6h if the
+    // account answers "model does not exist".
+    defaultModel: 'openai/gpt-oss-120b',
     /** Free models from the same provider, tried in order. They live on
      *  different token buckets, so a model that is momentarily throttled does
      *  not take the whole analyst down with it. */
-    fallbackModels: ['llama-3.1-8b-instant', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
+    fallbackModels: [
+      'openai/gpt-oss-20b',
+      'llama-3.3-70b-versatile',
+      'llama-3.1-8b-instant',
+    ],
   },
   openrouter: {
     label: 'OpenRouter',
@@ -329,6 +336,15 @@ const providerName =
       : 'groq';
 const provider = AI_PROVIDERS[providerName];
 
+/*
+ * A leftover OpenRouter model id from the pre-Groq setup (for example
+ * AI_SIGNAL_MODEL=openrouter/free) would 404 on Groq and burn one model call
+ * per process boot. If the configured id plainly belongs to another provider,
+ * ignore it and use the active provider's default instead.
+ */
+const configuredModel = process.env.AI_SIGNAL_MODEL?.trim() || '';
+const staleProviderModel = providerName === 'groq' && /^openrouter\//i.test(configuredModel);
+
 const ai = {
   /** Master switch — the analyst idles unless enabled AND a key is present. */
   ENABLED: bool(process.env.AI_SIGNAL_ENABLED, true),
@@ -348,8 +364,9 @@ const ai = {
   GROQ_API_KEYS: aiKeys.groq,
   OPENROUTER_API_KEY: aiKeys.openrouter[0] || '',
   OPENROUTER_API_KEYS: aiKeys.openrouter,
-  /** Model id — defaults to the provider's model when AI_SIGNAL_MODEL is unset. */
-  MODEL: process.env.AI_SIGNAL_MODEL?.trim() || provider.defaultModel,
+  /** Model id — defaults to the provider's model when AI_SIGNAL_MODEL is unset
+   *  or still carries the other provider's id. */
+  MODEL: configuredModel && !staleProviderModel ? configuredModel : provider.defaultModel,
   /** Instrument the analyst reads. Kept for single-symbol deployments and for
    *  the per-symbol service inside the multi-symbol manager. */
   SYMBOL: upper(process.env.AI_SIGNAL_SYMBOL, 'XAUUSD'),
@@ -386,21 +403,27 @@ const ai = {
    *  take a minute to answer, so the default is deliberately above the 60s a
    *  thoughtless value would use — a timeout here costs a whole cycle. */
   TIMEOUT_MS: int(process.env.AI_SIGNAL_TIMEOUT_MS, 90_000, 5_000, 300_000),
-  /** Max tokens the model may spend on its JSON signal. Reasoning models burn
-   *  part of this budget on chain-of-thought, so it must be generous enough to
-   *  still let the answer be written (empty `content` otherwise). */
-  MAX_TOKENS: int(process.env.AI_SIGNAL_MAX_TOKENS, 2000, 256, 8_000),
+  /** Max tokens the model may spend on its JSON signal. Groq counts input +
+   *  max_tokens against the model's per-minute cap, so a big value can push an
+   *  otherwise valid request over the free-tier limit (413). 1500 is ample for
+   *  the JSON answer and leaves headroom under an 8k TPM bucket. */
+  MAX_TOKENS: int(process.env.AI_SIGNAL_MAX_TOKENS, 1500, 256, 8_000),
+  /** Hard ceiling for the USER turn, in characters. The builder trims the
+   *  oldest bars from the longest frame until the prompt fits. Keeps a news
+   *  spike or a widened bar window from turning into a 413. */
+  MAX_PROMPT_CHARS: int(process.env.AI_SIGNAL_MAX_PROMPT_CHARS, 12_000, 4_000, 60_000),
   /** Minimum reward:risk a BUY/SELL must satisfy to be published. */
   MIN_RR: num(process.env.AI_SIGNAL_MIN_RR, 2),
   /** How far (fraction of price) an entry may sit from the live quote. */
   MAX_ENTRY_DRIFT: num(process.env.AI_SIGNAL_MAX_ENTRY_DRIFT, 0.02),
-  /** Bars sent per timeframe — enough to trend, small enough for the free tier. */
+  /** Bars sent per timeframe — enough to trend, sized so the whole request
+   *  stays under the 8k-token free-tier per-minute bucket. */
   BARS: {
-    D1: int(process.env.AI_SIGNAL_BARS_D1, 60, 20, 100),
-    H4: int(process.env.AI_SIGNAL_BARS_H4, 60, 20, 100),
-    H1: int(process.env.AI_SIGNAL_BARS_H1, 80, 20, 100),
-    M15: int(process.env.AI_SIGNAL_BARS_M15, 60, 20, 100),
-    M5: int(process.env.AI_SIGNAL_BARS_M5, 60, 20, 100),
+    D1: int(process.env.AI_SIGNAL_BARS_D1, 40, 20, 100),
+    H4: int(process.env.AI_SIGNAL_BARS_H4, 40, 20, 100),
+    H1: int(process.env.AI_SIGNAL_BARS_H1, 50, 20, 100),
+    M15: int(process.env.AI_SIGNAL_BARS_M15, 40, 20, 100),
+    M5: int(process.env.AI_SIGNAL_BARS_M5, 40, 20, 100),
   },
   /** Fan a published signal out to Telegram when a bot token is configured. */
   TELEGRAM: bool(process.env.AI_SIGNAL_TELEGRAM, true),

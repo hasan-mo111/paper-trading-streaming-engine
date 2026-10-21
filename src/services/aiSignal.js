@@ -32,6 +32,7 @@ import { getSymbolSpec, roundPrice } from '../config/db.js';
 import { createLogger } from './logger.js';
 import { CHAT_TYPES } from './sseDispatcher.js';
 import { KeyPool, cooldownForMessage } from './keyPool.js';
+import { filterTradableBars, isWeekendBar } from './marketSession.js';
 
 const log = createLogger('ai');
 
@@ -81,7 +82,14 @@ export function isKeyError(err) {
  */
 export function isModelQuotaError(err) {
   const message = typeof err === 'string' ? err : (err && err.message) || '';
-  return isRateLimitError(message) && /for model|model `|model "|model id/i.test(String(message));
+  // 413 is Groq's answer when the request itself is bigger than the model's
+  // per-minute budget ("Request too large ... on tokens per minute (TPM)").
+  // It is a per-model limit, so the chain must move on instead of re-asking the
+  // same model with the same oversized prompt every cycle.
+  const limited =
+    isRateLimitError(message) ||
+    /(^|\D)413(\D|$)|request too large|tokens per minute \(TPM\)/i.test(message);
+  return limited && /for model|model `|model "|model id/i.test(String(message));
 }
 
 /**
@@ -253,6 +261,9 @@ export class AiSignalService {
       keyRotations: 0,
       /** Times a per-model daily bucket moved the analyst to the next model. */
       modelLimits: 0,
+      /** Size of the last prompt, so a free-tier 413 is diagnosable. */
+      promptChars: 0,
+      promptTokensEst: 0,
       lastRunAt: null,
       lastError: null,
       lastModel: null,
@@ -666,12 +677,16 @@ export class AiSignalService {
     const missing = [];
 
     for (const f of FRAMES) {
-      const limit = this.cfg.BARS?.[f.bucket] ?? 60;
-      const closed = this.market.closedCandles(symbol, f.seconds);
+      const limit = this.cfg.BARS?.[f.bucket] ?? 40;
+      // Belt and suspenders: the aggregator already refuses weekend bars, but
+      // an older in-memory ring must never teach the model a flat weekend.
+      const closed = filterTradableBars(this.market.closedCandles(symbol, f.seconds));
       const forming = this.market.formingCandle(symbol, f.seconds);
       const bars = closed.slice(-limit).map(compact);
-      if (forming && Number.isFinite(forming.close)) bars.push(compact(forming));
-      frames[f.bucket] = { label: f.label, bars };
+      if (forming && Number.isFinite(forming.close) && !isWeekendBar(forming.time)) {
+        bars.push(compact(forming));
+      }
+      frames[f.bucket] = { label: f.label, seconds: f.seconds, bars };
       counts[f.bucket] = closed.length;
       if (closed.length < MIN_BARS) missing.push(`${f.bucket}:${closed.length}`);
       shortest = Math.min(shortest, closed.length);
@@ -699,7 +714,12 @@ export class AiSignalService {
     maxTokens = this.cfg.MAX_TOKENS,
     { correction = null, news = [], key = '' } = {}
   ) {
-    const user = buildUserMessage(snapshot, news);
+    const user = buildUserMessage(snapshot, news, { maxChars: this.cfg.MAX_PROMPT_CHARS });
+    // Conservative estimate (digit-heavy JSON tokenises worse than prose).
+    // Exposed in /api/ai/signal so an oversized prompt is visible before the
+    // provider answers 413.
+    this.stats.promptChars = user.length;
+    this.stats.promptTokensEst = Math.ceil((user.length + SYSTEM_PROMPT.length) / 2);
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: user },
@@ -722,6 +742,12 @@ export class AiSignalService {
         // Best-effort JSON mode. The parser is strict either way, so an ignored
         // flag degrades gracefully.
         body.response_format = { type: 'json_object' };
+      }
+      // gpt-oss is a reasoning model. At the default effort it can spend the
+      // entire completion budget thinking and return empty `content`; low
+      // effort leaves room for the JSON inside a free-tier token budget.
+      if (this.cfg.PROVIDER === 'groq' && /gpt-oss/i.test(model)) {
+        body.reasoning_effort = 'low';
       }
 
       const headers = {
@@ -840,10 +866,15 @@ export class AiSignalService {
 
     while (i < maxCalls) {
       const model = chain[Math.min(i, chain.length - 1)];
-      // Attempt 0 asks cleanly; every later attempt spells out the contract and
-      // buys extra headroom in case a preamble ate the token budget.
+      // Attempt 0 asks cleanly; every later attempt re-sends the same turn with
+      // the JSON contract spelled out. The token budget deliberately stays the
+      // same: Groq counts input + max_tokens against the per-minute cap.
       const correction = i === 0 ? null : JSON_CORRECTION;
-      const maxTokens = i === 0 ? this.cfg.MAX_TOKENS : Math.max(this.cfg.MAX_TOKENS, 8_000);
+      // Do NOT inflate the retry budget. Groq counts input + max_tokens against
+      // the model's per-minute limit, so an 8k retry turned every chatty reply
+      // into a guaranteed 413 on the free tier. The JSON contract needs a few
+      // hundred tokens; the prompt budget does the rest.
+      const maxTokens = this.cfg.MAX_TOKENS;
 
       // Pick a credential that still has budget for THIS model.
       let slot;
@@ -1244,7 +1275,7 @@ const DEFAULTS = Object.freeze({
   ENDPOINT: 'https://api.groq.com/openai/v1/chat/completions',
   API_KEY: '',
   API_KEYS: [],
-  MODEL: 'llama-3.3-70b-versatile',
+  MODEL: 'openai/gpt-oss-120b',
   SYMBOL: 'XAUUSD',
   SYMBOLS: ['XAUUSD', 'EURUSD', 'USDJPY', 'GBPUSD'],
   STAGGER_MS: 12_000,
@@ -1255,10 +1286,16 @@ const DEFAULTS = Object.freeze({
   MANUAL_COOLDOWN_S: 60,
   BOOT_DELAY_MS: 120_000,
   TIMEOUT_MS: 90_000,
-  MAX_TOKENS: 2000,
+  // Groq counts input + max_tokens against the per-minute cap. 1500 is ample
+  // for the JSON answer and leaves room under an 8k TPM free-tier limit.
+  MAX_TOKENS: 1500,
   MIN_RR: 2,
   MAX_ENTRY_DRIFT: 0.02,
-  BARS: { D1: 60, H4: 60, H1: 80, M15: 60, M5: 60 },
+  // Oldest-first bars per frame. 210 rows keeps the whole request comfortably
+  // below ~8k tokens once the epoch column is removed (see buildUserMessage).
+  BARS: { D1: 40, H4: 40, H1: 50, M15: 40, M5: 40 },
+  /** Hard character ceiling for the USER turn; the builder trims oldest bars. */
+  MAX_PROMPT_CHARS: 12_000,
   TELEGRAM: false,
   TELEGRAM_CHAT_ID: '',
   MAX_ATTEMPTS: 2,
@@ -1286,23 +1323,45 @@ function compactPrice(v) {
 /**
  * Build the USER turn: the snapshot as a small JSON document.
  *
+ * Format choices, all driven by Groq's free-tier per-request token cap:
+ *   • rows are [open, high, low, close] — the 10-digit epoch on every row was
+ *     the single most expensive field and the model reads structure, not
+ *     wall-clock labels;
+ *   • each frame carries `first_bar_utc` + `interval_seconds`, so the window is
+ *     still unambiguous for one timestamp per frame instead of one per row;
+ *   • weekend gaps are already absent from the bars; `row_notes` explains the
+ *     omission so the model does not read it as a data error;
+ *   • `maxChars` trims the oldest bar from the longest frame until the payload
+ *     fits. MIN_BARS per frame is preserved — a frame below that is not worth
+ *     analysing anyway.
+ *
  * @param {object} snapshot
  * @param {string[]} [news] upcoming high-impact events, as compact lines
+ * @param {{maxChars?: number}} [opts]
+ * @returns {string} JSON for the user turn
  */
-export function buildUserMessage(snapshot, news = null) {
-  const tf = {};
+export function buildUserMessage(snapshot, news = null, { maxChars = 0 } = {}) {
+  /** Working copies keep the caller's snapshot untouched while we trim. */
+  const frames = {};
   for (const [bucket, f] of Object.entries(snapshot.frames)) {
-    tf[bucket] = { label: f.label, rows: f.bars };
+    frames[bucket] = {
+      label: f.label,
+      seconds: Number(f.seconds) || 0,
+      bars: Array.isArray(f.bars) ? f.bars.map((b) => [...b]) : [],
+    };
   }
+
+  const events = Array.isArray(news) ? news.filter(Boolean) : [];
   const payload = {
     symbol: snapshot.symbol.replace(/^(.{3})(.{3})$/, '$1/$2'),
     as_of: new Date().toISOString(),
     current_price: snapshot.price,
-    timeframes: tf,
-    row_format: ['epoch_seconds', 'open', 'high', 'low', 'close'],
+    timeframes: {},
+    row_format: ['open', 'high', 'low', 'close'],
+    row_notes:
+      'Rows are chronological (oldest first) as [open, high, low, close]. ' +
+      'Weekend gaps are omitted. The last row of the shortest frame may be the forming candle.',
   };
-
-  const events = Array.isArray(news) ? news.filter(Boolean) : [];
   if (events.length) {
     payload.upcoming_high_impact_events_utc = events;
     payload.instruction =
@@ -1311,7 +1370,38 @@ export function buildUserMessage(snapshot, news = null) {
   } else {
     payload.instruction = 'Analyse the frames macro→micro and return the strict JSON signal now.';
   }
-  return JSON.stringify(payload);
+
+  const render = () => {
+    for (const [bucket, f] of Object.entries(frames)) {
+      const first = f.bars[0]?.[0];
+      payload.timeframes[bucket] = {
+        label: f.label,
+        interval_seconds: f.seconds,
+        first_bar_utc: Number.isFinite(first) ? new Date(first * 1000).toISOString() : null,
+        rows: f.bars.map((b) => (b.length >= 5 ? [b[1], b[2], b[3], b[4]] : b.slice(-4))),
+      };
+    }
+    return JSON.stringify(payload);
+  };
+
+  let text = render();
+  if (maxChars > 0) {
+    // Trim the frame that currently has the most rows, oldest first, until the
+    // payload fits or every frame is down to the minimum usable window.
+    let guard = 0;
+    while (text.length > maxChars && guard < 500) {
+      guard += 1;
+      let target = null;
+      for (const [bucket, f] of Object.entries(frames)) {
+        if (f.bars.length <= MIN_BARS) continue;
+        if (!target || f.bars.length > frames[target].bars.length) target = bucket;
+      }
+      if (!target) break;
+      frames[target].bars.shift();
+      text = render();
+    }
+  }
+  return text;
 }
 
 /** One-line chat summary intended for the dashboard log. */

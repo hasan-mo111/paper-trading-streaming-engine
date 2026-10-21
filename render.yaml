@@ -105,8 +105,8 @@ services:
 
       # ── AI analyst (Groq) ─────────────────────────────────────────────
       # Set GROQ_API_KEY as a SECRET in the Render dashboard.
-      # Primary model: llama-3.3-70b-versatile; llama-3.1-8b-instant is the
-      # automatic last-resort fallback. OpenRouter is still available: set
+      # Primary model: openai/gpt-oss-120b; gpt-oss-20b is the first automatic
+      # fallback, then the llama ids. OpenRouter is still available: set
       # AI_SIGNAL_PROVIDER=openrouter and OPENROUTER_API_KEY instead.
       # The analyst never places orders — it only publishes a multi-timeframe
       # read to the chat stream and (optionally) Telegram.
@@ -121,11 +121,17 @@ services:
       - key: AI_SIGNAL_ENABLED
         value: "true"
       - key: AI_SIGNAL_MODEL
-        value: llama-3.3-70b-versatile
+        value: openai/gpt-oss-120b
       - key: AI_SIGNAL_FALLBACK_MODELS
-        value: llama-3.1-8b-instant,openai/gpt-oss-120b,openai/gpt-oss-20b
+        value: openai/gpt-oss-20b,llama-3.3-70b-versatile,llama-3.1-8b-instant
       - key: AI_SIGNAL_MAX_CALLS_PER_CYCLE
         value: "6"
+      # Groq counts input + max_tokens against the per-minute cap; keep both
+      # small enough for the 8k free-tier bucket.
+      - key: AI_SIGNAL_MAX_TOKENS
+        value: "1500"
+      - key: AI_SIGNAL_MAX_PROMPT_CHARS
+        value: "12000"
       - key: AI_SIGNAL_SYMBOL
         value: XAUUSD
       - key: AI_SIGNAL_INTERVAL_MS

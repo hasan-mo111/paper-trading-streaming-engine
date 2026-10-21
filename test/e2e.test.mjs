@@ -3,7 +3,7 @@
  *  Developed by Eng Hasan Mohamad
  * -----------------------------------------------------------------------------
  *  Boots a mock upstream server, points server.js at it, then asserts:
- *    1. all 20 series backfill with exactly MAX_CANDLES closed candles + 1 forming
+ *    1. all 20 series backfill with up to MAX_CANDLES closed candles + 1 forming
  *    2. /stream sends a full `snapshot` as the FIRST event
  *    3. live `update` events arrive, throttled to ~400ms, never faster
  *    4. tick → candle folding keeps close/high/low consistent
@@ -24,6 +24,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { startMockBiquote } from './mock-biquote.mjs';
+import { isWeekendBar } from '../src/services/marketSession.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -154,10 +155,18 @@ check('symbols subscribed upstream', health?.upstream?.subscribed === true);
 check('20 series (4 pairs × 5 timeframes)', health?.market?.series === 20, `got ${health?.market?.series}`);
 check('all series ready', health?.market?.ready === 20, `${health?.market?.ready}/${health?.market?.series}`);
 check(
-  `every series holds exactly ${RING} closed candles`,
+  `every series holds closed candles within the ${RING}-candle ring`,
   (await get('/api/snapshot')).series &&
-    Object.values((await get('/api/snapshot')).series).every((s) => s.candles.length === RING),
+    Object.values((await get('/api/snapshot')).series).every(
+      (s) => s.candles.length > 20 && s.candles.length <= RING
+    ),
   'per-series ring size'
+);
+check(
+  'no series contains a fake weekend candle',
+  Object.values((await get('/api/snapshot')).series).every((s) =>
+    s.candles.every((c) => !isWeekendBar(c.time))
+  )
 );
 check('D1 series exist for the 50-day Donchian', (await get('/api/snapshot')).series['XAUUSD|86400'] !== undefined);
 
@@ -174,7 +183,15 @@ check('every series reports fresh data', allSeries.every((s) => s.fresh));
 
 const xau = await get('/api/market/candles?symbol=XAUUSD&interval=900');
 const LAST = () => xau.candles?.at(-1); // read lazily: may be empty if backfill failed
-check(`REST /api/market/candles → ${RING} candles`, xau.candles.length === RING, `got ${xau.candles.length}`);
+check(
+  `REST /api/market/candles → ≤ ${RING} candles`,
+  xau.candles.length > 100 && xau.candles.length <= RING,
+  `got ${xau.candles.length}`
+);
+check(
+  'REST candles contain no weekend bars',
+  xau.candles.every((c) => !isWeekendBar(c.time))
+);
 check('candles are ascending by time', xau.candles.every((c, i, a) => i === 0 || c.time > a[i - 1].time));
 check('candles sit on the 900s grid', xau.candles.every((c) => c.time % 900 === 0));
 check('OHLC values are numbers', xau.candles.every((c) => [c.open, c.high, c.low, c.close].every(Number.isFinite)));
@@ -194,7 +211,12 @@ const events = await sseClient('/stream', { durationMs: 7000 });
 const first = events[0];
 check('first SSE event is `snapshot`', first?.event === 'snapshot', first?.event);
 check('snapshot contains 20 series', Object.keys(first?.json?.series ?? {}).length === 20, `${Object.keys(first?.json?.series ?? {}).length}`);
-check(`snapshot has ${RING} candles per series`, Object.values(first?.json?.series ?? {}).every((s) => s.candles.length === RING));
+check(
+  `snapshot has up to ${RING} candles per series`,
+  Object.values(first?.json?.series ?? {}).every(
+    (s) => s.candles.length > 20 && s.candles.length <= RING
+  )
+);
 check('snapshot advertises pairs + timeframes', first?.json?.pairs?.length === 4 && first?.json?.timeframes?.length === 5, `${first?.json?.pairs?.length}×${first?.json?.timeframes?.length}`);
 check('snapshot names its data source', typeof first?.json?.source === 'string', first?.json?.source);
 check('snapshot includes upstream status', typeof first?.json?.upstream?.connected === 'boolean');
@@ -239,7 +261,7 @@ check('ring stayed sorted', ring.candles.every((c, i, a) => i === 0 || c.time > 
 check('ring has no duplicate epochs', new Set(ring.candles.map((c) => c.time)).size === ring.candles.length);
 check('newest closed candle is adjacent to the forming candle', ringGap === 300, `gap ${ringGap}s`);
 
-/* -- Rollover, trimming and gap-filling, driven directly through the
+/* -- Rollover, trimming and gap handling, driven directly through the
       aggregator with synthetic time. A live 300s boundary will not fall
       inside a short test window, so this is the only way to actually cover it. */
 const { MarketAggregator } = await import(pathToFileURL(path.join(ROOT, 'server.js')).href);
@@ -285,24 +307,51 @@ const { MarketAggregator } = await import(pathToFileURL(path.join(ROOT, 'server.
   check('in-candle tick sets close to the last price', now.close === 800, `close ${now.close}`);
   check('in-candle ticks do not open a new candle', now.time === before.time);
 
-  // A gap (weekend / outage) must be filled, not left as a hole.
-  // Jumping 10 intervals ahead synthesises the 9 candles in between; the 10th
-  // boundary becomes the new forming candle.
+  // A gap (weekend / holiday / outage) must be honest: close the last real
+  // candle, leave the hole, and open the new candle at the live price. The old
+  // gap-filler fabricated nine flat candles here — the fake weekend bars the
+  // user sees on the chart and the model was trained on.
   const gapFrom = now.time;
-  const warnings = [];
-  const realWarn = console.warn;
-  console.warn = (...a) => warnings.push(a.join(' '));
+  const logs = [];
+  const realLog = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
   agg.applyTick('XAUUSD', tickAt((rolls + 1) * 300 + 300 * 10, 1050));
-  console.warn = realWarn;
+  console.log = realLog;
 
   const filled = slot.candles.filter((c) => c.time > gapFrom);
-  check('a 10-candle jump fills the 9 candles in between', filled.length === 9, `${filled.length} filled`);
-  check('filled candles are contiguous and on the grid', filled.every((c, i, a) => c.time % 300 === 0 && (i === 0 || c.time - a[i - 1].time === 300)));
-  check('filled candles carry the last known close', filled.every((c) => Number.isFinite(c.close) && c.close > 0));
+  check('a gap does not fabricate candles', filled.length === 0, `${filled.length} filled`);
+  check('the last real candle is kept', slot.candles.at(-1)?.time === gapFrom, `last ${slot.candles.at(-1)?.time}`);
   check('the 10th boundary became the forming candle', slot.current.time === gapFrom + 300 * 10);
   check('the new forming candle opened at the live price', slot.current.open === 1050);
-  check(`ring is still exactly ${RING} after gap-filling`, slot.candles.length === RING, `got ${slot.candles.length}`);
-  check('the gap was logged as a warning', warnings.some((w) => /gap of 10 candles/.test(w)), warnings[0]?.slice(0, 60));
+  check(`ring is still exactly ${RING} after the gap`, slot.candles.length === RING, `got ${slot.candles.length}`);
+  check('the gap was logged without a fill', logs.some((w) => /gap of 9 candle/.test(w)), logs.find((l) => /gap/.test(l))?.slice(0, 80));
+
+  // Weekend quotes must not enter the ring at all.
+  const beforeWeekend = { ...slot.current };
+  const ignored = agg.applyTick('XAUUSD', {
+    symbol: 'XAUUSD',
+    mid: 9999,
+    timestamp: new Date(Date.UTC(2026, 9, 17, 12, 0, 0)).toISOString(), // Saturday
+  });
+  check('weekend ticks are ignored', ignored === false);
+  check(
+    'weekend ticks do not move the forming candle',
+    slot.current.time === beforeWeekend.time && slot.current.close === beforeWeekend.close
+  );
+
+  // Hydration from Supabase must drop rows written by the old gap-filler.
+  const friday = Date.UTC(2026, 9, 16, 12, 0, 0) / 1000;
+  const saturday = Date.UTC(2026, 9, 17, 12, 0, 0) / 1000;
+  agg.hydrate('EURUSD', 300, [
+    { time: friday, open: 1, high: 1, low: 1, close: 1 },
+    { time: saturday, open: 2, high: 2, low: 2, close: 2 },
+  ]);
+  const eur = agg.store.get('EURUSD|300');
+  check(
+    'weekend rows are dropped on hydration',
+    eur.candles.length === 1 && eur.candles[0].time === friday,
+    `kept ${eur.candles.length}`
+  );
 }
 
 /* ================================================== 6. SSE CLIENT FILTER */
@@ -353,7 +402,14 @@ check('the failure was surfaced as a risk event on the chat stream', /feed error
 check('the disconnect triggered a re-backfill', /backfill complete/i.test(log));
 const after = await get('/health');
 check('state survived the reconnect', after.market.ready === 20, `${after.market.ready}/${after.market.series}`);
-check(`candle ring still exactly ${RING} after reconnect`, (await get('/api/market/candles?symbol=XAUUSD&interval=900')).candles.length === RING);
+const ringAfter = (await get('/api/market/candles?symbol=XAUUSD&interval=900')).candles;
+check(
+  `candle ring still within the ${RING}-candle cap after reconnect`,
+  ringAfter.length > 100 &&
+    ringAfter.length <= RING &&
+    ringAfter.every((c) => !isWeekendBar(c.time)),
+  `got ${ringAfter.length}`
+);
 
 /* ================================================= 9. STRATEGY ENGINE BOOT */
 section('8) Strategy engine — indicators and lifecycle');

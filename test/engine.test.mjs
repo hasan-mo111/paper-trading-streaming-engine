@@ -36,6 +36,7 @@ import {
   roundToStep,
 } from '../src/engine/indicatorCalc.js';
 import { MarketAggregator } from '../src/services/marketAggregator.js';
+import { isWeekendBar } from '../src/services/marketSession.js';
 import { PaperBroker } from '../src/services/brokerApi.js';
 import { StrategyEngine, ENGINE_STATE } from '../src/engine/strategyEngine.js';
 import { SupabaseService } from '../src/services/supabase.js';
@@ -155,8 +156,12 @@ function seed(market, symbol, interval, candles) {
   market.mergeHistory(symbol, interval, candles);
   const slot = market.store.get(seriesKey(symbol, interval));
   const lastClosed = slot.candles.at(-1);
+  // The aggregator drops weekend rows on merge, so the next tradable bar may be
+  // more than one interval away. Never seed a synthetic weekend forming bar.
+  let currentTime = lastClosed.time + interval;
+  while (isWeekendBar(currentTime)) currentTime += interval;
   slot.current = {
-    time: lastClosed.time + interval,
+    time: currentTime,
     open: lastClosed.close,
     high: lastClosed.close,
     low: lastClosed.close,
@@ -356,7 +361,7 @@ section('3) Entry rules — 50-day Donchian breakout');
   const daily3 = buildCandles({ count: 120, start: 2000, step: 1 });
   seed(h3.market, 'XAUUSD', 86_400, daily3);
   seed(h3.market, 'XAUUSD', 3600, buildCandles({ count: 120, start: 2000, step: 1 }));
-  const chLow = donchian(daily3, 50).low;
+  const chLow = donchian(h3.market.closedCandles('XAUUSD', 86_400), 50).low;
   const hs = h3.market.store.get(seriesKey('XAUUSD', 3600));
   hs.current.close = chLow - 5;
   hs.lastUpdate = Date.now();

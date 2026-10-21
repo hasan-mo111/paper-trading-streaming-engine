@@ -21,6 +21,7 @@ import { ENV } from '../config/env.js';
 import { SERIES, TIMEFRAMES, seriesKey, getSymbolSpec } from '../config/db.js';
 import { createLogger } from './logger.js';
 import { fetchWithTimeout } from './websocket.js';
+import { filterTradableBars, isWeekendBar } from './marketSession.js';
 
 const log = createLogger('market');
 
@@ -93,17 +94,22 @@ export class MarketAggregator {
     const slot = this.store.get(seriesKey(symbol, interval));
     if (!slot) return 0;
 
-    const clean = (candles ?? [])
-      .filter((c) => c && Number.isFinite(c.time) && Number.isFinite(c.close) && Number.isFinite(c.high) && Number.isFinite(c.low))
-      .map((c) => ({
-        time: Math.floor(c.time),
-        open: Number.isFinite(c.open) ? c.open : c.close,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-        tickVolume: Number(c.tickVolume ?? 0) || 0,
-      }))
-      .sort((a, b) => a.time - b.time);
+    // Weekend rows may already be in Supabase from the old gap-filler. Drop
+    // them on the way in so every consumer — chart, strategy, AI — sees only
+    // bars that came from a real session.
+    const clean = filterTradableBars(
+      (candles ?? [])
+        .filter((c) => c && Number.isFinite(c.time) && Number.isFinite(c.close) && Number.isFinite(c.high) && Number.isFinite(c.low))
+        .map((c) => ({
+          time: Math.floor(c.time),
+          open: Number.isFinite(c.open) ? c.open : c.close,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          tickVolume: Number(c.tickVolume ?? 0) || 0,
+        }))
+        .sort((a, b) => a.time - b.time)
+    );
 
     slot.candles = clean.slice(-this.maxCandles);
     if (slot.candles.length > 0) {
@@ -122,7 +128,7 @@ export class MarketAggregator {
         // Do NOT fabricate a forming bar when the newest closed bar is already
         // the current one (e.g. warm start in the middle of a session).
         const startAt = Math.max(expected, now);
-        if (startAt === expected) {
+        if (startAt === expected && !isWeekendBar(startAt)) {
           slot.current = {
             time: expected,
             open: lastClosed.close,
@@ -156,6 +162,7 @@ export class MarketAggregator {
     for (const c of slot.candles) byTime.set(c.time, c); // restored rows first
     for (const c of upstreamCandles) {
       if (!c || !Number.isFinite(c.time) || !Number.isFinite(c.close)) continue;
+      if (isWeekendBar(c.time)) continue;
       byTime.set(c.time, {
         time: c.time,
         open: Number.isFinite(c.open) ? c.open : c.close,
@@ -166,7 +173,9 @@ export class MarketAggregator {
       });
     }
 
-    slot.candles = [...byTime.values()].sort((a, b) => a.time - b.time).slice(-this.maxCandles);
+    slot.candles = filterTradableBars([...byTime.values()].sort((a, b) => a.time - b.time)).slice(
+      -this.maxCandles
+    );
     slot.ready = true;
     if (!this.store.get(seriesKey(symbol, interval))?.restored) slot.restored = false;
     this.markDirty(slot.key);
@@ -270,7 +279,11 @@ export class MarketAggregator {
     // it when it is newer than whatever we had, so a stale REST snapshot
     // cannot rewind a live feed.
     const forming = toCandle(formingRaw);
-    if (Number.isFinite(forming.time) && Number.isFinite(forming.close)) {
+    if (
+      Number.isFinite(forming.time) &&
+      Number.isFinite(forming.close) &&
+      !isWeekendBar(forming.time)
+    ) {
       if (!slot.current || forming.time >= slot.current.time) {
         slot.current = forming;
       } else if (slot.current.time === forming.time) {
@@ -334,6 +347,11 @@ export class MarketAggregator {
     const epochSec = tick.timestamp ? new Date(tick.timestamp).getTime() / 1000 : Date.now() / 1000;
     if (!Number.isFinite(price) || !Number.isFinite(epochSec)) return false;
 
+    // The feed keeps the socket open over the weekend and may replay the last
+    // quote. A tick stamped while the market is shut is not a trade; folding it
+    // in would create a flat "weekend candle" on the chart and in the prompt.
+    if (isWeekendBar(epochSec)) return false;
+
     let changed = false;
 
     for (const slot of this.store.values()) {
@@ -347,23 +365,21 @@ export class MarketAggregator {
         changed = true;
       } else if (epoch > slot.current.time) {
         /* -------- ROLLOVER: close the previous candle, open a new one ------- */
-        let closed = null;
-        if (epoch === slot.current.time + slot.interval) {
-          closed = slot.current; // the normal case
-          this.#pushClosed(slot, closed);
-        } else {
-          // Gap (weekend / outage): carry the last close forward so the chart
-          // never shows a hole, then open the new candle at the live price.
-          const missing = Math.round((epoch - slot.current.time) / slot.interval);
-          log.warn(`${slot.key} gap of ${missing} candles — filling`);
-          let ghost = { ...slot.current, time: slot.current.time + slot.interval };
-          while (ghost.time < epoch) {
-            this.#pushClosed(slot, ghost);
-            ghost = { ...ghost, time: ghost.time + slot.interval };
-          }
+        // Always emit the candle that actually traded. A long gap (weekend,
+        // holiday, feed outage) is left as a gap: carrying the last close
+        // forward fabricated hundreds of flat candles per series and poisoned
+        // both the chart and the AI prompt.
+        const closed = slot.current;
+        const emitClosed = !isWeekendBar(closed.time);
+        if (emitClosed) this.#pushClosed(slot, closed);
+
+        const missing = Math.round((epoch - closed.time) / slot.interval) - 1;
+        if (missing > 0) {
+          log.info(`${slot.key} gap of ${missing} candle(s) — market closed or feed outage, no fill`);
         }
+
         slot.current = { time: epoch, open: price, high: price, low: price, close: price, tickVolume: 1 };
-        this.#markDirty(slot, closed, true);
+        this.#markDirty(slot, emitClosed ? closed : null, true);
         changed = true;
       } else if (epoch === slot.current.time) {
         /* -------- same candle: mutate the forming candle in place ------------ */
@@ -399,6 +415,9 @@ export class MarketAggregator {
 
   /** Append a closed candle, keep the array at exactly maxCandles, persist it. */
   #pushClosed(slot, candle) {
+    // Last line of defence: no code path may put a weekend bar on the wire,
+    // in the ring, or in Supabase.
+    if (isWeekendBar(candle.time)) return;
     slot.candles.push(candle);
     if (slot.candles.length > this.maxCandles) {
       slot.candles.splice(0, slot.candles.length - this.maxCandles);

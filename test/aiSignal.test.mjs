@@ -20,9 +20,10 @@
 
 import assert from 'node:assert/strict';
 
-import { AiSignalService, SYSTEM_PROMPT, formatChat, formatTelegram, JSON_CORRECTION } from '../src/services/aiSignal.js';
+import { AiSignalService, SYSTEM_PROMPT, formatChat, formatTelegram, JSON_CORRECTION, buildUserMessage } from '../src/services/aiSignal.js';
 import { CHAT_TYPES } from '../src/services/sseDispatcher.js';
 import { KeyPool, cooldownForMessage } from '../src/services/keyPool.js';
+import { isWeekendBar, filterTradableBars } from '../src/services/marketSession.js';
 
 /* ------------------------------------------------------------ test harness */
 
@@ -205,8 +206,44 @@ await testAsync('run() sends the system prompt and a compact user turn to Groq',
   const user = JSON.parse(call.body.messages[1].content);
   assert.equal(user.current_price, 2400);
   assert.deepEqual(Object.keys(user.timeframes), ['D1', 'H4', 'H1', 'M15', 'M5']);
-  assert.equal(user.timeframes.D1.rows.length, 61); // 60 closed + forming
-  assert.deepEqual(user.row_format, ['epoch_seconds', 'open', 'high', 'low', 'close']);
+  assert.ok(user.timeframes.D1.rows.length >= 20, 'a usable daily window survives the weekend filter');
+  assert.equal(user.timeframes.D1.rows[0].length, 4, 'rows are [open, high, low, close]');
+  assert.equal(user.timeframes.D1.interval_seconds, 86400);
+  assert.match(user.timeframes.D1.first_bar_utc, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual(user.row_format, ['open', 'high', 'low', 'close']);
+  assert.deepEqual(user.timeframes.D1.rows.at(-1), [2400, 2400, 2400, 2400], 'forming candle is last');
+});
+
+await test('the weekly session predicate is DST-aware', () => {
+  const ts = (year, month, day, hour) => Date.UTC(year, month, day, hour) / 1000;
+
+  // July: US daylight saving → the week closes/opens at 21:00 UTC.
+  assert.equal(isWeekendBar(ts(2026, 6, 17, 20)), false, 'Friday before the summer close');
+  assert.equal(isWeekendBar(ts(2026, 6, 17, 21)), true, 'Friday at the summer close');
+  assert.equal(isWeekendBar(ts(2026, 6, 18, 12)), true, 'Saturday');
+  assert.equal(isWeekendBar(ts(2026, 6, 19, 20)), true, 'Sunday before the summer open');
+  assert.equal(isWeekendBar(ts(2026, 6, 19, 21)), false, 'Sunday at the summer open');
+
+  // January: standard time → the same edges move to 22:00 UTC.
+  assert.equal(isWeekendBar(ts(2026, 0, 16, 21)), false, 'Friday 21:xx is still open in winter');
+  assert.equal(isWeekendBar(ts(2026, 0, 16, 22)), true, 'Friday at the winter close');
+  assert.equal(isWeekendBar(ts(2026, 0, 18, 21)), true, 'Sunday before the winter open');
+  assert.equal(isWeekendBar(ts(2026, 0, 18, 22)), false, 'Sunday at the winter open');
+});
+
+await test('filterTradableBars keeps real session bars and drops the closed window', () => {
+  const rows = [
+    { time: Date.UTC(2026, 6, 17, 20) / 1000, close: 1 }, // Friday, open
+    { time: Date.UTC(2026, 6, 17, 21) / 1000, close: 2 }, // Friday, closed
+    { time: Date.UTC(2026, 6, 18, 12) / 1000, close: 3 }, // Saturday
+    { time: Date.UTC(2026, 6, 19, 20) / 1000, close: 4 }, // Sunday, pre-open
+    { time: Date.UTC(2026, 6, 19, 21) / 1000, close: 5 }, // Sunday, open
+  ];
+  assert.deepEqual(
+    filterTradableBars(rows).map((r) => r.close),
+    [1, 5]
+  );
+  assert.equal(filterTradableBars(null).length, 0);
 });
 
 /* ---- 2. parsing ---------------------------------------------------------- */
@@ -410,10 +447,17 @@ await test('an empty completion from the primary model falls back to the provide
   const res = await svc.run('manual');
   assert.equal(res.ok, true, 'fallback should recover');
   assert.equal(fetchFn.calls.length, 2, 'primary + fallback = 2 calls');
-  // First call is the configured model, second is the fallback with more room.
+  // First call is the configured model, second is the fallback on the same budget.
   assert.equal(fetchFn.calls[0].body.model, 'openai/gpt-oss-120b');
+  assert.equal(fetchFn.calls[0].body.reasoning_effort, 'low', 'gpt-oss reasons briefly');
   assert.equal(fetchFn.calls[1].body.model, 'llama-3.1-8b-instant');
-  assert.ok(fetchFn.calls[1].body.max_tokens >= 8000, 'fallback gets extra headroom');
+  assert.equal(fetchFn.calls[1].body.reasoning_effort, undefined, 'llama is not a reasoning model');
+  assert.equal(
+    fetchFn.calls[1].body.max_tokens,
+    fetchFn.calls[0].body.max_tokens,
+    'the fallback must not inflate the request past the free-tier cap'
+  );
+  assert.ok(fetchFn.calls[1].body.max_tokens <= 2000);
   assert.equal(svc.stats.fallbacks, 1);
 });
 
@@ -580,6 +624,89 @@ await testAsync('a decommissioned model walks to the next model in the chain', a
   assert.equal(svc.stats.keyRotations, 0, 'a missing model is not a credential problem');
 });
 
+await testAsync('a 413 request-too-large walks the model chain instead of re-asking forever', async () => {
+  const calls = [];
+  const fetchFn = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    calls.push({ url, opts, body });
+    if (body.model === 'big/model') {
+      return {
+        ok: false,
+        status: 413,
+        text: async () =>
+          JSON.stringify({
+            error: {
+              message:
+                'Request too large for model `big/model` in organization `org_x` on tokens per minute (TPM): Limit 8000, Requested 9442',
+            },
+          }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ choices: [{ message: { content: buySignal() } }] }),
+    };
+  };
+  const env = {
+    ai: baseCfg({
+      MODEL: 'big/model',
+      FALLBACK_MODELS: ['small/model'],
+      MAX_ATTEMPTS: 2,
+      MAX_CALLS_PER_CYCLE: 6,
+    }),
+  };
+  const svc = new AiSignalService({
+    market: fakeMarket({ price: 2400 }),
+    dispatcher: fakeDispatcher(),
+    telegram: fakeTelegram(),
+    env,
+    fetchFn,
+  });
+  const res = await svc.run('manual');
+
+  assert.equal(res.ok, true, 'the next model should recover the cycle');
+  assert.deepEqual(calls.map((c) => c.body.model), ['big/model', 'small/model']);
+  assert.ok(svc.stats.modelLimits >= 1, 'a 413 is booked as a per-model limit');
+  assert.equal(svc.stats.keyRotations, 0, 'a 413 is not a credential problem');
+  assert.equal(
+    svc.keyPool.status().modelsDisabled,
+    0,
+    'a too-large request must not disable the model for hours'
+  );
+});
+
+await test('the prompt builder trims the oldest bars to stay inside its budget', () => {
+  const bars = (seconds, n) =>
+    Array.from({ length: n }, (_, i) => [
+      1_700_000_000 + i * seconds,
+      4117.03,
+      4117.2,
+      4116.9,
+      4117.1,
+    ]);
+  const snapshot = {
+    symbol: 'XAUUSD',
+    price: 4117.11,
+    frames: {
+      D1: { label: 'Daily', seconds: 86400, bars: bars(86400, 100) },
+      H4: { label: '4H', seconds: 14400, bars: bars(14400, 100) },
+      H1: { label: '1H', seconds: 3600, bars: bars(3600, 100) },
+      M15: { label: '15m', seconds: 900, bars: bars(900, 100) },
+      M5: { label: '5m', seconds: 300, bars: bars(300, 100) },
+    },
+  };
+  const news = Array.from({ length: 12 }, (_, i) => `2026-10-21T${String(i).padStart(2, '0')}:30:00Z USD High impact event`);
+  const text = buildUserMessage(snapshot, news, { maxChars: 6000 });
+  const payload = JSON.parse(text);
+
+  assert.ok(text.length <= 6000, `prompt is ${text.length} chars, budget 6000`);
+  for (const [bucket, frame] of Object.entries(payload.timeframes)) {
+    assert.ok(frame.rows.length >= 20, `${bucket} keeps the usable minimum`);
+    assert.equal(frame.rows[0].length, 4, `${bucket} rows stay compact`);
+  }
+});
+
 await test('cooldownForMessage separates daily limits from per-minute ones', () => {
   const now = Date.UTC(2026, 0, 2, 12, 0, 0);
   const daily = cooldownForMessage('tokens per day (TPD) exhausted', now);
@@ -654,12 +781,13 @@ await test('a prose reply with no JSON triggers a corrected retry that recovers'
   assert.equal(res.signal.action, 'BUY');
   assert.equal(fetchFn.calls.length, 2, 'prose + corrected retry = 2 calls');
 
-  // The retry re-sends the original turn and appends the correction, with room.
+  // The retry re-sends the original turn and appends the correction, without
+  // growing the budget past the provider's per-request limit.
   const retry = fetchFn.calls[1].body;
   assert.equal(retry.messages.length, 3);
   assert.equal(retry.messages[2].role, 'user');
   assert.equal(retry.messages[2].content, JSON_CORRECTION);
-  assert.ok(retry.max_tokens >= 4000, 'retry gets extra headroom');
+  assert.equal(retry.max_tokens, 2000, 'the corrected retry stays inside the configured budget');
 
   assert.equal(dispatcher.pushed.length, 1, 'the recovered signal is published');
   assert.equal(telegram.sent.length, 1);
