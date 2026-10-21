@@ -669,6 +669,7 @@ await testAsync('a 413 request-too-large walks the model chain instead of re-ask
   assert.deepEqual(calls.map((c) => c.body.model), ['big/model', 'small/model']);
   assert.ok(svc.stats.modelLimits >= 1, 'a 413 is booked as a per-model limit');
   assert.equal(svc.stats.keyRotations, 0, 'a 413 is not a credential problem');
+  assert.equal(svc.stats.lastError, null, 'a recovered cycle clears the transient attempt error');
   assert.equal(
     svc.keyPool.status().modelsDisabled,
     0,
@@ -727,6 +728,17 @@ await test('KeyPool skips parked slots and wraps around', () => {
   assert.equal(pool.hasAvailable(), false);
   assert.deepEqual(pool.status().available, 0);
   assert.equal(pool.status().rotations, 3);
+});
+
+await test('KeyPool spreads successful calls across accounts', () => {
+  const pool = new KeyPool(['a', 'b']);
+  const first = pool.current();
+  assert.equal(first.key, 'a');
+  pool.markOk(first.key);
+  const second = pool.current();
+  assert.equal(second.key, 'b');
+  pool.markOk(second.key);
+  assert.equal(pool.current().key, 'a', 'the pool wraps back to the first account');
 });
 
 await test('reasoning_content is used when content is empty', async () => {

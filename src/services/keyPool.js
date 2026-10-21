@@ -188,6 +188,10 @@ export class KeyPool {
     if (index === -1) return;
     this.cooldownUntil.delete(index);
     if (model) this.modelCooldown.delete(`${index}|${model}`);
+    // Spread the next call across accounts. Without this, every cycle hammers
+    // the first key until its per-minute bucket is empty and only then rotates,
+    // which burns a 429 (and a fallback model) on nearly every symbol.
+    this.active = this.keys.length ? (index + 1) % this.keys.length : 0;
   }
 
   /** Observability — never includes key material. */

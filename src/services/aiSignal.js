@@ -464,6 +464,9 @@ export class AiSignalService {
       this.stats.lastRunAt = Date.now();
       this.stats.lastLatencyMs = latency;
       this.stats.lastModel = call.model;
+      // A fallback succeeded: keep the cycle healthy and do not leave a
+      // transient 429/413 from an earlier attempt in the public status.
+      this.stats.lastError = null;
       this.catchupsUsed = 0; // a healthy cycle clears the catch-up budget
       this.lastSignal = signal;
 
