@@ -25,28 +25,34 @@ import express from 'express';
  * @param {import('express').Application} deps.app
  * @param {import('../services/aiSignal.js').AiSignalService} deps.ai
  * @param {Function} [deps.tradeGuard]  shared request guard
+ * @param {Function} [deps.deviceGate]  optional APK membership gate
  */
-export function mountAiRoutes({ app, ai, tradeGuard = null }) {
+export function mountAiRoutes({ app, ai, tradeGuard = null, deviceGate = null }) {
   const router = express.Router();
   const guard = tradeGuard ? [tradeGuard] : [];
+  const member = deviceGate ? [deviceGate] : [];
 
   /** Current status + last signal. Cheap, safe to poll. */
-  router.get('/api/ai/signal', ...guard, (_req, res) => {
+  router.get('/api/ai/signal', ...guard, ...member, (_req, res) => {
     res.json(ai.status());
   });
 
   /** On-demand analysis. 429 while the cooldown is live, 503 when unconfigured. */
-  router.get('/api/ai/analyze', ...guard, async (_req, res) => {
-    const result = await ai.run('manual');
-    if (result.ok) return res.json(result);
+  router.get('/api/ai/analyze', ...guard, ...member, async (_req, res, next) => {
+    try {
+      const result = await ai.run('manual');
+      if (result.ok) return res.json(result);
 
-    const code =
-      result.error === 'cooldown' || result.error === 'busy' || result.error === 'rate-limited'
-        ? 429
-        : result.error === 'disabled' || result.error === 'insufficient-data'
-          ? 503
-          : 502;
-    return res.status(code).json(result);
+      const code =
+        result.error === 'cooldown' || result.error === 'busy' || result.error === 'rate-limited'
+          ? 429
+          : result.error === 'disabled' || result.error === 'insufficient-data'
+            ? 503
+            : 502;
+      return res.status(code).json(result);
+    } catch (err) {
+      return next(err);
+    }
   });
 
   app.use(router);

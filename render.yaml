@@ -7,9 +7,12 @@
 #  BEFORE THE FIRST DEPLOY
 #  -----------------------
 #    1. Run supabase/schema.sql in the Supabase SQL Editor.
+#       Existing deployments: also run supabase/admin-membership.sql once.
 #    2. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY as secret env vars
 #       (Render → the service → Environment).
-#    3. Deploy. Check /health — `database.lastProbe.connected` must be true.
+#    3. Set ADMIN_PASSWORD_HASH (or ADMIN_PASSWORD) and ADMIN_SESSION_SECRET
+#       so /admin/ is enabled.
+#    4. Deploy. Check /health — `database.lastProbe.connected` must be true.
 #
 #  ⚠ NEVER put the service-role key in the Android app or in git. It bypasses
 #    row-level security and is the single most sensitive value in this system.
@@ -86,6 +89,39 @@ services:
         value: "0"           # 0 = unlimited
       - key: AUTH_REQUIRED
         value: "true"
+
+      # ── Admin console + APK memberships ────────────────────────────────
+      # Set ADMIN_PASSWORD_HASH as a SECRET (npm run hash:admin -- "…") and
+      # ADMIN_SESSION_SECRET as another random secret. Without a password the
+      # console answers "not configured" and the SPA stays disabled.
+      - key: ADMIN_ENABLED
+        value: "true"
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD_HASH
+        sync: false
+      - key: ADMIN_SESSION_SECRET
+        sync: false
+      - key: ADMIN_SESSION_TTL_MS
+        value: "43200000"
+      - key: MEMBERSHIP_ENABLED
+        value: "true"
+      - key: FREE_HISTORY_DAYS
+        value: "7"
+      - key: MONTHLY_HISTORY_DAYS
+        value: "90"
+      - key: YEARLY_HISTORY_DAYS
+        value: "3650"
+      - key: MEMBERSHIP_TELEGRAM
+        value: "true"
+      - key: MEMBERSHIP_REQUEST_COOLDOWN_MS
+        value: "300000"
+      - key: SUPPORT_TELEGRAM
+        sync: false
+      - key: SUPPORT_WHATSAPP
+        sync: false
+      - key: SUPPORT_EMAIL
+        sync: false
 
       # ── Market data ────────────────────────────────────────────────────
       - key: UPSTREAM_WS

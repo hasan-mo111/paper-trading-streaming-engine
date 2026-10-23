@@ -118,6 +118,13 @@ const child = spawn(process.execPath, ['server.js'], {
     // A dev token lets the authenticated endpoints be exercised without a
     // Supabase project. env.js blanks DEV_TOKEN in production.
     DEV_TOKEN: 'e2e-dev-token',
+    // Exercise the real admin router + APK membership wiring in app.js.
+    ADMIN_USERNAME: 'admin',
+    ADMIN_PASSWORD: 'e2e-admin-password',
+    ADMIN_PASSWORD_HASH: '',
+    ADMIN_SESSION_SECRET: 'e2e-session-secret',
+    MEMBERSHIP_ENABLED: 'true',
+    FREE_HISTORY_DAYS: '7',
     // Keep the log readable — the engine is chatty by design.
     LOG_LEVEL: process.env.LOG_LEVEL ?? 'info',
   },
@@ -577,6 +584,65 @@ check('no client-supplied order appears anywhere in the log', !/client-supplied|
 check('sizing stays within the broker maximum', (engFinal.positions ?? []).every((p) => p.volume > 0 && p.volume <= 50), `${engFinal.positions?.length ?? 0} position(s)`);
 check('every open position carries a stop', (engFinal.positions ?? []).every((p) => p.stop != null));
 check('the leg split is preserved on every position', (engFinal.positions ?? []).every((p) => p.legs.length === 2));
+
+/* ============================== 11. ADMIN + APK MEMBERSHIP WIRING ======= */
+section('11) Admin console + APK membership');
+
+const adminPage = await getText('/admin/');
+check('GET /admin/ serves the operator SPA', /Operator console/.test(adminPage) && /Sign in/.test(adminPage));
+
+const adminLogin = await fetch(`${APP}/admin/api/login`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ username: 'admin', password: 'e2e-admin-password' }),
+});
+const adminCookie = adminLogin.headers.get('set-cookie')?.split(';')[0] ?? '';
+check('admin login returns a session cookie', adminLogin.status === 200 && adminCookie.startsWith('aetheron_admin='));
+
+const adminOverview = await fetch(`${APP}/admin/api/overview`, { headers: { cookie: adminCookie } });
+const adminOverviewBody = await adminOverview.json();
+check(
+  'authenticated admin overview reads the membership service',
+  adminOverview.status === 200 && adminOverviewBody.stats?.users?.total === 0,
+  `HTTP ${adminOverview.status}`
+);
+
+const device = 'E2E-DEVICE-0001';
+const registration = await fetch(`${APP}/api/membership/register`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ deviceId: device, displayName: 'E2E', contactMethod: 'telegram' }),
+});
+const registrationBody = await registration.json();
+check(
+  'APK device registration creates a FREE account',
+  registration.status === 200 && registrationBody.created === true && registrationBody.user?.plan === 'FREE',
+  registrationBody.user?.plan
+);
+
+const meDevice = await fetch(`${APP}/api/membership/me`, { headers: { 'X-Device-Id': device } });
+const meDeviceBody = await meDevice.json();
+check(
+  'GET /api/membership/me is the source of truth',
+  meDevice.status === 200 && meDeviceBody.user?.deviceId === device && meDeviceBody.user?.retentionDays === 7
+);
+
+const historyDevice = await fetch(`${APP}/api/trades/history`, { headers: { 'X-Device-Id': device } });
+const historyDeviceBody = await historyDevice.json();
+check(
+  'APK reads trade history through the server, not Supabase',
+  historyDevice.status === 200 && historyDeviceBody.plan === 'FREE' && Array.isArray(historyDeviceBody.items)
+);
+
+const aiWithDevice = await fetch(`${APP}/api/ai/signal`, { headers: { 'X-Device-Id': device } });
+check('a registered device can read /api/ai/signal', aiWithDevice.status === 200);
+
+const adminUsers = await fetch(`${APP}/admin/api/users`, { headers: { cookie: adminCookie } });
+const adminUsersBody = await adminUsers.json();
+check(
+  'the admin console lists the registered device',
+  adminUsers.status === 200 && adminUsersBody.total === 1 && adminUsersBody.items?.[0]?.deviceId === device
+);
 
 /* ---------------------------------------------------------------- report */
 if (failures.length) {

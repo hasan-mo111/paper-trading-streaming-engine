@@ -28,6 +28,7 @@
  *  parsing/validation core is testable with no network and no key.
  * ============================================================================= */
 
+import { randomUUID } from 'node:crypto';
 import { getSymbolSpec, roundPrice } from '../config/db.js';
 import { createLogger } from './logger.js';
 import { CHAT_TYPES } from './sseDispatcher.js';
@@ -35,6 +36,80 @@ import { KeyPool, cooldownForMessage } from './keyPool.js';
 import { filterTradableBars, isWeekendBar } from './marketSession.js';
 
 const log = createLogger('ai');
+
+/**
+ * Turn the live in-memory position into the permanent `ai_trades` row.
+ * Kept next to the analyst so the shape of the book and the shape of the
+ * ledger cannot drift apart.
+ *
+ * @param {object} p
+ * @param {{closed?:boolean}} [opts]
+ */
+export function tradeRowFromPosition(p, { closed = false } = {}) {
+  if (!p) return null;
+  const openedMs = Number(p.openedMs) || Date.parse(p.openedAt) || Date.now();
+  return {
+    id: p.id,
+    symbol: p.symbol,
+    action: p.action,
+    entry_price: Number(p.entry),
+    stop_loss: p.sl == null ? null : Number(p.sl),
+    take_profit_1: p.tp1 == null ? null : Number(p.tp1),
+    take_profit_2: p.tp2 == null ? null : Number(p.tp2),
+    rr: p.rr == null ? null : Number(p.rr),
+    confidence: p.confidence ?? null,
+    reasoning: p.reasoning ?? null,
+    model: p.model ?? null,
+    stage: p.stage === 'tp1' ? 'tp1' : 'open',
+    status: closed ? 'CLOSED' : 'OPEN',
+    opened_at: p.openedAt ?? new Date(openedMs).toISOString(),
+    opened_ms: openedMs,
+    closed_at: closed ? p.closedAt ?? new Date().toISOString() : null,
+    closed_ms: closed ? Number(p.closedMs) || Date.now() : null,
+    exit_price: closed && p.exitPrice != null ? Number(p.exitPrice) : null,
+    exit_reason: closed ? p.exitReason ?? null : null,
+    pnl_points: closed && p.pnlPoints != null ? Number(p.pnlPoints) : null,
+    pnl_pct: closed && p.pnlPct != null ? Number(p.pnlPct) : null,
+    last_price: p.lastPrice == null ? null : Number(p.lastPrice),
+    mfe: Number(p.mfe) || 0,
+    mae: Number(p.mae) || 0,
+    meta: {
+      openedAtPrice: p.openedAtPrice ?? null,
+      ticks: Number(p.ticks) || 0,
+      exitNote: closed ? p.exitNote ?? null : null,
+    },
+  };
+}
+
+/** Rebuild the tick-handler's position object from an `ai_trades` row. */
+export function positionFromRow(row) {
+  if (!row || (row.action !== 'BUY' && row.action !== 'SELL')) return null;
+  const entry = Number(row.entry_price);
+  if (!Number.isFinite(entry)) return null;
+  const meta = row.meta && typeof row.meta === 'object' ? row.meta : {};
+  const openedMs = Number(row.opened_ms) || Date.parse(row.opened_at) || Date.now();
+  return {
+    id: row.id,
+    action: row.action,
+    symbol: String(row.symbol).toUpperCase(),
+    entry,
+    sl: row.stop_loss == null ? null : Number(row.stop_loss),
+    tp1: row.take_profit_1 == null ? null : Number(row.take_profit_1),
+    tp2: row.take_profit_2 == null ? null : Number(row.take_profit_2),
+    rr: row.rr == null ? null : Number(row.rr),
+    confidence: row.confidence ?? null,
+    reasoning: row.reasoning ?? null,
+    model: row.model ?? null,
+    openedAt: row.opened_at ?? new Date(openedMs).toISOString(),
+    openedMs,
+    openedAtPrice: Number(meta.openedAtPrice) || entry,
+    stage: row.stage === 'tp1' ? 'tp1' : 'open',
+    lastPrice: row.last_price == null ? entry : Number(row.last_price),
+    mfe: Number(row.mfe) || 0,
+    mae: Number(row.mae) || 0,
+    ticks: Number(meta.ticks) || 0,
+  };
+}
 
 /**
  * Does this error mean "you have spent your quota"? Every provider answers 429
@@ -212,6 +287,7 @@ export class AiSignalService {
     fetchFn = null,
     news = null,
     keyPool = null,
+    persistence = null,
   } = {}) {
     if (!market) throw new Error('AiSignalService requires a market aggregator');
     if (!dispatcher) throw new Error('AiSignalService requires an SSE dispatcher');
@@ -220,6 +296,8 @@ export class AiSignalService {
     this.dispatcher = dispatcher;
     this.env = env ?? market.env ?? null;
     this.news = news;
+    /** SupabaseService (or a test double) for the durable trade ledger. */
+    this.persistence = persistence;
     // `env.ai` can be partial — a trimmed test env, or a knob added to ENV after
     // this process last booted. Merging over DEFAULTS guarantees every key the
     // service reads exists, so a missing entry degrades to a sane value instead
@@ -391,9 +469,31 @@ export class AiSignalService {
       lastSignal: this.lastSignal,
       position: this.position,
       positionOpen: Boolean(this.position),
+      positionId: this.position?.id ?? null,
+      persisted: Boolean(this.persistence?.saveAiTrade),
       historyCount: this.history.length,
       news: this.news?.status?.() ?? null,
     };
+  }
+
+  /**
+   * Reattach an open trade loaded from the durable ledger after a restart.
+   * The first tick will enforce its stop/targets again.
+   *
+   * @param {object} row  one `ai_trades` row
+   * @returns {boolean} true when the position was adopted
+   */
+  restorePosition(row) {
+    if (!row || this.position) return false;
+    const position = positionFromRow(row);
+    if (!position) return false;
+    if (String(this.cfg.SYMBOL).toUpperCase() !== position.symbol) return false;
+    this.position = position;
+    log.ok(
+      `AI trade RESTORED → ${position.action} ${position.symbol} @ ${position.entry} ` +
+        `(${position.id})`
+    );
+    return true;
   }
 
   /* ==================================================================== run */
@@ -573,7 +673,9 @@ export class AiSignalService {
   /** Take the signal as a paper position the analyst will now manage. */
   #openPosition(signal, snapshot) {
     this.position = {
-      id: `ai-${Date.now().toString(36)}`,
+      // Four symbols can open in the same millisecond, so the id must not be
+      // derived from the clock alone — the ledger's primary key depends on it.
+      id: `ai-${randomUUID()}`,
       action: signal.action,
       symbol: signal.symbol,
       entry: signal.entry_price,
@@ -594,7 +696,38 @@ export class AiSignalService {
       ticks: 0,
     };
     this.stats.opened += 1;
+    this.#persistOpen(this.position);
     log.ok(`AI trade OPEN → ${signal.action} ${signal.symbol} @ ${signal.entry_price}`);
+  }
+
+  /**
+   * Write the open trade to the durable ledger. Fire-and-forget: a database
+   * hiccup must never abort a trade the tick handler is already managing.
+   */
+  #persistOpen(position) {
+    if (!this.persistence?.saveAiTrade) return;
+    Promise.resolve(this.persistence.saveAiTrade(tradeRowFromPosition(position))).catch((e) =>
+      log.warn('AI trade open was not persisted:', e.message)
+    );
+  }
+
+  /** Persist a TP1 / breakeven mutation without blocking the tick path. */
+  #persistUpdate(position) {
+    if (!this.persistence?.updateAiTrade || !position?.id) return;
+    Promise.resolve(
+      this.persistence.updateAiTrade(position.id, {
+        stage: position.stage,
+        stop_loss: position.sl,
+        last_price: position.lastPrice,
+        mfe: position.mfe,
+        mae: position.mae,
+        meta: {
+          openedAtPrice: position.openedAtPrice ?? null,
+          ticks: Number(position.ticks) || 0,
+          exitNote: null,
+        },
+      })
+    ).catch((e) => log.warn('AI trade update was not persisted:', e.message));
   }
 
   /** TP1 reached: pull the stop to entry so the trade can no longer lose. */
@@ -604,6 +737,7 @@ export class AiSignalService {
     p.stage = 'tp1';
     p.sl = p.entry;
     p.lastPrice = price;
+    this.#persistUpdate(p);
     log.ok(`AI trade ${p.symbol}: TP1 reached at ${price} — stop moved to breakeven (${p.entry})`);
     this.#emitTradeEvent('TP1', p, price);
     return null;
@@ -638,6 +772,12 @@ export class AiSignalService {
     if (reason === 'REVERSAL') this.stats.reversals += 1;
     if (pnlPoints >= 0) this.stats.wins += 1;
     else this.stats.losses += 1;
+
+    if (this.persistence?.saveAiTrade) {
+      Promise.resolve(this.persistence.saveAiTrade(tradeRowFromPosition(closed, { closed: true }))).catch((e) =>
+        log.warn('AI trade close was not persisted:', e.message)
+      );
+    }
 
     const icon = reason === 'SL' ? '🛑' : reason === 'REVERSAL' ? '↩️' : '✅';
     log.ok(

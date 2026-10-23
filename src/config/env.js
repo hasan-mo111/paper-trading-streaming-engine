@@ -132,6 +132,59 @@ const auth = {
   DEV_TOKEN: process.env.NODE_ENV === 'production' ? '' : secret(process.env.DEV_TOKEN),
 };
 
+/* ------------------------------------------------------ admin console --- */
+
+/*
+ *  The admin console manages APK users, membership requests and the trade
+ *  ledger. It is deliberately independent of Supabase auth: the browser logs
+ *  in with a username/password held in the server environment, and the server
+ *  issues a short-lived signed cookie. No admin password is ever stored in the
+ *  database or shipped to a client.
+ */
+const admin = {
+  /** Master switch. Without a password the console answers "not configured". */
+  ENABLED: bool(process.env.ADMIN_ENABLED, true),
+  USERNAME: (process.env.ADMIN_USERNAME || 'admin').trim() || 'admin',
+  /** Plain password from the environment. Prefer ADMIN_PASSWORD_HASH in prod. */
+  PASSWORD: secret(process.env.ADMIN_PASSWORD),
+  /**
+   * Optional scrypt hash: `scrypt$<salt-b64url>$<hash-b64url>`.
+   * Generate one with: npm run hash:admin -- "your password"
+   */
+  PASSWORD_HASH: secret(process.env.ADMIN_PASSWORD_HASH),
+  /** HMAC key for the session cookie. Empty = derive from the credential. */
+  SESSION_SECRET: secret(process.env.ADMIN_SESSION_SECRET),
+  SESSION_TTL_MS: int(process.env.ADMIN_SESSION_TTL_MS, 12 * 3_600_000, 5 * 60_000, 7 * 86_400_000),
+  LOGIN_WINDOW_MS: int(process.env.ADMIN_LOGIN_WINDOW_MS, 15 * 60_000, 60_000, 3_600_000),
+  LOGIN_MAX: int(process.env.ADMIN_LOGIN_MAX, 8, 3, 100),
+};
+
+/* ------------------------------------------------- APK membership plans -- */
+
+/*
+ *  The APK has no email/password signup. Each installation generates a device
+ *  id, registers it, and the operator upgrades or bans that device from the
+ *  admin console. Plans are labels plus a retention window for the trade
+ *  history; nothing about them touches the trading engine's execution logic.
+ */
+const membership = {
+  ENABLED: bool(process.env.MEMBERSHIP_ENABLED, true),
+  /** How many days of closed trades each plan can read. */
+  FREE_HISTORY_DAYS: int(process.env.FREE_HISTORY_DAYS, 7, 1, 36_500),
+  MONTHLY_HISTORY_DAYS: int(process.env.MONTHLY_HISTORY_DAYS, 90, 1, 36_500),
+  YEARLY_HISTORY_DAYS: int(process.env.YEARLY_HISTORY_DAYS, 3_650, 1, 36_500),
+  /** Send a Telegram DM on upgrade/ban when the device is paired. */
+  TELEGRAM_UPGRADE: bool(process.env.MEMBERSHIP_TELEGRAM, true),
+  /** Minimum gap between two upgrade requests from the same device. */
+  REQUEST_COOLDOWN_MS: int(process.env.MEMBERSHIP_REQUEST_COOLDOWN_MS, 5 * 60_000, 10_000, 86_400_000),
+  /** Hard cap on the free-text note the user can send with a request. */
+  MAX_MESSAGE_CHARS: int(process.env.MEMBERSHIP_MAX_MESSAGE_CHARS, 500, 40, 4_000),
+  /** Public support handles shown on the APK's upgrade screen. */
+  SUPPORT_TELEGRAM: secret(process.env.SUPPORT_TELEGRAM),
+  SUPPORT_WHATSAPP: secret(process.env.SUPPORT_WHATSAPP),
+  SUPPORT_EMAIL: secret(process.env.SUPPORT_EMAIL),
+};
+
 /* ------------------------------------------------------------------ quota -- */
 
 const quota = {
@@ -506,6 +559,8 @@ export const ENV = Object.freeze({
   upstream,
   supabase,
   auth,
+  admin,
+  membership,
   quota,
   broker,
   strategy,
@@ -529,6 +584,20 @@ export function publicEnv() {
     brokerMode: broker.MODE,
     executionEnabled: strategy.EXECUTION_ENABLED,
     quota: { freeDailyExecutions: quota.FREE_DAILY_EXECUTIONS, proUnlimited: quota.PRO_DAILY_EXECUTIONS === 0 },
+    membership: {
+      enabled: membership.ENABLED,
+      plans: ['FREE', 'MONTHLY', 'YEARLY'],
+      historyDays: {
+        FREE: membership.FREE_HISTORY_DAYS,
+        MONTHLY: membership.MONTHLY_HISTORY_DAYS,
+        YEARLY: membership.YEARLY_HISTORY_DAYS,
+      },
+      support: {
+        telegram: membership.SUPPORT_TELEGRAM || null,
+        whatsapp: membership.SUPPORT_WHATSAPP || null,
+        email: membership.SUPPORT_EMAIL || null,
+      },
+    },
     strategy: {
       name: 'Aetheron Universal',
       donchianEntry: strategy.DONCHIAN_ENTRY,
@@ -633,6 +702,30 @@ export function auditEnv() {
   if (requestedProvider !== 'auto' && !AI_PROVIDERS[requestedProvider]) {
     warnings.push(
       `AI_SIGNAL_PROVIDER="${requestedProvider}" is not a known provider — using ${provider.label} instead.`
+    );
+  }
+
+  // Admin console + APK memberships. These are optional features, but a
+  // half-configured console is worse than a clearly disabled one.
+  if (admin.ENABLED && !admin.PASSWORD && !admin.PASSWORD_HASH) {
+    warnings.push(
+      'ADMIN_PASSWORD (or ADMIN_PASSWORD_HASH) is not set — /admin/ is disabled. ' +
+        'Add a strong password in Render → Environment, then redeploy.'
+    );
+  }
+  if (admin.PASSWORD && admin.PASSWORD.length < 10) {
+    warnings.push('ADMIN_PASSWORD is shorter than 10 characters — use a long random value.');
+  }
+  if (admin.ENABLED && !admin.SESSION_SECRET && (admin.PASSWORD || admin.PASSWORD_HASH)) {
+    warnings.push(
+      'ADMIN_SESSION_SECRET is not set — admin sessions are signed with a key derived from the password. ' +
+        'Set a separate random secret so rotating the password does not just invalidate sessions.'
+    );
+  }
+  if (membership.ENABLED && (!supabase.URL || !supabase.SERVICE_ROLE_KEY)) {
+    warnings.push(
+      'MEMBERSHIP_ENABLED is on but Supabase is not configured — APK users, requests and AI trades ' +
+        'will live in memory only and disappear on restart.'
     );
   }
 

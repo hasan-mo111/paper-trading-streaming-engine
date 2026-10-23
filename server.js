@@ -30,6 +30,11 @@
  *    GET /api/user/positions            engine's open positions  (auth)
  *    GET /api/user/executions           audit trail             (auth)
  *    GET /api/user/engine               live strategy state      (auth)
+ *    GET /api/membership/me             plan + retention         (device id)
+ *    POST /api/membership/register      install → FREE account   (device id)
+ *    GET /api/trades/open               live AI / strategy book  (device id)
+ *    GET /api/trades/history            plan-filtered ledger     (device id)
+ *    GET /admin/                        operator console         (cookie)
  *
  *    There is no trade endpoint. The server decides when to trade.
  * ============================================================================= */
@@ -59,6 +64,17 @@ export { QuotaManager, createRateLimiter, PLANS } from './src/middleware/quotaMa
 export { tradeGuard, apiManifest } from './src/middleware/tradeGuard.js';
 export { StrategyEngine, ENGINE_STATE } from './src/engine/strategyEngine.js';
 export * as indicators from './src/engine/indicatorCalc.js';
+export {
+  AppUserService,
+  APP_PLANS,
+  APP_STATUS,
+  PLAN_DAYS,
+  normaliseDeviceId,
+  effectivePlan,
+  planExpired,
+} from './src/services/appUsers.js';
+export { MembershipEvents } from './src/services/membershipEvents.js';
+export { AdminAuth, hashPassword, verifyPasswordHash, ADMIN_COOKIE } from './src/middleware/adminAuth.js';
 export {
   SYMBOLS,
   SERIES,
@@ -122,6 +138,12 @@ export async function start({ env = ENV } = {}) {
 
   log.ok(`listening on http://${env.server.HOST}:${env.server.PORT}`);
   log.raw(`  Dashboard  : http://localhost:${env.server.PORT}/`);
+  if (ctx.adminAuth?.enabled) {
+    log.raw(`  Admin      : http://localhost:${env.server.PORT}/admin/`);
+  } else {
+    log.raw(`  Admin      : disabled (set ADMIN_PASSWORD or ADMIN_PASSWORD_HASH)`);
+  }
+  log.raw(`  Membership : /api/membership/me · /api/trades/history`);
   log.raw(`  Prices SSE : /api/stream/prices`);
   log.raw(`  Chat SSE   : /api/stream/chat-events`);
   log.raw(`  Health     : /health`);

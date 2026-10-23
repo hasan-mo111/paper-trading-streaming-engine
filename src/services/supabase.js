@@ -21,6 +21,7 @@
  *    chat_events        chat-ops history, replayed to reconnecting clients
  * ============================================================================= */
 
+import { randomUUID } from 'node:crypto';
 import { ENV } from '../config/env.js';
 import { createLogger } from './logger.js';
 import { normaliseSymbol, normaliseInterval, seriesKey } from '../config/db.js';
@@ -117,6 +118,10 @@ export class SupabaseService {
       candles: new Map(), // seriesKey → Map(ts → candle)
       daily: new Map(), // `${userId}|${day}` → count
       profiles: new Map(), // userId → profile
+      appUsers: new Map(), // id → app user
+      appUsersByDevice: new Map(), // device_id → id
+      membershipRequests: new Map(), // id → request
+      aiTrades: new Map(), // id → AI trade
       executions: [],
       chatEvents: [],
     };
@@ -644,6 +649,393 @@ export class SupabaseService {
       return false;
     }
     return true;
+  }
+
+  /* ======================================================================== */
+  /*  APK MEMBERSHIP — device accounts, requests, admin actions              */
+  /* ======================================================================== */
+
+  /** Coerce one PostgREST/local row into the shape the admin UI expects. */
+  #normaliseAppUser(row) {
+    if (!row) return null;
+    const plan = ['FREE', 'MONTHLY', 'YEARLY'].includes(String(row.plan)) ? String(row.plan) : 'FREE';
+    return {
+      id: String(row.id),
+      device_id: String(row.device_id ?? ''),
+      display_name: row.display_name ?? null,
+      contact_method: row.contact_method ?? null,
+      contact_value: row.contact_value ?? null,
+      plan,
+      status: row.status === 'BANNED' ? 'BANNED' : 'ACTIVE',
+      plan_started_at: row.plan_started_at ?? null,
+      plan_expires_at: row.plan_expires_at ?? null,
+      note: row.note ?? null,
+      last_seen_at: row.last_seen_at ?? null,
+      created_at: row.created_at ?? null,
+      updated_at: row.updated_at ?? null,
+    };
+  }
+
+  #cacheAppUser(row) {
+    const user = this.#normaliseAppUser(row);
+    if (!user) return null;
+    this.local.appUsers.set(user.id, user);
+    if (user.device_id) this.local.appUsersByDevice.set(user.device_id, user.id);
+    // Bound the in-process mirror; Supabase remains the source of truth.
+    if (this.local.appUsers.size > 5_000) {
+      const oldest = [...this.local.appUsers.values()].sort((a, b) =>
+        String(a.last_seen_at ?? '').localeCompare(String(b.last_seen_at ?? ''))
+      )[0];
+      if (oldest) {
+        this.local.appUsers.delete(oldest.id);
+        this.local.appUsersByDevice.delete(oldest.device_id);
+      }
+    }
+    return user;
+  }
+
+  /** One APK account by primary key. */
+  async getAppUser(id) {
+    if (!id) return null;
+    const cached = this.local.appUsers.get(id);
+    if (!this.client) return cached ?? null;
+
+    const row = await this.#query(
+      this.client.from('app_users').select('*').eq('id', id).maybeSingle(),
+      `getAppUser(${id})`
+    );
+    if (row) return this.#cacheAppUser(row);
+    return cached ?? null;
+  }
+
+  /** One APK account by its stable device id. */
+  async getAppUserByDevice(deviceId) {
+    if (!deviceId) return null;
+    const cachedId = this.local.appUsersByDevice.get(deviceId);
+    const cached = cachedId ? this.local.appUsers.get(cachedId) : null;
+    if (!this.client) return cached ?? null;
+
+    const row = await this.#query(
+      this.client.from('app_users').select('*').eq('device_id', deviceId).maybeSingle(),
+      `getAppUserByDevice(${deviceId})`
+    );
+    if (row) return this.#cacheAppUser(row);
+    return cached ?? null;
+  }
+
+  /** Insert a new device account. Duplicate device ids return the existing row. */
+  async createAppUser({ deviceId, displayName = null, contactMethod = null, contactValue = null }) {
+    if (!deviceId) return null;
+    const now = new Date().toISOString();
+
+    if (!this.client) {
+      const existing = this.local.appUsersByDevice.get(deviceId);
+      if (existing) return this.local.appUsers.get(existing) ?? null;
+      const user = this.#cacheAppUser({
+        id: randomUUID(),
+        device_id: deviceId,
+        display_name: displayName,
+        contact_method: contactMethod,
+        contact_value: contactValue,
+        plan: 'FREE',
+        status: 'ACTIVE',
+        plan_started_at: null,
+        plan_expires_at: null,
+        note: null,
+        last_seen_at: now,
+        created_at: now,
+        updated_at: now,
+      });
+      return user;
+    }
+
+    const row = await this.#query(
+      this.client
+        .from('app_users')
+        .insert({
+          device_id: deviceId,
+          display_name: displayName,
+          contact_method: contactMethod,
+          contact_value: contactValue,
+          plan: 'FREE',
+          status: 'ACTIVE',
+          last_seen_at: now,
+          created_at: now,
+          updated_at: now,
+        })
+        .select('*')
+        .maybeSingle(),
+      `createAppUser(${deviceId})`
+    );
+    if (row) return this.#cacheAppUser(row);
+
+    // The unique constraint means "already registered" is a normal outcome.
+    return this.getAppUserByDevice(deviceId);
+  }
+
+  /** Patch an APK account (plan, ban, contact details, note). */
+  async updateAppUser(id, patch = {}) {
+    if (!id) return null;
+    const clean = { ...patch, updated_at: new Date().toISOString() };
+    const cached = this.local.appUsers.get(id);
+
+    if (!this.client) {
+      if (!cached) return null;
+      return this.#cacheAppUser({ ...cached, ...clean });
+    }
+
+    const row = await this.#query(
+      this.client.from('app_users').update(clean).eq('id', id).select('*').maybeSingle(),
+      `updateAppUser(${id})`
+    );
+    if (row) return this.#cacheAppUser(row);
+    // A configured database write that failed must NOT pretend to have applied
+    // the patch. Returning the stale cached row would let the admin console
+    // report a plan/ban change that never reached Postgres.
+    return null;
+  }
+
+  /** All APK accounts, newest activity first. */
+  async listAppUsers(limit = 1_000) {
+    const local = [...this.local.appUsers.values()].sort((a, b) =>
+      String(b.last_seen_at ?? '').localeCompare(String(a.last_seen_at ?? ''))
+    );
+    if (!this.client) return local.slice(0, limit);
+
+    const rows = await this.#query(
+      this.client.from('app_users').select('*').order('last_seen_at', { ascending: false }).limit(limit),
+      'listAppUsers'
+    );
+    if (!rows) return local.slice(0, limit);
+    for (const row of rows) this.#cacheAppUser(row);
+    return rows.map((r) => this.#normaliseAppUser(r)).filter(Boolean);
+  }
+
+  #normaliseMembershipRequest(row) {
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      user_id: row.user_id ?? null,
+      device_id: row.device_id ?? null,
+      requested_plan: row.requested_plan ?? null,
+      contact_method: row.contact_method ?? null,
+      contact_value: row.contact_value ?? null,
+      message: row.message ?? null,
+      status: row.status ?? 'PENDING',
+      admin_note: row.admin_note ?? null,
+      resolved_by: row.resolved_by ?? null,
+      resolved_at: row.resolved_at ?? null,
+      created_at: row.created_at ?? null,
+    };
+  }
+
+  async createMembershipRequest(row) {
+    const now = new Date().toISOString();
+    const record = {
+      id: row.id ?? randomUUID(),
+      user_id: row.user_id ?? null,
+      device_id: row.device_id,
+      requested_plan: row.requested_plan,
+      contact_method: row.contact_method ?? null,
+      contact_value: row.contact_value ?? null,
+      message: row.message ?? null,
+      status: 'PENDING',
+      admin_note: null,
+      resolved_by: null,
+      resolved_at: null,
+      created_at: now,
+    };
+
+    if (!this.client) {
+      const existing = [...this.local.membershipRequests.values()].find(
+        (r) => r.device_id === record.device_id && r.status === 'PENDING'
+      );
+      if (existing) return existing;
+      const out = this.#normaliseMembershipRequest(record);
+      this.local.membershipRequests.set(out.id, out);
+      return out;
+    }
+
+    const inserted = await this.#query(
+      this.client.from('membership_requests').insert(record).select('*').maybeSingle(),
+      `createMembershipRequest(${row.device_id})`
+    );
+    if (inserted) {
+      const out = this.#normaliseMembershipRequest(inserted);
+      this.local.membershipRequests.set(out.id, out);
+      return out;
+    }
+    // The partial unique index can reject a concurrent double-tap. If a
+    // pending row now exists, return it instead of surfacing a 503.
+    const pending = await this.listMembershipRequests({ status: 'PENDING', limit: 500 });
+    return pending.find((r) => r.device_id === row.device_id) ?? null;
+  }
+
+  async listMembershipRequests({ status = null, limit = 500 } = {}) {
+    const local = [...this.local.membershipRequests.values()]
+      .filter((r) => !status || r.status === status)
+      .sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
+
+    if (!this.client) return local.slice(0, limit);
+
+    let q = this.client
+      .from('membership_requests')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (status) q = q.eq('status', status);
+    const rows = await this.#query(q, 'listMembershipRequests');
+    if (!rows) return local.slice(0, limit);
+    return rows.map((r) => this.#normaliseMembershipRequest(r)).filter(Boolean);
+  }
+
+  async resolveMembershipRequest(id, patch = {}, { expectedStatus = null } = {}) {
+    if (!id) return null;
+    const clean = { ...patch };
+    // `null` is meaningful here (reopening a request), so only fill the
+    // timestamp when the caller did not mention the field at all.
+    if (clean.resolved_at === undefined) clean.resolved_at = new Date().toISOString();
+    const cached = this.local.membershipRequests.get(id);
+
+    if (!this.client) {
+      if (!cached) return null;
+      if (expectedStatus && cached.status !== expectedStatus) return null;
+      const out = this.#normaliseMembershipRequest({ ...cached, ...clean });
+      this.local.membershipRequests.set(id, out);
+      return out;
+    }
+
+    let q = this.client.from('membership_requests').update(clean).eq('id', id);
+    if (expectedStatus) q = q.eq('status', expectedStatus);
+    const row = await this.#query(q.select('*').maybeSingle(), `resolveMembershipRequest(${id})`);
+    if (row) {
+      const out = this.#normaliseMembershipRequest(row);
+      this.local.membershipRequests.set(id, out);
+      return out;
+    }
+    return null;
+  }
+
+  /* ======================================================================== */
+  /*  AI TRADE LEDGER — durable open/closed positions                        */
+  /* ======================================================================== */
+
+  #normaliseAiTrade(row) {
+    if (!row?.id) return null;
+    return {
+      id: String(row.id),
+      symbol: String(row.symbol ?? '').toUpperCase(),
+      action: String(row.action ?? '').toUpperCase(),
+      entry_price: Number(row.entry_price),
+      stop_loss: row.stop_loss == null ? null : Number(row.stop_loss),
+      take_profit_1: row.take_profit_1 == null ? null : Number(row.take_profit_1),
+      take_profit_2: row.take_profit_2 == null ? null : Number(row.take_profit_2),
+      rr: row.rr == null ? null : Number(row.rr),
+      confidence: row.confidence ?? null,
+      reasoning: row.reasoning ?? null,
+      model: row.model ?? null,
+      stage: row.stage === 'tp1' ? 'tp1' : 'open',
+      status: row.status === 'CLOSED' ? 'CLOSED' : 'OPEN',
+      opened_at: row.opened_at ?? null,
+      opened_ms: row.opened_ms == null ? null : Number(row.opened_ms),
+      closed_at: row.closed_at ?? null,
+      closed_ms: row.closed_ms == null ? null : Number(row.closed_ms),
+      exit_price: row.exit_price == null ? null : Number(row.exit_price),
+      exit_reason: row.exit_reason ?? null,
+      pnl_points: row.pnl_points == null ? null : Number(row.pnl_points),
+      pnl_pct: row.pnl_pct == null ? null : Number(row.pnl_pct),
+      last_price: row.last_price == null ? null : Number(row.last_price),
+      mfe: Number(row.mfe ?? 0),
+      mae: Number(row.mae ?? 0),
+      meta: row.meta && typeof row.meta === 'object' ? row.meta : {},
+      created_at: row.created_at ?? null,
+      updated_at: row.updated_at ?? null,
+    };
+  }
+
+  #cacheAiTrade(row) {
+    const trade = this.#normaliseAiTrade(row);
+    if (!trade) return null;
+    this.local.aiTrades.set(trade.id, trade);
+    return trade;
+  }
+
+  /** Insert or update one AI trade. Called on open, TP1 and close. */
+  async saveAiTrade(row) {
+    if (!row?.id) return false;
+    const clean = { ...row, updated_at: new Date().toISOString() };
+    this.#cacheAiTrade(clean);
+    if (!this.client) return true;
+
+    const { error } = await this.client.from('ai_trades').upsert(clean, { onConflict: 'id' });
+    if (error) {
+      this.stats.errors += 1;
+      log.error('saveAiTrade failed:', error.message);
+      return false;
+    }
+    return true;
+  }
+
+  /** Patch a trade row (breakeven move, close, excursion). */
+  async updateAiTrade(id, patch = {}) {
+    if (!id) return false;
+    const cached = this.local.aiTrades.get(id);
+    const clean = { ...patch, updated_at: new Date().toISOString() };
+    if (cached) this.#cacheAiTrade({ ...cached, ...clean });
+    if (!this.client) return Boolean(cached);
+
+    const { error } = await this.client.from('ai_trades').update(clean).eq('id', id);
+    if (error) {
+      this.stats.errors += 1;
+      log.error('updateAiTrade failed:', error.message);
+      return false;
+    }
+    return true;
+  }
+
+  /** Trades that were still open when the process stopped. */
+  async listOpenAiTrades() {
+    const local = [...this.local.aiTrades.values()]
+      .filter((t) => t.status === 'OPEN')
+      .sort((a, b) => String(a.opened_at ?? '').localeCompare(String(b.opened_at ?? '')));
+    if (!this.client) return local;
+
+    const rows = await this.#query(
+      this.client.from('ai_trades').select('*').eq('status', 'OPEN').order('opened_at', { ascending: true }),
+      'listOpenAiTrades'
+    );
+    if (!rows) return local;
+    return rows.map((r) => this.#cacheAiTrade(r)).filter(Boolean);
+  }
+
+  /**
+   * Closed (or all) AI trades, newest first.
+   *
+   * @param {object} [opts]
+   * @param {'OPEN'|'CLOSED'} [opts.status]
+   * @param {string} [opts.symbol]
+   * @param {string} [opts.since] ISO date applied to closed_at
+   * @param {number} [opts.limit]
+   * @param {number} [opts.offset]
+   */
+  async listAiTrades({ status = 'CLOSED', symbol = null, since = null, limit = 100, offset = 0 } = {}) {
+    const local = [...this.local.aiTrades.values()]
+      .filter((t) => (!status || t.status === status))
+      .filter((t) => (!symbol || t.symbol === symbol))
+      .filter((t) => (!since || String(t.closed_at ?? '') >= since))
+      .sort((a, b) => String(b.opened_at ?? '').localeCompare(String(a.opened_at ?? '')))
+      .slice(offset, offset + limit);
+    if (!this.client) return local;
+
+    let q = this.client.from('ai_trades').select('*').order('opened_at', { ascending: false });
+    if (status) q = q.eq('status', status);
+    if (symbol) q = q.eq('symbol', symbol);
+    if (since) q = q.gte('closed_at', since);
+    q = q.range(offset, Math.max(offset, offset + limit - 1));
+
+    const rows = await this.#query(q, 'listAiTrades');
+    if (!rows) return local;
+    return rows.map((r) => this.#cacheAiTrade(r)).filter(Boolean);
   }
 
   /* ======================================================================== */

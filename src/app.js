@@ -57,6 +57,11 @@ import { StrategyEngine, ENGINE_STATE } from './engine/strategyEngine.js';
 import { mountSseRoutes } from './routes/sse.js';
 import { mountUserRoutes } from './routes/user.js';
 import { mountAiRoutes } from './routes/ai.js';
+import { mountMembershipRoutes, deviceGate } from './routes/membership.js';
+import { mountAdminRoutes } from './routes/admin.js';
+import { AdminAuth } from './middleware/adminAuth.js';
+import { AppUserService } from './services/appUsers.js';
+import { MembershipEvents } from './services/membershipEvents.js';
 import { AiAnalystManager } from './services/aiAnalystManager.js';
 import { EconomicNewsService } from './services/economicNews.js';
 
@@ -132,6 +137,13 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   const broker = createBroker({ env });
   const auth = createAuth({ supabase: persistence, env });
   const quota = new QuotaManager({ supabase: persistence, auth: auth.service, env });
+
+  // Device-based APK accounts, upgrade requests and the admin console. These
+  // use the same Supabase service-role client; no credential ever reaches the
+  // phone or the browser.
+  const membership = new AppUserService({ persistence, env });
+  const membershipEvents = new MembershipEvents();
+  const adminAuth = new AdminAuth({ env });
   engine = new StrategyEngine({
     market,
     broker,
@@ -153,7 +165,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   // The economic calendar feeds the analyst's prompt (see economicNews.js). It
   // is created here so both the analyst and /health can see it.
   const news = new EconomicNewsService({ env });
-  aiSignal = new AiAnalystManager({ market, dispatcher, env, news });
+  aiSignal = new AiAnalystManager({ market, dispatcher, env, news, persistence });
 
   /* ===================================================================== */
   /*  3. REHYDRATE FROM SUPABASE                                           */
@@ -161,6 +173,11 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   // Runs BEFORE the upstream feed, so the 50-day Donchian channel is already
   // in memory when the strategy arms.
   const hydration = await market.hydrateFromDatabase(persistence);
+
+  // Re-attach the AI analyst's open paper trades from the ledger BEFORE the
+  // feed starts. The first tick then enforces their stop/targets, and a restart
+  // can never open a second trade on the same symbol.
+  const aiRestored = await aiSignal.restoreOpenTrades();
 
   // Recover positions the previous process left open. This runs before the
   // first evaluation so a restart can never double-expose a symbol.
@@ -181,16 +198,14 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   app.disable('x-powered-by');
   app.set('trust proxy', 1); // Render terminates TLS and forwards X-Forwarded-*
 
-  // A small JSON cap. The API has no order endpoint, but an unauthenticated
+  // A small body cap. The API has no order endpoint, but an unauthenticated
   // client should never be able to make us buffer a megabyte.
   app.use(express.json({ limit: env.server.BODY_LIMIT }));
-
-  if (env.market.SERVE_PUBLIC) {
-    app.use(express.static(path.join(ROOT, 'public'), { maxAge: env.server.IS_PRODUCTION ? '1h' : 0, etag: true }));
-    app.get('/', (_req, res) => res.sendFile(path.join(ROOT, 'public', 'index.html')));
-  }
+  app.use(express.urlencoded({ extended: false, limit: env.server.BODY_LIMIT }));
 
   /* ---- security headers (hand-rolled: one less dependency) ------------ */
+  // Registered BEFORE the static mount so the dashboard, the admin console and
+  // every API response share the same policy.
   app.use((_req, res, next) => {
     res.set('X-Content-Type-Options', 'nosniff');
     res.set('X-Frame-Options', 'SAMEORIGIN');
@@ -206,6 +221,24 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     );
     next();
   });
+
+  if (env.market.SERVE_PUBLIC) {
+    app.use(
+      express.static(path.join(ROOT, 'public'), {
+        maxAge: env.server.IS_PRODUCTION ? '1h' : 0,
+        etag: true,
+        setHeaders: (res, filePath) => {
+          // The console is a live operator tool: never let a deploy be hidden
+          // by a one-hour browser cache.
+          if (filePath.includes(`${path.sep}admin${path.sep}`)) {
+            res.setHeader('Cache-Control', 'no-store');
+            res.setHeader('Pragma', 'no-cache');
+          }
+        },
+      })
+    );
+    app.get('/', (_req, res) => res.sendFile(path.join(ROOT, 'public', 'index.html')));
+  }
 
   /* ---- the guard runs before every route ------------------------------ */
   app.use(guard);
@@ -264,6 +297,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     startedAt: Date.now(),
     hydrated: hydration,
     restoredPositions: restored,
+    aiRestored,
     dbReady,
     dbVerified,
     version: publicEnv().version,
@@ -296,9 +330,14 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     },
     quota: quota.stats(),
     auth: auth.service.stats(),
+    membership: {
+      ...membership.status(),
+      restoredOpenTrades: aiRestored.restored,
+    },
+    admin: { enabled: adminAuth.enabled },
     broker: broker.status(),
     ai: aiSignal.status(),
-    sse: { ...hub.summary, chat: dispatcher.stats() },
+    sse: { ...hub.summary, chat: dispatcher.stats(), membership: membershipEvents.totalClients },
     memoryMb: Math.round((process.memoryUsage().heapUsed / 1048576) * 10) / 10,
     hydration: bootInfo.hydrated,
   });
@@ -308,14 +347,112 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   /* ===================================================================== */
   /*  7. ROUTES                                                            */
   /* ===================================================================== */
-  mountSseRoutes({ app, hub, dispatcher, market, auth, tradeGuard: guard, healthProvider: healthPayload });
+
+  /**
+   * The Telegram gateway is mounted after the HTTP routes (it needs the same
+   * app), but the admin notifier below must be able to reach it. The closure
+   * reads this variable at notification time, by which point it is assigned.
+   */
+  let telegram = null;
+
+  /**
+   * Fan an account change out to the app and, when paired, to Telegram.
+   *
+   * This is deliberately SERVER-SIDE: the phone does not need to poll a
+   * payment provider, and a plan cannot be forged by editing a local setting.
+   * GET /api/membership/me remains the source of truth; the SSE frame and the
+   * Telegram DM are wake-ups, not the authority.
+   */
+  async function notifyMembership(row, kind = 'plan', ctx = {}) {
+    const view = membership.publicUser(row);
+    if (!view) return { sse: 0, telegram: false, kind };
+
+    const esc = (s) =>
+      String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const until = view.planExpiresAt ? String(view.planExpiresAt).slice(0, 10) : null;
+    const planLabel =
+      view.plan === 'YEARLY' ? 'Yearly' : view.plan === 'MONTHLY' ? 'Monthly' : 'Free';
+
+    let text;
+    if (kind === 'status') {
+      text =
+        view.status === 'BANNED'
+          ? `⛔ <b>Account suspended</b>\nDevice: <code>${esc(view.deviceId)}</code>\n\nContact support to appeal.`
+          : `✅ <b>Account reactivated</b>\nDevice: <code>${esc(view.deviceId)}</code>\nPlan: <b>${planLabel}</b>`;
+    } else if (kind === 'manual') {
+      text = ctx.message
+        ? `ℹ️ <b>Aetheron</b>\n\n${esc(ctx.message)}`
+        : `ℹ️ <b>Aetheron</b>\nYour account was reviewed by support.`;
+    } else {
+      text =
+        view.plan === 'FREE'
+          ? `ℹ️ <b>Membership changed</b>\nPlan: <b>Free</b>\nDevice: <code>${esc(view.deviceId)}</code>`
+          : `✅ <b>Membership upgraded</b>\nPlan: <b>${planLabel}</b>` +
+            (until ? `\nValid until: <b>${until}</b>` : '') +
+            `\nDevice: <code>${esc(view.deviceId)}</code>`;
+    }
+
+    const event = {
+      type: 'membership',
+      kind,
+      user: view,
+      message: text,
+      by: ctx.by ?? null,
+      at: new Date().toISOString(),
+    };
+    const sse = membershipEvents.publish(view.deviceId, 'membership', event);
+
+    let sent = false;
+    if (env.membership.TELEGRAM_UPGRADE && telegram?.notifyDevice) {
+      try {
+        sent = Boolean(await telegram.notifyDevice(view.deviceId, text));
+      } catch (e) {
+        log.warn('membership Telegram notify failed:', e.message);
+      }
+    }
+    return { sse, telegram: sent, kind, plan: view.plan, status: view.status };
+  }
+
+  mountSseRoutes({
+    app,
+    hub,
+    dispatcher,
+    market,
+    auth,
+    tradeGuard: guard,
+    deviceGate: deviceGate({ membership, sse: false }),
+    healthProvider: healthPayload,
+  });
   mountUserRoutes({ app, auth, quota, engine, broker, persistence, tradeGuard: guard, rateLimiter: rateLimiter.middleware });
-  mountAiRoutes({ app, ai: aiSignal, tradeGuard: guard });
+  mountAiRoutes({
+    app,
+    ai: aiSignal,
+    tradeGuard: guard,
+    deviceGate: deviceGate({ membership, sse: false }),
+  });
+  mountMembershipRoutes({
+    app,
+    membership,
+    events: membershipEvents,
+    engine,
+    tradeGuard: guard,
+    rateLimiter: rateLimiter.middleware,
+    env,
+  });
+  mountAdminRoutes({
+    app,
+    adminAuth,
+    membership,
+    persistence,
+    env,
+    ai: aiSignal,
+    notifyMembership,
+    healthProvider: healthPayload,
+  });
 
   /* ---- optional Telegram chat-ops gateway ------------------------------ */
   // Mount when explicitly enabled OR when a bot token exists (the AI analyst
   // can then deliver signals to a configured chat even without device pairing).
-  let telegram = null;
   if (env.market.TELEGRAM_ENABLED || process.env.TELEGRAM_BOT_TOKEN) {
     try {
       const { mountTelegramGateway } = await import('./routes/telegram.js');
@@ -333,11 +470,18 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   });
   app.use((err, _req, res, _next) => {
     // A malformed JSON body is the client's fault, not a server fault.
-    if (err?.type === 'entity.parse.failed' || err?.status === 400) {
+    if (err?.type === 'entity.parse.failed') {
       return res.status(400).json({ error: { code: 'bad_request', message: 'Malformed JSON body' } });
     }
     if (err?.type === 'entity.too.large') {
       return res.status(413).json({ error: { code: 'payload_too_large', message: 'Request body is too large' } });
+    }
+    // Validation errors raised by services carry an explicit 4xx status. Pass
+    // their message through instead of mislabelling every 400 as bad JSON.
+    if (!res.headersSent && Number.isInteger(err?.status) && err.status >= 400 && err.status < 500) {
+      return res.status(err.status).json({
+        error: { code: err.code || 'bad_request', message: err.message || 'Bad request' },
+      });
     }
     log.error('unhandled request error:', err?.message ?? err);
     if (res.headersSent) return undefined;
@@ -400,6 +544,9 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   }
   log.raw(`  Hydration   : ${hydration.series} series / ${hydration.candles} candles rehydrated in ${hydration.ms}ms`);
   if (restored > 0) log.warn(`  Recovery    : ${restored} open position(s) restored from the audit log`);
+  if (aiRestored.restored.length) {
+    log.raw(`  AI recovery : ${aiRestored.restored.join(', ')} open trade(s) restored from ai_trades`);
+  }
   log.raw(`  Symbols     : ${SYMBOLS.join(', ')}`);
   log.raw(`  Timeframes  : ${TIMEFRAMES.map((t) => t.label).join(', ')}  →  ${SERIES.length} series`);
   log.raw(`  Broker      : ${env.broker.MODE}${env.strategy.EXECUTION_ENABLED ? '' : ' (execution DISABLED)'}`);
@@ -424,6 +571,13 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
   log.raw('  AI payload  : PLAINTEXT on /stream (same connection as the candles)');
   log.raw(`  AI tracking : ${env.ai.TRACK_ENABLED ? 'one trade at a time · Telegram status every cycle' : 'signal-only (no tracking)'}`);
   log.raw(`  Calendar    : ${news.enabled ? `${env.news.MIN_IMPACT}+ events within ${env.news.HORIZON_H}h` : 'disabled'}`);
+  log.raw(
+    `  Admin       : ${adminAuth.enabled ? `/admin/ · operator "${adminAuth.username}"` : '/admin/ DISABLED — set ADMIN_PASSWORD'}`
+  );
+  log.raw(
+    `  Memberships : ${env.membership.ENABLED ? 'FREE / MONTHLY / YEARLY · history ' + membership.retentionFor('FREE') + '/' + membership.retentionFor('MONTHLY') + '/' + membership.retentionFor('YEARLY') + ' days' : 'disabled'}`
+  );
+  log.raw(`  Trade API   : /api/trades/open · /api/trades/history · /api/trades/stats`);
   log.raw(`  Streams     : /stream · /api/stream/prices · /api/stream/chat-events`);
   log.raw(`  Upstream    : ${env.upstream.WS}`);
   log.raw('========================================================');
@@ -447,6 +601,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     news.stop();
     feed.stop();
     hub.closeAll();
+    membershipEvents.closeAll();
     telegram?.stop?.();
 
     // Flush any queued candle writes so a restart does not lose a closed bar.
@@ -475,6 +630,9 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     telegram,
     aiSignal,
     news,
+    membership,
+    membershipEvents,
+    adminAuth,
     health: healthPayload,
     close,
     // Re-exported for the e2e suite / unit tests.

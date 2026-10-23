@@ -1,0 +1,1256 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+   AETHERON CORE — Operator Console
+   ----------------------------------------------------------------------------
+   A dependency-free SPA served by the Node process.
+
+   Security model:
+     • This page contains no data. Every row is fetched from /admin/api/* with
+       the HttpOnly, SameSite=Strict session cookie issued by POST /admin/api/login.
+     • The APK and the public dashboard cannot call these endpoints without the
+       cookie; the credential lives only in the Render environment.
+     • All text from the database is escaped before it reaches innerHTML.
+
+   Views: overview · APK users · upgrade requests · AI trade ledger.
+  ============================================================================
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>Aetheron Core — Admin</title>
+  <style>
+    :root {
+      --bg: #0b0f16;
+      --panel: #131a24;
+      --panel-2: #1a2331;
+      --panel-3: #202c3d;
+      --line: #243040;
+      --text: #e6edf6;
+      --muted: #8496ad;
+      --accent: #2b7fff;
+      --accent-2: #59a0ff;
+      --up: #26a69a;
+      --down: #ef5350;
+      --warn: #f0b429;
+      --free: #8496ad;
+      --monthly: #59a0ff;
+      --yearly: #f0b429;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      background:
+        radial-gradient(1100px 520px at 80% -10%, rgba(43, 127, 255, .13), transparent 65%),
+        radial-gradient(900px 500px at -10% 110%, rgba(38, 166, 154, .08), transparent 60%),
+        var(--bg);
+      color: var(--text);
+      font: 14px/1.45 "Segoe UI", Inter, system-ui, -apple-system, sans-serif;
+    }
+    button, input, select, textarea { font: inherit; }
+    [hidden] { display: none !important; }
+    a { color: var(--accent-2); }
+
+    /* ------------------------------------------------------------- login -- */
+    .auth {
+      min-height: 100vh; display: grid; place-items: center; padding: 24px;
+    }
+    .auth-card {
+      width: min(420px, 100%);
+      background: linear-gradient(180deg, var(--panel), #101720);
+      border: 1px solid var(--line); border-radius: 16px;
+      padding: 30px 28px;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, .45);
+    }
+    .logo {
+      width: 46px; height: 46px; border-radius: 12px;
+      display: grid; place-items: center; font-size: 22px;
+      background: linear-gradient(135deg, rgba(43,127,255,.28), rgba(38,166,154,.2));
+      border: 1px solid rgba(89, 160, 255, .35);
+      margin-bottom: 16px;
+    }
+    .auth-card h1 { margin: 0 0 4px; font-size: 20px; letter-spacing: .2px; }
+    .auth-card p { margin: 0 0 22px; color: var(--muted); font-size: 12.5px; }
+    .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+    .field > span { font-size: 10.5px; letter-spacing: .8px; text-transform: uppercase; color: var(--muted); }
+    .input, .select, .textarea {
+      width: 100%; background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--line); border-radius: 8px;
+      padding: 9px 11px; outline: none;
+    }
+    .input:focus, .select:focus, .textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(43,127,255,.14); }
+    .textarea { min-height: 84px; resize: vertical; }
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--line); border-radius: 8px;
+      padding: 8px 13px; font-size: 12.5px; cursor: pointer;
+      transition: border-color .15s, background .15s, transform .05s;
+      white-space: nowrap;
+    }
+    .btn:hover { border-color: var(--accent); background: var(--panel-3); }
+    .btn:active { transform: translateY(1px); }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn.primary:hover { background: #3b8bff; }
+    .btn.ghost { background: transparent; }
+    .btn.danger { color: #ff9a98; border-color: rgba(239,83,80,.35); }
+    .btn.danger:hover { border-color: var(--down); background: rgba(239,83,80,.1); }
+    .btn.ok { color: #8ae0d7; border-color: rgba(38,166,154,.35); }
+    .btn.ok:hover { border-color: var(--up); background: rgba(38,166,154,.1); }
+    .btn.sm { padding: 5px 9px; font-size: 11.5px; border-radius: 7px; }
+    .btn.wide { width: 100%; padding: 10px 14px; }
+    .alert {
+      border: 1px solid rgba(240,180,41,.35); background: rgba(240,180,41,.08);
+      color: #ffd97a; border-radius: 9px; padding: 10px 12px;
+      font-size: 12px; margin-bottom: 16px;
+    }
+    .login-error {
+      border: 1px solid rgba(239,83,80,.4); background: rgba(239,83,80,.09);
+      color: #ff9a98; border-radius: 9px; padding: 9px 11px;
+      font-size: 12px; margin-bottom: 14px;
+    }
+
+    /* ------------------------------------------------------------ shell -- */
+    header.top {
+      position: sticky; top: 0; z-index: 30;
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+      padding: 12px 20px;
+      background: rgba(19, 26, 36, .92);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--line);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .brand .mark {
+      width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center;
+      font-size: 15px; background: linear-gradient(135deg, rgba(43,127,255,.3), rgba(38,166,154,.2));
+      border: 1px solid rgba(89,160,255,.35);
+    }
+    .brand h1 { margin: 0; font-size: 14px; letter-spacing: .3px; }
+    .brand span { display: block; color: var(--muted); font-size: 10.5px; }
+    nav.tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-left: 8px; }
+    nav.tabs button {
+      background: transparent; color: var(--muted); border: 1px solid transparent;
+      border-radius: 8px; padding: 7px 11px; cursor: pointer; font-size: 12.5px;
+    }
+    nav.tabs button:hover { color: var(--text); background: var(--panel-2); }
+    nav.tabs button.active { color: #fff; background: var(--panel-2); border-color: var(--line); }
+    .spacer { flex: 1 1 auto; }
+    .who { color: var(--muted); font-size: 12px; text-align: right; }
+    .who b { color: var(--text); font-weight: 600; }
+    .health-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); margin-right: 5px; }
+    .health-dot.ok { background: var(--up); box-shadow: 0 0 7px var(--up); }
+    .health-dot.bad { background: var(--down); box-shadow: 0 0 7px var(--down); }
+
+    main { padding: 20px; max-width: 1500px; margin: 0 auto; }
+    .view-head {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px;
+    }
+    .view-head h2 { margin: 0; font-size: 17px; letter-spacing: .2px; }
+    .view-head p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+    .toolbar { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+    .toolbar .input, .toolbar .select { width: auto; min-width: 150px; padding: 7px 10px; }
+    .toolbar .input.search { min-width: 250px; }
+
+    /* ------------------------------------------------------------ cards -- */
+    .cards {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
+      gap: 12px; margin-bottom: 18px;
+    }
+    .card {
+      background: linear-gradient(180deg, var(--panel), #101720);
+      border: 1px solid var(--line); border-radius: 12px; padding: 14px 15px;
+      min-height: 92px; display: flex; flex-direction: column; justify-content: space-between;
+    }
+    .card .label { color: var(--muted); font-size: 10.5px; letter-spacing: .7px; text-transform: uppercase; }
+    .card .value { font-size: 25px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.15; }
+    .card .sub { color: var(--muted); font-size: 11px; }
+    .card.accent { border-color: rgba(43,127,255,.32); }
+    .card.warn { border-color: rgba(240,180,41,.3); }
+    .card.up { border-color: rgba(38,166,154,.3); }
+    .card.down { border-color: rgba(239,83,80,.3); }
+
+    .grid-2 {
+      display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr);
+      gap: 14px; align-items: start;
+    }
+    @media (max-width: 1000px) { .grid-2 { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: var(--panel); border: 1px solid var(--line);
+      border-radius: 12px; overflow: hidden; margin-bottom: 14px;
+    }
+    .panel-head {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 12px 15px; border-bottom: 1px solid var(--line);
+      background: rgba(26, 35, 49, .55);
+    }
+    .panel-head h3 { margin: 0; font-size: 13px; letter-spacing: .2px; }
+    .panel-head .hint { color: var(--muted); font-size: 11px; }
+    .panel-body { padding: 15px; }
+    .panel-body.flush { padding: 0; }
+
+    /* ------------------------------------------------------------ table -- */
+    .table-wrap { overflow: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    th {
+      position: sticky; top: 0; z-index: 1;
+      text-align: left; color: var(--muted); font-size: 10px;
+      text-transform: uppercase; letter-spacing: .7px; font-weight: 600;
+      padding: 9px 12px; background: #16202d; border-bottom: 1px solid var(--line);
+      white-space: nowrap;
+    }
+    td { padding: 10px 12px; border-bottom: 1px solid rgba(36, 48, 64, .7); vertical-align: top; }
+    tbody tr:hover { background: rgba(43, 127, 255, .045); }
+    tbody tr:last-child td { border-bottom: 0; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .mono { font-family: "Cascadia Mono", Consolas, monospace; font-size: 11.5px; }
+    .muted { color: var(--muted); }
+    .tiny { font-size: 11px; }
+    .empty { padding: 30px 16px; text-align: center; color: var(--muted); font-size: 12.5px; }
+    .actions { display: flex; gap: 5px; flex-wrap: wrap; }
+
+    /* ------------------------------------------------------------ badges -- */
+    .badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      border-radius: 999px; padding: 2px 8px; font-size: 10.5px; font-weight: 600;
+      border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+    }
+    .badge.FREE { color: var(--free); border-color: rgba(132,150,173,.35); }
+    .badge.MONTHLY { color: var(--monthly); border-color: rgba(89,160,255,.35); background: rgba(89,160,255,.06); }
+    .badge.YEARLY { color: var(--yearly); border-color: rgba(240,180,41,.35); background: rgba(240,180,41,.06); }
+    .badge.BANNED { color: #ff9a98; border-color: rgba(239,83,80,.4); background: rgba(239,83,80,.07); }
+    .badge.ACTIVE { color: #8ae0d7; border-color: rgba(38,166,154,.35); }
+    .badge.OPEN { color: #8ae0d7; border-color: rgba(38,166,154,.35); }
+    .badge.CLOSED { color: var(--muted); }
+    .badge.PENDING { color: #ffd97a; border-color: rgba(240,180,41,.35); background: rgba(240,180,41,.07); }
+    .badge.APPROVED { color: #8ae0d7; border-color: rgba(38,166,154,.35); }
+    .badge.REJECTED { color: #ff9a98; border-color: rgba(239,83,80,.35); }
+    .badge.EXPIRED { color: var(--warn); border-color: rgba(240,180,41,.35); }
+
+    .up { color: var(--up); }
+    .down { color: var(--down); }
+    .warn { color: var(--warn); }
+
+    .kv { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 7px 12px; font-size: 12.5px; }
+    .kv dt { color: var(--muted); }
+    .kv dd { margin: 0; }
+    .progress { height: 5px; background: var(--panel-3); border-radius: 999px; overflow: hidden; margin-top: 5px; }
+    .progress > i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--up)); }
+
+    .list { display: flex; flex-direction: column; }
+    .list-row {
+      display: flex; align-items: flex-start; gap: 10px;
+      padding: 11px 15px; border-bottom: 1px solid rgba(36,48,64,.7);
+    }
+    .list-row:last-child { border-bottom: 0; }
+    .list-row .grow { flex: 1 1 auto; min-width: 0; }
+    .list-row .title { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .list-row .sub { color: var(--muted); font-size: 11px; }
+    .msg {
+      margin-top: 5px; color: #b9c7d8; font-size: 11.5px;
+      white-space: pre-wrap; overflow-wrap: anywhere;
+    }
+
+    /* ------------------------------------------------------------ modal -- */
+    .backdrop {
+      position: fixed; inset: 0; z-index: 60; display: grid; place-items: center;
+      padding: 20px; background: rgba(5, 8, 13, .72); backdrop-filter: blur(3px);
+      overflow: auto;
+    }
+    .modal {
+      width: min(620px, 100%); background: var(--panel);
+      border: 1px solid var(--line); border-radius: 14px;
+      box-shadow: 0 30px 90px rgba(0,0,0,.55); overflow: hidden;
+    }
+    .modal-head {
+      display: flex; align-items: center; gap: 10px;
+      padding: 15px 18px; border-bottom: 1px solid var(--line);
+      background: rgba(26,35,49,.55);
+    }
+    .modal-head h3 { margin: 0; font-size: 14px; flex: 1 1 auto; }
+    .modal-body { padding: 18px; max-height: min(70vh, 640px); overflow: auto; }
+    .modal-foot {
+      display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap;
+      padding: 13px 18px; border-top: 1px solid var(--line); background: rgba(19,26,36,.65);
+    }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .form-grid .full { grid-column: 1 / -1; }
+    @media (max-width: 620px) { .form-grid { grid-template-columns: 1fr; } }
+    .close {
+      background: transparent; border: 0; color: var(--muted); font-size: 20px;
+      cursor: pointer; line-height: 1; padding: 0 3px;
+    }
+    .close:hover { color: var(--text); }
+
+    /* ------------------------------------------------------------ toast -- */
+    #toast {
+      position: fixed; right: 18px; bottom: 18px; z-index: 80;
+      display: flex; flex-direction: column; gap: 8px; max-width: min(380px, calc(100vw - 36px));
+    }
+    .toast {
+      border: 1px solid var(--line); background: #18222f;
+      border-left: 3px solid var(--accent);
+      border-radius: 9px; padding: 10px 13px; font-size: 12.5px;
+      box-shadow: 0 14px 40px rgba(0,0,0,.4);
+      animation: slide-in .18s ease-out;
+    }
+    .toast.ok { border-left-color: var(--up); }
+    .toast.error { border-left-color: var(--down); }
+    .toast.warn { border-left-color: var(--warn); }
+    @keyframes slide-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+    .skeleton {
+      color: var(--muted); font-size: 12px; padding: 22px; text-align: center;
+    }
+    footer.bottom { max-width: 1500px; margin: 0 auto; padding: 4px 20px 28px; color: var(--muted); font-size: 11px; }
+  </style>
+</head>
+<body>
+
+<!-- ============================================================== LOGIN = -->
+<div class="auth" id="loginView">
+  <form class="auth-card" id="loginForm" autocomplete="on">
+    <div class="logo">🛡️</div>
+    <h1>Aetheron Core</h1>
+    <p>Operator console — APK accounts, plans, upgrade requests and the AI trade ledger.</p>
+
+    <div id="loginNotice" class="alert" hidden></div>
+    <div id="loginError" class="login-error" hidden></div>
+
+    <label class="field">
+      <span>Username</span>
+      <input class="input" id="loginUser" name="username" autocomplete="username" required />
+    </label>
+    <label class="field">
+      <span>Password</span>
+      <input class="input" id="loginPass" name="password" type="password" autocomplete="current-password" required />
+    </label>
+
+    <button class="btn primary wide" id="loginBtn" type="submit">Sign in</button>
+
+    <p style="margin:18px 0 0; text-align:center; font-size:11px; color:var(--muted)">
+      Credentials are set with <span class="mono">ADMIN_USERNAME</span> /
+      <span class="mono">ADMIN_PASSWORD</span> on the server.
+    </p>
+  </form>
+</div>
+
+<!-- ================================================================ APP = -->
+<div id="appView" hidden>
+  <header class="top">
+    <div class="brand">
+      <div class="mark">🛡️</div>
+      <div>
+        <h1>Aetheron Core</h1>
+        <span>Operator console</span>
+      </div>
+    </div>
+
+    <nav class="tabs" id="tabs">
+      <button data-view="overview" class="active">Overview</button>
+      <button data-view="users">APK users</button>
+      <button data-view="requests">Upgrade requests <span id="pendingBadge" class="badge PENDING" hidden>0</span></button>
+      <button data-view="trades">Trade ledger</button>
+    </nav>
+
+    <div class="spacer"></div>
+
+    <div class="who">
+      <div><span class="health-dot" id="dbDot"></span><span id="dbText">database</span></div>
+      <div>signed in as <b id="whoUser">admin</b></div>
+    </div>
+
+    <button class="btn sm" id="refreshBtn" title="Refresh the current view">⟳ Refresh</button>
+    <button class="btn sm ghost" id="logoutBtn">Sign out</button>
+  </header>
+
+  <main>
+    <!-- ------------------------------------------------------- overview -- -->
+    <section id="view-overview">
+      <div class="view-head">
+        <div>
+          <h2>Overview</h2>
+          <p>Live counters from the shared database and the running engine.</p>
+        </div>
+      </div>
+
+      <div class="cards" id="overviewCards">
+        <div class="card"><span class="label">APK users</span><span class="value">—</span></div>
+      </div>
+
+      <div class="grid-2">
+        <div>
+          <div class="panel">
+            <div class="panel-head">
+              <h3>Upgrade requests</h3>
+              <span class="hint" id="recentReqHint"></span>
+              <span class="spacer"></span>
+              <button class="btn sm" data-goto="requests">Open queue</button>
+            </div>
+            <div class="panel-body flush" id="recentRequests"><div class="skeleton">Loading…</div></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h3>Open AI trades</h3>
+              <span class="hint">one position per symbol</span>
+              <span class="spacer"></span>
+              <button class="btn sm" data-goto="trades">Full ledger</button>
+            </div>
+            <div class="panel-body flush" id="openTrades"><div class="skeleton">Loading…</div></div>
+          </div>
+        </div>
+
+        <div>
+          <div class="panel">
+            <div class="panel-head"><h3>System</h3><span class="hint" id="sysTime"></span></div>
+            <div class="panel-body" id="systemPanel"><div class="skeleton">Loading…</div></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h3>Plan distribution</h3></div>
+            <div class="panel-body" id="planPanel"><div class="skeleton">Loading…</div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- users -- -->
+    <section id="view-users" hidden>
+      <div class="view-head">
+        <div>
+          <h2>APK users</h2>
+          <p>Each install is a device account. Plans only change trade-history retention.</p>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <input class="input search" id="userSearch" placeholder="Search device, name, contact…" />
+        <select class="select" id="userStatus">
+          <option value="">All statuses</option>
+          <option value="ACTIVE">Active</option>
+          <option value="BANNED">Banned</option>
+        </select>
+        <select class="select" id="userPlan">
+          <option value="">All plans</option>
+          <option value="FREE">Free</option>
+          <option value="MONTHLY">Monthly</option>
+          <option value="YEARLY">Yearly</option>
+        </select>
+        <select class="select" id="userExpired">
+          <option value="">Any expiry</option>
+          <option value="true">Expired paid plan</option>
+          <option value="false">Not expired</option>
+        </select>
+        <button class="btn" id="userApply">Apply</button>
+        <span class="spacer"></span>
+        <span class="muted tiny" id="userCount"></span>
+        <button class="btn sm" id="userPrev" disabled>← Prev</button>
+        <button class="btn sm" id="userNext" disabled>Next →</button>
+      </div>
+
+      <div class="panel">
+        <div class="panel-body flush table-wrap" id="userTable">
+          <div class="skeleton">Loading…</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------- requests -- -->
+    <section id="view-requests" hidden>
+      <div class="view-head">
+        <div>
+          <h2>Upgrade requests</h2>
+          <p>Approve to grant MONTHLY / YEARLY. The user is notified by Telegram (if paired) and per-device SSE.</p>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <select class="select" id="reqStatus">
+          <option value="PENDING">Pending</option>
+          <option value="">All requests</option>
+          <option value="APPROVED">Approved</option>
+          <option value="REJECTED">Rejected</option>
+        </select>
+        <button class="btn" id="reqApply">Apply</button>
+        <span class="spacer"></span>
+        <span class="muted tiny" id="reqCount"></span>
+      </div>
+
+      <div class="panel">
+        <div class="panel-body flush table-wrap" id="reqTable">
+          <div class="skeleton">Loading…</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- --------------------------------------------------------- trades -- -->
+    <section id="view-trades" hidden>
+      <div class="view-head">
+        <div>
+          <h2>AI trade ledger</h2>
+          <p>Permanent record of every AI position — open and closed. The APK reads this through <span class="mono">/api/trades/history</span>.</p>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <select class="select" id="tradeStatus">
+          <option value="">All statuses</option>
+          <option value="OPEN">Open</option>
+          <option value="CLOSED">Closed</option>
+        </select>
+        <input class="input" id="tradeSymbol" placeholder="Symbol (e.g. XAUUSD)" style="width:170px" />
+        <button class="btn" id="tradeApply">Apply</button>
+        <span class="spacer"></span>
+        <span class="muted tiny" id="tradeCount"></span>
+        <button class="btn sm" id="tradePrev" disabled>← Prev</button>
+        <button class="btn sm" id="tradeNext" disabled>Next →</button>
+      </div>
+
+      <div class="panel">
+        <div class="panel-body flush table-wrap" id="tradeTable">
+          <div class="skeleton">Loading…</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="bottom">
+    Aetheron Core · Eng Hasan Mohamad · server-side admin only — the APK never sees these endpoints.
+  </footer>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toast"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* ====================================================================== *
+   *  STATE + HELPERS
+   * ====================================================================== */
+  const state = {
+    me: null,
+    view: 'overview',
+    timer: null,
+    users: { offset: 0, limit: 50, total: 0 },
+    trades: { offset: 0, limit: 50, total: 0 },
+    pending: 0,
+    lastOverview: null,
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const qs = (sel, root = document) => root.querySelector(sel);
+  const qsa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+  /** Escape everything that came from the database before it touches innerHTML. */
+  const esc = (value) =>
+    String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+
+  const badge = (value, extra = '') => {
+    const v = String(value ?? '').toUpperCase();
+    return `<span class="badge ${esc(v)}">${esc(v || '—')}</span>${extra ? ` ${extra}` : ''}`;
+  };
+
+  const fmtDate = (value, withTime = true) => {
+    if (!value) return '—';
+    const d = new Date(value);
+    if (!Number.isFinite(d.getTime())) return '—';
+    const opts = withTime
+      ? { year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }
+      : { year: 'numeric', month: 'short', day: '2-digit' };
+    return d.toLocaleString(undefined, opts);
+  };
+
+  const fmtNum = (value, digits = 2) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '—';
+    return n.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  };
+
+  const pnlClass = (value) => (Number(value) > 0 ? 'up' : Number(value) < 0 ? 'down' : 'muted');
+
+  const relTime = (value) => {
+    const ms = Date.parse(value);
+    if (!Number.isFinite(ms)) return '—';
+    const diff = Date.now() - ms;
+    if (diff < 60_000) return 'just now';
+    if (diff < 3_600_000) return `${Math.round(diff / 60_000)}m ago`;
+    if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)}h ago`;
+    return `${Math.round(diff / 86_400_000)}d ago`;
+  };
+
+  function toast(message, kind = 'ok', ms = 4200) {
+    const el = document.createElement('div');
+    el.className = `toast ${kind}`;
+    el.textContent = String(message ?? '');
+    $('toast').appendChild(el);
+    setTimeout(() => el.remove(), ms);
+  }
+
+  /* ====================================================================== *
+   *  API
+   * ====================================================================== */
+  async function api(path, options = {}) {
+    const init = {
+      method: options.method || 'GET',
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json', ...(options.headers || {}) },
+      cache: 'no-store',
+    };
+    if (options.body !== undefined) {
+      init.headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(options.body);
+    }
+
+    const res = await fetch(path, init);
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+
+    if (res.status === 401) {
+      showLogin();
+      throw new Error('Your session expired. Sign in again.');
+    }
+    if (!res.ok) {
+      const message = data?.error?.message || data?.message || `Request failed (${res.status})`;
+      const err = new Error(message);
+      err.status = res.status;
+      err.code = data?.error?.code;
+      err.data = data;
+      throw err;
+    }
+    return data;
+  }
+
+  /* ====================================================================== *
+   *  AUTH
+   * ====================================================================== */
+  function showLogin() {
+    state.me = null;
+    $('appView').hidden = true;
+    $('loginView').hidden = false;
+    clearInterval(state.timer);
+    setTimeout(() => $('loginUser').focus(), 50);
+  }
+
+  function showApp(me) {
+    state.me = me;
+    $('loginView').hidden = true;
+    $('appView').hidden = false;
+    $('whoUser').textContent = me.username || 'admin';
+    $('dbDot').className = `health-dot ${me.database?.connected ? 'ok' : 'bad'}`;
+    $('dbText').textContent = me.database?.connected
+      ? 'database connected'
+      : me.database?.enabled
+        ? 'database issue'
+        : 'local mode';
+    if (me.message) {
+      $('loginNotice').hidden = false;
+      $('loginNotice').textContent = me.message;
+    }
+  }
+
+  async function boot() {
+    try {
+      const me = await api('/admin/api/me');
+      if (!me.enabled) {
+        $('loginNotice').hidden = false;
+        $('loginNotice').textContent = me.message || 'Admin console is not configured on this server.';
+        $('loginBtn').disabled = true;
+        $('loginUser').disabled = true;
+        $('loginPass').disabled = true;
+        return;
+      }
+      if (me.authenticated) {
+        showApp(me);
+        await switchView(location.hash.replace('#', '') || 'overview', { force: true });
+      } else {
+        showLogin();
+      }
+    } catch (err) {
+      $('loginError').hidden = false;
+      $('loginError').textContent = err.message;
+      showLogin();
+    }
+  }
+
+  $('loginForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const btn = $('loginBtn');
+    $('loginError').hidden = true;
+    btn.disabled = true;
+    btn.textContent = 'Signing in…';
+    try {
+      await api('/admin/api/login', {
+        method: 'POST',
+        body: { username: $('loginUser').value, password: $('loginPass').value },
+      });
+      const me = await api('/admin/api/me');
+      showApp(me);
+      $('loginPass').value = '';
+      await switchView('overview', { force: true });
+    } catch (err) {
+      $('loginError').hidden = false;
+      $('loginError').textContent = err.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Sign in';
+    }
+  });
+
+  $('logoutBtn').addEventListener('click', async () => {
+    try { await api('/admin/api/logout', { method: 'POST' }); } catch { /* ignore */ }
+    showLogin();
+    toast('Signed out', 'ok', 2000);
+  });
+
+  /* ====================================================================== *
+   *  NAVIGATION
+   * ====================================================================== */
+  async function switchView(view, { force = false } = {}) {
+    const allowed = ['overview', 'users', 'requests', 'trades'];
+    const next = allowed.includes(view) ? view : 'overview';
+    if (!force && state.view === next && !$('view-' + next).hidden) {
+      await refresh();
+      return;
+    }
+    state.view = next;
+    if (location.hash !== '#' + next) history.replaceState(null, '', '#' + next);
+
+    for (const name of allowed) $('view-' + name).hidden = name !== next;
+    qsa('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.view === next));
+
+    clearInterval(state.timer);
+    state.timer = setInterval(() => {
+      if (!document.hidden && !qs('#modalRoot .backdrop')) refresh({ silent: true }).catch(() => {});
+    }, 30_000);
+
+    await refresh();
+  }
+
+  qsa('#tabs button').forEach((btn) => {
+    btn.addEventListener('click', () => switchView(btn.dataset.view));
+  });
+
+  qsa('[data-goto]').forEach((btn) => {
+    btn.addEventListener('click', () => switchView(btn.dataset.goto));
+  });
+
+  $('refreshBtn').addEventListener('click', () => refresh({ forceToast: true }));
+
+  async function refresh({ silent = false, forceToast = false } = {}) {
+    if (!state.me) return;
+    try {
+      if (state.view === 'overview') await loadOverview();
+      else if (state.view === 'users') await loadUsers();
+      else if (state.view === 'requests') await loadRequests();
+      else if (state.view === 'trades') await loadTrades();
+      if (forceToast) toast('Refreshed', 'ok', 1600);
+    } catch (err) {
+      if (!silent) toast(err.message, 'error', 6000);
+    }
+  }
+
+  /* ====================================================================== *
+   *  OVERVIEW
+   * ====================================================================== */
+  async function loadOverview() {
+    const data = await api('/admin/api/overview');
+    const s = data.stats;
+    state.lastOverview = data;
+    state.pending = s.requests.pending;
+    updatePendingBadge();
+
+    $('overviewCards').innerHTML = [
+      card('APK users', s.users.total, `${s.users.active} active · ${s.users.banned} banned`, ''),
+      card('Paid plans', s.users.paid, `${s.users.monthly} monthly · ${s.users.yearly} yearly`, 'accent'),
+      card('Pending requests', s.requests.pending, `${s.requests.total} lifetime`, s.requests.pending ? 'warn' : ''),
+      card('Open trades', s.trades.open, `${s.trades.closed} closed`, ''),
+      card('Win rate', `${fmtNum(s.trades.winRate, 1)}%`, `${s.trades.wins}W / ${s.trades.losses}L`, s.trades.winRate >= 50 ? 'up' : 'down'),
+      card('Closed PnL', `${fmtNum(s.trades.pnlPoints, 1)} pts`, 'sum over stored trades', Number(s.trades.pnlPoints) >= 0 ? 'up' : 'down'),
+    ].join('');
+
+    /* requests */
+    if (!s.recentRequests.length) {
+      $('recentRequests').innerHTML = '<div class="empty">No upgrade requests yet.</div>';
+      $('recentReqHint').textContent = '';
+    } else {
+      $('recentReqHint').textContent = `${s.requests.pending} pending`;
+      $('recentRequests').innerHTML = `<div class="list">${s.recentRequests.map((r) => `
+        <div class="list-row">
+          <div class="grow">
+            <div class="title"><span class="mono">${esc(r.device_id)}</span> → ${badge(r.requested_plan)}</div>
+            <div class="sub">${fmtDate(r.created_at)} · ${esc(r.contact_method || 'no contact')} ${r.contact_value ? '· ' + esc(r.contact_value) : ''}</div>
+            ${r.message ? `<div class="msg">${esc(r.message)}</div>` : ''}
+          </div>
+          ${badge(r.status)}
+        </div>`).join('')}</div>`;
+    }
+
+    /* open trades */
+    if (!s.openTrades.length) {
+      $('openTrades').innerHTML = '<div class="empty">No open AI trades.</div>';
+    } else {
+      $('openTrades').innerHTML = `<div class="list">${s.openTrades.map((t) => `
+        <div class="list-row">
+          <div class="grow">
+            <div class="title"><b>${esc(t.symbol)}</b> ${esc(t.action || '')} · ${badge(t.status)}</div>
+            <div class="sub">entry ${fmtNum(t.entry, 2)} · SL ${fmtNum(t.stopLoss, 2)} · TP1 ${fmtNum(t.takeProfit1, 2)}</div>
+          </div>
+          <div class="sub">${relTime(t.openedAt)}</div>
+        </div>`).join('')}</div>`;
+    }
+
+    /* system */
+    const h = data.health || {};
+    const ai = data.ai || {};
+    $('sysTime').textContent = fmtDate(data.serverTime);
+    $('systemPanel').innerHTML = `<dl class="kv">
+      <dt>Server</dt><dd><span class="health-dot ${h.status === 'ok' ? 'ok' : 'bad'}"></span>${esc(h.status || 'unknown')} · up ${esc(h.uptimeSec ?? 0)}s</dd>
+      <dt>Database</dt><dd>${data.database.connected ? '<span class="up">connected</span>' : `<span class="down">${esc(data.database.error || 'not connected')}</span>`}</dd>
+      <dt>Engine</dt><dd>${esc(h.engineState || '—')}</dd>
+      <dt>Upstream</dt><dd>${h.upstream ? '<span class="up">streaming</span>' : '<span class="down">disconnected</span>'}</dd>
+      <dt>AI analyst</dt><dd>${ai.running ? '<span class="up">running</span>' : '<span class="muted">idle</span>'} · ${esc(ai.model || 'no model')}</dd>
+      <dt>AI errors</dt><dd>${ai.lastError ? `<span class="warn">${esc(ai.lastError)}</span>` : '<span class="muted">none</span>'}</dd>
+      <dt>Session</dt><dd>${esc(data.admin.username)} · ${Math.round((data.admin.sessionTtlMs || 0) / 3600000)}h cookie</dd>
+    </dl>`;
+
+    /* plans */
+    const total = Math.max(1, s.users.total);
+    $('planPanel').innerHTML = ['FREE', 'MONTHLY', 'YEARLY'].map((plan) => {
+      const count = plan === 'FREE' ? s.users.free : plan === 'MONTHLY' ? s.users.monthly : s.users.yearly;
+      const pct = Math.round((count / total) * 100);
+      return `<div style="margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;font-size:12px">
+          <span>${badge(plan)}</span><span class="muted">${count} · ${pct}%</span>
+        </div>
+        <div class="progress"><i style="width:${pct}%"></i></div>
+      </div>`;
+    }).join('') + `<div class="tiny muted" style="margin-top:4px">${s.users.expired} paid account(s) past expiry are counted as FREE.</div>`;
+  }
+
+  function card(label, value, sub, tone) {
+    return `<div class="card ${tone || ''}">
+      <span class="label">${esc(label)}</span>
+      <span class="value">${esc(value)}</span>
+      <span class="sub">${esc(sub)}</span>
+    </div>`;
+  }
+
+  function updatePendingBadge() {
+    const el = $('pendingBadge');
+    el.textContent = String(state.pending);
+    el.hidden = !state.pending;
+  }
+
+  /* ====================================================================== *
+   *  USERS
+   * ====================================================================== */
+  async function loadUsers() {
+    const params = new URLSearchParams({
+      limit: String(state.users.limit),
+      offset: String(state.users.offset),
+    });
+    const q = $('userSearch').value.trim();
+    const status = $('userStatus').value;
+    const plan = $('userPlan').value;
+    const expired = $('userExpired').value;
+    if (q) params.set('q', q);
+    if (status) params.set('status', status);
+    if (plan) params.set('plan', plan);
+    if (expired) params.set('expired', expired);
+
+    const data = await api('/admin/api/users?' + params.toString());
+    state.users.total = data.total;
+    const from = data.total ? state.users.offset + 1 : 0;
+    const to = Math.min(state.users.offset + state.users.limit, data.total);
+    $('userCount').textContent = `${from}–${to} of ${data.total}`;
+    $('userPrev').disabled = state.users.offset <= 0;
+    $('userNext').disabled = state.users.offset + state.users.limit >= data.total;
+
+    if (!data.items.length) {
+      $('userTable').innerHTML = '<div class="empty">No device accounts match these filters.</div>';
+      return;
+    }
+
+    $('userTable').innerHTML = `<table>
+      <thead><tr>
+        <th>Device</th><th>User</th><th>Plan</th><th>Status</th><th>Expires</th><th>Last seen</th><th>Actions</th>
+      </tr></thead>
+      <tbody>${data.items.map((u) => `
+        <tr>
+          <td><div class="mono">${esc(u.deviceId)}</div><div class="tiny muted">joined ${fmtDate(u.createdAt, false)}</div></td>
+          <td>${esc(u.displayName || '—')}<div class="tiny muted">${esc(u.contactMethod || '')} ${u.contactValue ? '· ' + esc(u.contactValue) : ''}</div></td>
+          <td>${badge(u.plan)}${u.storedPlan && u.storedPlan !== u.plan ? `<div class="tiny warn">stored ${esc(u.storedPlan)}</div>` : ''}</td>
+          <td>${badge(u.status)}</td>
+          <td class="tiny">${u.planExpiresAt ? `${fmtDate(u.planExpiresAt, false)}${u.expired ? ' <span class="warn">(expired)</span>' : ''}` : '<span class="muted">—</span>'}</td>
+          <td class="tiny muted" title="${esc(u.lastSeenAt || '')}">${relTime(u.lastSeenAt)}</td>
+          <td><div class="actions">
+            <button class="btn sm" data-edit-user="${esc(u.id)}">Edit</button>
+            <button class="btn sm ${u.status === 'BANNED' ? 'ok' : 'danger'}" data-ban-user="${esc(u.id)}" data-next="${u.status === 'BANNED' ? 'ACTIVE' : 'BANNED'}">${u.status === 'BANNED' ? 'Unban' : 'Ban'}</button>
+            <button class="btn sm ghost" data-notify-user="${esc(u.id)}">Notify</button>
+          </div></td>
+        </tr>`).join('')}
+      </tbody></table>`;
+
+    qsa('[data-edit-user]').forEach((btn) => btn.addEventListener('click', () => {
+      openUserModal(btn.dataset.editUser).catch((err) => toast(err.message, 'error', 6000));
+    }));
+    qsa('[data-ban-user]').forEach((btn) => btn.addEventListener('click', () => quickStatus(btn.dataset.banUser, btn.dataset.next)));
+    qsa('[data-notify-user]').forEach((btn) => btn.addEventListener('click', () => openNotifyModal(btn.dataset.notifyUser)));
+  }
+
+  async function openUserModal(id) {
+    const data = await api('/admin/api/users/' + encodeURIComponent(id));
+    const u = data.user;
+    openModal({
+      title: `Edit ${u.deviceId}`,
+      body: `
+        <div class="form-grid">
+          <label class="field full"><span>Device id</span><input class="input mono" value="${esc(u.deviceId)}" disabled /></label>
+          <label class="field"><span>Plan</span>
+            <select class="select" id="mPlan">
+              ${['FREE', 'MONTHLY', 'YEARLY'].map((p) => `<option value="${p}" ${u.storedPlan === p ? 'selected' : ''}>${p}</option>`).join('')}
+            </select>
+          </label>
+          <label class="field"><span>Status</span>
+            <select class="select" id="mStatus">
+              <option value="ACTIVE" ${u.status === 'ACTIVE' ? 'selected' : ''}>ACTIVE</option>
+              <option value="BANNED" ${u.status === 'BANNED' ? 'selected' : ''}>BANNED</option>
+            </select>
+          </label>
+          <label class="field"><span>Extend by days</span><input class="input" id="mDays" type="number" min="1" max="3650" placeholder="e.g. 30" /></label>
+          <label class="field"><span>Expiry (overrides extend)</span><input class="input" id="mExpiry" type="date" value="${u.planExpiresAt ? esc(String(u.planExpiresAt).slice(0, 10)) : ''}" /></label>
+          <label class="field"><span>Display name</span><input class="input" id="mName" value="${esc(u.displayName || '')}" maxlength="80" /></label>
+          <label class="field"><span>Contact method</span>
+            <select class="select" id="mContactMethod">
+              <option value="">—</option>
+              ${['telegram', 'whatsapp', 'email', 'other'].map((m) => `<option value="${m}" ${u.contactMethod === m ? 'selected' : ''}>${m}</option>`).join('')}
+            </select>
+          </label>
+          <label class="field full"><span>Contact value</span><input class="input" id="mContactValue" value="${esc(u.contactValue || '')}" maxlength="200" /></label>
+          <label class="field full"><span>Internal note</span><textarea class="textarea" id="mNote" maxlength="1000" placeholder="Payment reference, support context…">${esc(u.note || '')}</textarea></label>
+        </div>
+        <p class="tiny muted" style="margin:0">Changing the plan or status sends a per-device SSE frame and, if the device is paired with Telegram, a DM. The app re-reads <span class="mono">/api/membership/me</span>.</p>
+        <div class="tiny muted" style="margin-top:10px">History requests: ${data.requests.length} recent · ${data.requests.filter((r) => r.status === 'PENDING').length} pending</div>
+      `,
+      foot: `<button class="btn" data-close>Cancel</button><button class="btn primary" id="mSave">Save changes</button>`,
+    });
+
+    $('mSave').addEventListener('click', async () => {
+      const originalExpiry = u.planExpiresAt ? String(u.planExpiresAt).slice(0, 10) : '';
+      const patch = {
+        status: $('mStatus').value,
+        displayName: $('mName').value,
+        contactMethod: $('mContactMethod').value,
+        contactValue: $('mContactValue').value,
+        note: $('mNote').value,
+      };
+      // Only send plan when it actually changes: re-sending the stored plan on
+      // an expired account would silently renew it while editing contact info.
+      if ($('mPlan').value !== u.storedPlan) patch.plan = $('mPlan').value;
+      const days = Number($('mDays').value);
+      if (Number.isFinite(days) && days > 0) patch.extendDays = Math.round(days);
+      const expiry = $('mExpiry').value;
+      // An untouched date field must not override an explicit day extension.
+      if (expiry && expiry !== originalExpiry) patch.expiresAt = expiry;
+      if (patch.plan === 'FREE') delete patch.extendDays;
+
+      const btn = $('mSave');
+      btn.disabled = true;
+      btn.textContent = 'Saving…';
+      try {
+        const result = await api('/admin/api/users/' + encodeURIComponent(id), { method: 'PATCH', body: patch });
+        closeModal();
+        toast(notificationSummary(result.notification, 'Saved'), 'ok', 5000);
+        await loadUsers();
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = 'Save changes';
+        toast(err.message, 'error', 6000);
+      }
+    });
+  }
+
+  async function quickStatus(id, next) {
+    const verb = next === 'BANNED' ? 'ban' : 'reactivate';
+    if (!confirm(`Are you sure you want to ${verb} this device?`)) return;
+    try {
+      const result = await api('/admin/api/users/' + encodeURIComponent(id), {
+        method: 'PATCH',
+        body: { status: next },
+      });
+      toast(notificationSummary(result.notification, next === 'BANNED' ? 'Device banned' : 'Device reactivated'), 'ok', 5000);
+      await loadUsers();
+    } catch (err) {
+      toast(err.message, 'error', 6000);
+    }
+  }
+
+  function openNotifyModal(id) {
+    openModal({
+      title: 'Send a notice',
+      body: `
+        <label class="field"><span>Message</span>
+          <textarea class="textarea" id="nMessage" maxlength="400" placeholder="e.g. Your payment was received. Thanks!"></textarea>
+        </label>
+        <p class="tiny muted">Delivered over the device SSE stream and Telegram when the device is paired. It is a nudge — membership data still comes from the server.</p>
+      `,
+      foot: `<button class="btn" data-close>Cancel</button><button class="btn primary" id="nSend">Send</button>`,
+    });
+    $('nSend').addEventListener('click', async () => {
+      const btn = $('nSend');
+      btn.disabled = true;
+      try {
+        const result = await api('/admin/api/users/' + encodeURIComponent(id) + '/notify', {
+          method: 'POST',
+          body: { message: $('nMessage').value.trim() },
+        });
+        closeModal();
+        toast(notificationSummary(result.notification, 'Notice queued'), 'ok', 5000);
+      } catch (err) {
+        btn.disabled = false;
+        toast(err.message, 'error', 6000);
+      }
+    });
+  }
+
+  function notificationSummary(n, fallback) {
+    if (!n) return fallback;
+    const parts = [];
+    if (n.sse) parts.push(`${n.sse} app stream${n.sse === 1 ? '' : 's'}`);
+    if (n.telegram) parts.push('Telegram DM');
+    return parts.length ? `${fallback} · ${parts.join(' + ')}` : `${fallback} · app will see it on next refresh`;
+  }
+
+  $('userApply').addEventListener('click', () => { state.users.offset = 0; loadUsers().catch((e) => toast(e.message, 'error')); });
+  $('userSearch').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { state.users.offset = 0; loadUsers().catch((err) => toast(err.message, 'error')); }
+  });
+  $('userPrev').addEventListener('click', () => {
+    state.users.offset = Math.max(0, state.users.offset - state.users.limit);
+    loadUsers().catch((e) => toast(e.message, 'error'));
+  });
+  $('userNext').addEventListener('click', () => {
+    state.users.offset += state.users.limit;
+    loadUsers().catch((e) => toast(e.message, 'error'));
+  });
+
+  /* ====================================================================== *
+   *  REQUESTS
+   * ====================================================================== */
+  async function loadRequests() {
+    const params = new URLSearchParams({ limit: '200', offset: '0' });
+    const status = $('reqStatus').value;
+    if (status) params.set('status', status);
+    const data = await api('/admin/api/requests?' + params.toString());
+
+    $('reqCount').textContent = `${data.total} request${data.total === 1 ? '' : 's'}`;
+    const pending = data.items.filter((r) => r.status === 'PENDING').length;
+    if (status === 'PENDING' || !status) {
+      state.pending = pending;
+      updatePendingBadge();
+    }
+
+    if (!data.items.length) {
+      $('reqTable').innerHTML = '<div class="empty">No requests in this queue.</div>';
+      return;
+    }
+
+    $('reqTable').innerHTML = `<table>
+      <thead><tr>
+        <th>Created</th><th>Device</th><th>Requested</th><th>Contact</th><th>Message</th><th>Status</th><th>Actions</th>
+      </tr></thead>
+      <tbody>${data.items.map((r) => `
+        <tr>
+          <td class="tiny">${fmtDate(r.created_at)}</td>
+          <td class="mono">${esc(r.device_id)}</td>
+          <td>${badge(r.requested_plan)}</td>
+          <td class="tiny">${esc(r.contact_method || '—')}${r.contact_value ? `<div class="muted">${esc(r.contact_value)}</div>` : ''}</td>
+          <td class="tiny" style="max-width:300px">${r.message ? esc(r.message) : '<span class="muted">—</span>'}</td>
+          <td>${badge(r.status)}${r.admin_note ? `<div class="tiny muted" style="max-width:180px">${esc(r.admin_note)}</div>` : ''}</td>
+          <td>${r.status === 'PENDING' ? `<div class="actions">
+            <button class="btn sm ok" data-approve="${esc(r.id)}" data-plan="${esc(r.requested_plan)}">Approve</button>
+            <button class="btn sm danger" data-reject="${esc(r.id)}">Reject</button>
+          </div>` : `<span class="tiny muted">${esc(r.resolved_by || '')}<br>${r.resolved_at ? fmtDate(r.resolved_at, false) : ''}</span>`}</td>
+        </tr>`).join('')}
+      </tbody></table>`;
+
+    qsa('[data-approve]').forEach((btn) => btn.addEventListener('click', () => openApproveModal(btn.dataset.approve, btn.dataset.plan)));
+    qsa('[data-reject]').forEach((btn) => btn.addEventListener('click', () => rejectRequest(btn.dataset.reject)));
+  }
+
+  function openApproveModal(id, plan) {
+    openModal({
+      title: 'Approve upgrade',
+      body: `
+        <div class="form-grid">
+          <label class="field"><span>Plan</span>
+            <select class="select" id="aPlan">
+              <option value="MONTHLY" ${plan !== 'YEARLY' ? 'selected' : ''}>MONTHLY</option>
+              <option value="YEARLY" ${plan === 'YEARLY' ? 'selected' : ''}>YEARLY</option>
+            </select>
+          </label>
+          <label class="field"><span>Days</span><input class="input" id="aDays" type="number" min="1" max="3650" value="${plan === 'YEARLY' ? 365 : 30}" /></label>
+          <label class="field full"><span>Note (optional)</span><input class="input" id="aNote" maxlength="500" placeholder="Payment reference…" /></label>
+        </div>
+        <p class="tiny muted" style="margin:0">Approval extends from the current expiry when the plan is still active, otherwise from now. The device is notified through SSE and Telegram when paired.</p>
+      `,
+      foot: `<button class="btn" data-close>Cancel</button><button class="btn primary" id="aConfirm">Approve & notify</button>`,
+    });
+    $('aConfirm').addEventListener('click', async () => {
+      const btn = $('aConfirm');
+      btn.disabled = true;
+      btn.textContent = 'Approving…';
+      try {
+        const result = await api('/admin/api/requests/' + encodeURIComponent(id) + '/resolve', {
+          method: 'POST',
+          body: {
+            decision: 'approve',
+            plan: $('aPlan').value,
+            days: Number($('aDays').value),
+            note: $('aNote').value,
+          },
+        });
+        closeModal();
+        toast(notificationSummary(result.notification, 'Upgrade approved'), 'ok', 5500);
+        await loadRequests();
+        loadOverview().catch(() => {});
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = 'Approve & notify';
+        toast(err.message, 'error', 6000);
+      }
+    });
+  }
+
+  async function rejectRequest(id) {
+    if (!confirm('Reject this upgrade request? The device will stay on its current plan.')) return;
+    try {
+      await api('/admin/api/requests/' + encodeURIComponent(id) + '/resolve', {
+        method: 'POST',
+        body: { decision: 'reject' },
+      });
+      toast('Request rejected', 'ok');
+      await loadRequests();
+    } catch (err) {
+      toast(err.message, 'error', 6000);
+    }
+  }
+
+  $('reqApply').addEventListener('click', () => loadRequests().catch((e) => toast(e.message, 'error')));
+
+  /* ====================================================================== *
+   *  TRADES
+   * ====================================================================== */
+  async function loadTrades() {
+    const params = new URLSearchParams({
+      limit: String(state.trades.limit),
+      offset: String(state.trades.offset),
+    });
+    const status = $('tradeStatus').value;
+    const symbol = $('tradeSymbol').value.trim().toUpperCase();
+    if (status) params.set('status', status);
+    if (symbol) params.set('symbol', symbol);
+
+    const data = await api('/admin/api/trades?' + params.toString());
+    state.trades.total = data.total;
+    const from = data.total ? state.trades.offset + 1 : 0;
+    const to = Math.min(state.trades.offset + state.trades.limit, data.total);
+    $('tradeCount').textContent = `${from}–${to} of ${data.total}`;
+    $('tradePrev').disabled = state.trades.offset <= 0;
+    $('tradeNext').disabled = state.trades.offset + state.trades.limit >= data.total;
+
+    if (!data.items.length) {
+      $('tradeTable').innerHTML = '<div class="empty">No trades match this filter.</div>';
+      return;
+    }
+
+    $('tradeTable').innerHTML = `<table>
+      <thead><tr>
+        <th>Symbol</th><th>Side</th><th>Status</th><th>Entry</th><th>SL</th><th>TP1 / TP2</th><th>PnL</th><th>Opened</th><th>Closed / exit</th><th>Reasoning</th>
+      </tr></thead>
+      <tbody>${data.items.map((t) => `
+        <tr>
+          <td><b>${esc(t.symbol)}</b><div class="tiny muted">${esc(t.stage || '')} ${t.confidence != null ? `· ${esc(t.confidence)} conf.` : ''}</div></td>
+          <td>${esc(t.action || '—')}</td>
+          <td>${badge(t.status)}</td>
+          <td class="num">${fmtNum(t.entry, 2)}</td>
+          <td class="num">${fmtNum(t.stopLoss, 2)}</td>
+          <td class="num tiny">${fmtNum(t.takeProfit1, 2)} / ${fmtNum(t.takeProfit2, 2)}</td>
+          <td class="num ${pnlClass(t.pnlPoints)}">${t.pnlPoints == null ? '<span class="muted">—</span>' : `${fmtNum(t.pnlPoints, 1)} pts`}${t.pnlPct != null ? `<div class="tiny">${fmtNum(t.pnlPct, 2)}%</div>` : ''}</td>
+          <td class="tiny">${fmtDate(t.openedAt)}</td>
+          <td class="tiny">${t.closedAt ? fmtDate(t.closedAt) : '<span class="muted">open</span>'}${t.exitReason ? `<div class="muted">${esc(t.exitReason)}</div>` : ''}</td>
+          <td class="tiny" style="max-width:260px">${t.reasoning ? `<details><summary class="muted">view</summary><div class="msg">${esc(t.reasoning)}</div></details>` : '<span class="muted">—</span>'}</td>
+        </tr>`).join('')}
+      </tbody></table>`;
+  }
+
+  $('tradeApply').addEventListener('click', () => { state.trades.offset = 0; loadTrades().catch((e) => toast(e.message, 'error')); });
+  $('tradeSymbol').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { state.trades.offset = 0; loadTrades().catch((err) => toast(err.message, 'error')); }
+  });
+  $('tradePrev').addEventListener('click', () => {
+    state.trades.offset = Math.max(0, state.trades.offset - state.trades.limit);
+    loadTrades().catch((e) => toast(e.message, 'error'));
+  });
+  $('tradeNext').addEventListener('click', () => {
+    state.trades.offset += state.trades.limit;
+    loadTrades().catch((e) => toast(e.message, 'error'));
+  });
+
+  /* ====================================================================== *
+   *  MODALS
+   * ====================================================================== */
+  function openModal({ title, body, foot }) {
+    closeModal();
+    const root = $('modalRoot');
+    root.innerHTML = `<div class="backdrop" role="dialog" aria-modal="true">
+      <div class="modal">
+        <div class="modal-head">
+          <h3>${esc(title)}</h3>
+          <button class="close" data-close aria-label="Close">×</button>
+        </div>
+        <div class="modal-body">${body}</div>
+        <div class="modal-foot">${foot}</div>
+      </div>
+    </div>`;
+    qsa('[data-close]', root).forEach((b) => b.addEventListener('click', closeModal));
+    qs('.backdrop', root).addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) closeModal();
+    });
+    const first = qs('.modal-body input, .modal-body select, .modal-body textarea', root);
+    if (first) setTimeout(() => first.focus(), 30);
+  }
+
+  function closeModal() {
+    $('modalRoot').innerHTML = '';
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeModal();
+  });
+
+  /* ====================================================================== *
+   *  BOOT
+   * ====================================================================== */
+  window.addEventListener('hashchange', () => {
+    const view = location.hash.replace('#', '') || 'overview';
+    if (state.me && view !== state.view) switchView(view).catch(() => {});
+  });
+
+  boot();
+})();
+</script>
+</body>
+</html>

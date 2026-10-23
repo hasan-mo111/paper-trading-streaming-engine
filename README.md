@@ -35,7 +35,7 @@ npm install
 cp .env.example .env          # add Supabase URL + service-role key
 node diagnose.mjs             # verify Supabase, the feed and the backfill
 npm start                     # → http://localhost:3000
-npm test                      # 291 assertions, no network required
+npm test                      # engine + AI + admin/membership + e2e, no real network
 ```
 
 Without Supabase credentials the engine still runs in **local mode**: candles
@@ -119,10 +119,15 @@ is acceptable while losing a closed one is not.
 
 Run [`supabase/schema.sql`](supabase/schema.sql) once in the Supabase SQL editor
 (it is idempotent). It creates `candles`, `profiles`, `daily_executions`,
-`executions` and `chat_events`, enables **row-level security with zero
-policies** — the service-role key in this process is the only thing that can
-read or write them — and installs the atomic quota function plus a new-user
-trigger that gives every signup a FREE profile automatically.
+`executions`, `chat_events`, `app_users`, `membership_requests` and `ai_trades`,
+enables **row-level security with zero policies** — the service-role key in this
+process is the only thing that can read or write them — and installs the atomic
+quota function plus a new-user trigger that gives every signup a FREE profile
+automatically.
+
+Upgrading an existing deployment? Run
+[`supabase/admin-membership.sql`](supabase/admin-membership.sql) once as well.
+It adds only the three new tables, indexes and RLS, and is safe to re-run.
 
 ---
 
@@ -157,6 +162,93 @@ Two design points worth stating explicitly:
 
 ---
 
+## APK membership and the operator console
+
+The Android app has **no email/password signup and no database credentials**.
+An installation is identified by the same stable device id it already uses for
+Telegram pairing:
+
+```
+install → POST /api/membership/register → FREE account
+launch/resume → GET /api/membership/me → plan, status, retention window
+upgrade → POST /api/membership/request → operator sees it in /admin/
+operator approves → plan_expires_at is set → APK is notified
+```
+
+### Plans
+
+| Plan | History retention | Execution rights |
+| --- | ---: | --- |
+| `FREE` | 7 days | unchanged — the engine's normal freemium quota |
+| `MONTHLY` | 90 days | unchanged |
+| `YEARLY` | 3,650 days | unchanged |
+
+A plan is a **label plus a trade-history window**. It never grants the APK any
+execution ability: the strategy engine and the AI analyst remain the only
+things that can open or close a position, and both run server-side.
+
+Expiry is enforced on every request. A paid plan whose `plan_expires_at` is
+missing or in the past is treated as `FREE` immediately, so a broken date can
+never grant permanent access. In the console, **Extend by days** adds to the
+current expiry (or starts from now if the plan already lapsed); changing the
+plan uses that plan's default period unless you enter an explicit expiry.
+
+### Upgrade notification — always server-side
+
+When an operator approves a request or edits a plan, the **server**:
+
+1. persists the new plan and expiry in `app_users`;
+2. pushes a `membership` event to that device's
+   `GET /api/membership/stream` listeners;
+3. sends a Telegram DM if the device was paired with `/start <deviceId>`;
+4. returns the notification counts to the admin console.
+
+`GET /api/membership/me` remains the **source of truth**. The SSE frame and the
+Telegram DM are wake-ups, not authority: if the phone was offline and unpaired,
+it sees the new plan the next time it calls `/me`. There is no client-side plan
+flag to edit and no payment credential in the APK.
+
+### Bans
+
+Setting an account to `BANNED` makes `deviceGate` return `403 banned` on
+`/api/trades/*`, `/api/ai/signal`, `/api/ai/analyze`, `/api/membership/request`,
+`/api/membership/stream`, `/stream`, `/api/stream/prices` and
+`/api/stream/chat-events` whenever the APK sends its device id.
+`GET /api/membership/me` still returns the account with `status: "BANNED"`, so
+the app can show a clear suspension screen instead of a generic network error.
+Unbanning restores access on the next request or reconnect. Public market
+endpoints remain public for anonymous browsers; a ban is enforced on every
+identified request.
+
+### Admin console
+
+`/admin/` is a self-contained page served by this process. It has an overview,
+APK-user search/edit, the upgrade-request queue and the permanent AI ledger.
+Authentication is a single operator account from the environment:
+
+```bash
+# Render → Environment
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD_HASH=scrypt$...       # npm run hash:admin -- "long password"
+ADMIN_SESSION_SECRET=<random hex>    # optional but recommended
+```
+
+The browser receives an `HttpOnly`, `SameSite=Strict`, HMAC-signed cookie.
+Login attempts are rate-limited per IP; mutating admin calls also require a
+same-origin `Origin`. No admin secret is stored in Supabase. Without
+`ADMIN_PASSWORD` or `ADMIN_PASSWORD_HASH`, `/admin/` shows a setup message and
+every admin API answers `503 admin_disabled`.
+
+### Permanent AI trade ledger
+
+Every AI trade is written to `ai_trades` when it opens, when TP1 moves the stop
+to breakeven, and when it closes. A partial unique index enforces **one OPEN
+row per symbol**, so a restart can never open a second trade on the same
+instrument. At boot the analyst re-adopts those OPEN rows and resumes managing
+their stop/targets; the APK reads them through the API, never through Supabase.
+
+---
+
 ## Endpoints
 
 | Method | Path | Auth | Purpose |
@@ -174,9 +266,27 @@ Two design points worth stating explicitly:
 | `GET` | `/api/user/positions` | ✔ | open positions with their leg split |
 | `GET` | `/api/user/executions` | ✔ | audit trail |
 | `GET` | `/api/user/engine` | ✔ | live strategy state + indicators |
+| `POST` | `/api/membership/register` | device | install → FREE account (idempotent) |
+| `GET` | `/api/membership/me` | device | plan, status, expiry, retention, support handles |
+| `POST` | `/api/membership/request` | device | ask the operator for MONTHLY / YEARLY |
+| `GET` | `/api/membership/requests` | device | that device's own request history |
+| `GET` | `/api/membership/plans` | — | public plan metadata + support handles |
+| `GET` | `/api/membership/stream` | device | per-device SSE upgrade/ban notice |
+| `GET` | `/api/trades/open` | device | live AI book + engine positions |
+| `GET` | `/api/trades/history` | device | closed AI trades, filtered by plan |
+| `GET` | `/api/trades/stats` | device | win rate / PnL for the plan window |
+| `GET` | `/admin/` | cookie | operator console (login page + SPA) |
+| `POST` | `/admin/api/login` | — | username/password → signed cookie |
+| `GET` | `/admin/api/overview` | cookie | counters, system state, recent activity |
+| `GET`/`PATCH` | `/admin/api/users…` | cookie | list, inspect, edit plan/ban/contact |
+| `GET`/`POST` | `/admin/api/requests…` | cookie | queue and approve/reject upgrades |
+| `GET` | `/admin/api/trades` | cookie | permanent AI ledger |
 | `GET` | `/api/stream` | — | connectors index |
 
-Every user route is a `GET`. There is no mutating endpoint.
+`device` means `X-Device-Id: <installation id>` (or `?deviceId=` for
+EventSource). Every `/api/user/*` route is still a `GET`. The only mutating
+endpoints are device registration / upgrade requests and the browser-only admin
+console — none of them can place, size or close a trade.
 
 Authenticate with `Authorization: Bearer <token>`, `?access_token=<token>` or
 `x-access-token` (EventSource cannot set headers, so the query form is the
@@ -237,6 +347,13 @@ app), RLS is enabled with no policies, tokens are verified server-side with a
 short-lived cache, the API is rate limited per IP, security headers and a CSP are
 set, and `DEV_TOKEN` is hard-disabled when `NODE_ENV=production`.
 
+The APK has no Supabase URL or key at all. Device membership reads go through
+this process (`/api/trades/*`, `/api/membership/*`), which is why a plan cannot
+be forged by editing a local setting and a leaked APK cannot query another
+user's data. The admin console is a separate, environment-held credential with
+an HttpOnly signed cookie; it is not a Supabase user, and its password never
+enters the database.
+
 ---
 
 ## Project layout
@@ -253,6 +370,10 @@ src/
 │   ├── marketAggregator.js      candle store, DB hydration, write-behind
 │   ├── sseHub.js                channel-aware SSE hub, back-pressure
 │   ├── sseDispatcher.js         prices + chat-ops streams
+│   ├── aiSignal.js              AI analyst + durable trade ledger writes
+│   ├── aiAnalystManager.js      multi-symbol clock, quota backoff, restore
+│   ├── appUsers.js              device accounts, plans, retention, requests
+│   ├── membershipEvents.js      per-device SSE fan-out
 │   ├── brokerApi.js             paper + MT5 bridge execution (server-only)
 │   └── logger.js
 ├── engine/
@@ -260,15 +381,24 @@ src/
 │   └── indicatorCalc.js         ATR(20), Donchian, breakout (pure functions)
 ├── middleware/
 │   ├── auth.js                  token → profile, SSE-aware
+│   ├── adminAuth.js             scrypt password, signed session cookie
 │   ├── quotaManager.js          daily counter, SIGNAL_ONLY downgrade, rate limit
 │   └── tradeGuard.js            rejects client-supplied execution parameters
 └── routes/
     ├── sse.js                   /stream + the two production streams
     ├── user.js                  read-only user API
+    ├── ai.js                    /api/ai/signal + /api/ai/analyze
+    ├── membership.js            APK membership + trade-history API
+    ├── admin.js                 /admin/ console + operator API
     └── telegram.js              optional notifications
-supabase/schema.sql              tables, RLS, atomic quota RPC, triggers
+public/admin/index.html          operator SPA (login, users, requests, ledger)
+supabase/schema.sql              full idempotent schema
+supabase/admin-membership.sql    migration for existing deployments
 test/engine.test.mjs             140 assertions — quant, quota, security
-test/e2e.test.mjs                151 assertions — full stack against a mock feed
+test/aiSignal.test.mjs            38 assertions — analyst parsing/fallbacks
+test/aiManager.test.mjs           10 assertions — multi-symbol/quota behaviour
+test/admin.test.mjs               56 assertions — auth, plans, ledger, bans
+test/e2e.test.mjs                163 assertions — full stack against a mock feed
 ```
 
 ---
@@ -289,14 +419,26 @@ behaviour rather than tuning:
 | `FREE_DAILY_EXECUTIONS` | `3` | the freemium hook |
 | `AUTH_REQUIRED` | `true` | gate on `/api/user/*` and `/api/stream/*` |
 | `DEV_TOKEN` | — | dev only; blanked in production |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD(_HASH)` | `admin` / — | `/admin/` is disabled until a password is set |
+| `ADMIN_SESSION_SECRET` | derived | set a separate random value so password rotation is clean |
+| `MEMBERSHIP_ENABLED` | `true` | APK device accounts + trade-history API |
+| `FREE_HISTORY_DAYS` | `7` | FREE trade-history window |
+| `MONTHLY_HISTORY_DAYS` | `90` | MONTHLY window |
+| `YEARLY_HISTORY_DAYS` | `3650` | YEARLY window |
+| `SUPPORT_TELEGRAM` / `SUPPORT_WHATSAPP` / `SUPPORT_EMAIL` | — | shown by `GET /api/membership/plans` |
 
 ---
 
 ## Deploy to Render
 
-1. Run `supabase/schema.sql` in Supabase.
+1. Run `supabase/schema.sql` in Supabase. Existing projects also run
+   `supabase/admin-membership.sql` once.
 2. Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` as secret env vars.
-3. Apply the blueprint — [`render.yaml`](render.yaml) pins the strategy
+3. Set `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH` (or `ADMIN_PASSWORD`) and
+   `ADMIN_SESSION_SECRET`. Without a password the console stays disabled.
+4. Set `SUPPORT_TELEGRAM` / `SUPPORT_WHATSAPP` / `SUPPORT_EMAIL` so the APK's
+   upgrade screen has real contact buttons.
+5. Apply the blueprint — [`render.yaml`](render.yaml) pins the strategy
    parameters and defaults to `BROKER_MODE=paper`.
 
 Then confirm `/health` reports `database.lastProbe.connected: true`,
@@ -337,6 +479,71 @@ val req = Request.Builder()
 // switch on the parsed "type": EXECUTION | SIGNAL_ONLY | STOP_HIT | …
 ```
 
+### APK membership + trade history
+
+Use the installation id already generated for Telegram pairing. It is an
+identity, not a secret, and it must be stable across app restarts.
+
+```kotlin
+// 1) Register once (idempotent — safe to call on every launch)
+// The device id may go in the header or the JSON body; the header is preferred.
+val body = """
+  {"displayName":"$name",
+   "contactMethod":"telegram","contactValue":"$handle"}
+""".trimIndent().toRequestBody("application/json".toMediaType())
+
+val register = Request.Builder()
+    .url("$BASE/api/membership/register")
+    .header("X-Device-Id", deviceId)
+    .post(body)
+    .build()
+
+// 2) Source of truth for plan / status / retention
+val me = Request.Builder()
+    .url("$BASE/api/membership/me")
+    .header("X-Device-Id", deviceId)
+    .build()
+
+// 3) Ask the operator for an upgrade (after showing SUPPORT_* handles)
+val request = Request.Builder()
+    .url("$BASE/api/membership/request")
+    .header("X-Device-Id", deviceId)
+    .post("""{"plan":"MONTHLY","message":"paid via Telegram"}"""
+        .toRequestBody("application/json".toMediaType()))
+    .build()
+
+// 4) Trade history — closed rows filtered by the server, not by the client
+val history = Request.Builder()
+    .url("$BASE/api/trades/history?limit=100&offset=0")
+    .header("X-Device-Id", deviceId)
+    .build()
+
+// 5) Open book (AI + strategy positions)
+val open = Request.Builder()
+    .url("$BASE/api/trades/open")
+    .header("X-Device-Id", deviceId)
+    .build()
+```
+
+`GET /api/membership/me` returns `plan`, `storedPlan`, `status`, `expired`,
+`planExpiresAt`, `retentionDays` and `features`. Handle the two important
+errors explicitly:
+
+- `401 unregistered` → call `/api/membership/register` first.
+- `403 banned` → show the suspension screen; do not retry in a loop.
+
+To receive the upgrade immediately instead of waiting for the next `/me`, keep
+an EventSource open on
+`$BASE/api/membership/stream?deviceId=$deviceId` and refresh `/me` when a
+`membership` event arrives. The stream is optional; `/me` is authoritative.
+
+**Do not put a Supabase URL, service-role key or database driver in the APK.**
+The app cannot query `ai_trades` directly, by design. It sends its device id to
+this Node process, which uses the service-role key server-side and returns only
+the rows that device's plan is allowed to see. That is the complete answer to
+"how does the app show the trade history without database access?" — it calls
+`/api/trades/history`, not Supabase.
+
 Always render a connecting/reconnecting state: even on `starter` the first frame
 can take a moment, and `retry:` (3 s) means EventSource recovers on its own.
 
@@ -353,8 +560,15 @@ can take a moment, and `retry:` (3 s) means EventSource recovers on its own.
 - **Forex and metals are closed at weekends.** The silence watchdog is
   deliberately long (5 min) so the feed does not reconnect in a loop for the
   whole Saturday.
-- **Candle gaps are filled, not hidden.** A weekend or outage produces synthetic
-  flat candles carrying the last close, so the chart never shows a hole — which
-  means ATR across such a gap understates real volatility.
+- **Candle gaps are left as gaps.** Weekend and outage bars are not fabricated:
+  the chart and the indicators both see the real sequence, so ATR is not
+  diluted by synthetic flat candles.
+- **The AI ledger is permanent; the plan is not.** A FREE account that upgrades
+  to YEARLY can read the older rows immediately because they were never
+  deleted — retention is a read filter (`closed_at >= now - retentionDays`),
+  not a purge job.
+- **One OPEN AI trade per symbol** is enforced by a partial unique index in
+  Postgres, not just by the in-memory map. A restart re-adopts the row and
+  resumes managing it.
 - **`MAX_CANDLES` must stay above `DONCHIAN_ENTRY`.** `diagnose.mjs` checks this
   and fails loudly if it does not.

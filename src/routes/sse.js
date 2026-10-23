@@ -40,16 +40,17 @@ const log = createLogger('routes:sse');
  * @param {import('../services/marketAggregator.js').MarketAggregator} deps.market
  * @param {ReturnType<import('../middleware/auth.js').createAuth>} deps.auth
  * @param {import('../middleware/tradeGuard.js').default} deps.tradeGuard
+ * @param {Function} [deps.deviceGate] optional APK membership gate
  * @param {() => object} deps.healthProvider
  */
-export function mountSseRoutes({ app, hub, dispatcher, market, auth, tradeGuard, healthProvider }) {
+export function mountSseRoutes({ app, hub, dispatcher, market, auth, tradeGuard, deviceGate = null, healthProvider }) {
   const router = express.Router();
 
   /* ====================================================================== */
   /*  LEGACY PUBLIC CHART FEED — unchanged contract, so the dashboard keeps */
   /*  working exactly as before the refactor.                              */
   /* ====================================================================== */
-  router.get('/stream', tradeGuard, (req, res) => {
+  router.get('/stream', tradeGuard, ...(deviceGate ? [deviceGate] : []), (req, res) => {
     const symbolFilter = normaliseSymbol(req.query.symbol);
     const intervalFilter = normaliseInterval(req.query.interval);
 
@@ -73,6 +74,7 @@ export function mountSseRoutes({ app, hub, dispatcher, market, auth, tradeGuard,
   router.get(
     '/api/stream/prices',
     tradeGuard,
+    ...(deviceGate ? [deviceGate] : []),
     ENV.auth.REQUIRED ? auth.sse : auth.optionalSse,
     (req, res) => {
       // Filters are validated against the symbol registry before use. An
@@ -154,6 +156,7 @@ export function mountSseRoutes({ app, hub, dispatcher, market, auth, tradeGuard,
   router.get(
     '/api/stream/chat-events',
     tradeGuard,
+    ...(deviceGate ? [deviceGate] : []),
     ENV.auth.REQUIRED ? auth.sse : auth.optionalSse,
     async (req, res) => {
       await dispatcher.openChat(hub, req, res, {

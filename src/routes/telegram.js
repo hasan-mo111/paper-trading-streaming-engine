@@ -247,6 +247,26 @@ export function mountTelegramGateway(app, { log = console.log, warn = console.wa
     return sent;
   }
 
+  /**
+   * Send one message to the chat paired with a device id.
+   * Used by the admin console when an APK account is upgraded or banned.
+   *
+   * @param {string} deviceId
+   * @param {string} text HTML message
+   * @returns {Promise<boolean>}
+   */
+  async function notifyDevice(deviceId, text) {
+    if (!cfg.token || !text) return false;
+    const d = devices.get(String(deviceId ?? '').toUpperCase());
+    if (!d?.chatId) return false;
+    const sent = await sendMessage(d.chatId, text);
+    if (sent) {
+      d.sent += 1;
+      d.lastSentAt = Date.now();
+    }
+    return Boolean(sent);
+  }
+
   /* ---------------------------------------------------------- formatting -- */
 
   function format(event, p = {}) {
@@ -294,6 +314,8 @@ export function mountTelegramGateway(app, { log = console.log, warn = console.wa
     devices,
     /** Server-side broadcast used by the AI analyst (see notifyAll above). */
     notifyAll,
+    /** Send to the chat paired with one device id (admin upgrades/bans). */
+    notifyDevice,
     /** Send to one chat id — escape hatch for other server modules. */
     send: sendMessage,
     stop: () => {

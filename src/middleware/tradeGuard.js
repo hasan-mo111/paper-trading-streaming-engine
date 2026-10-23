@@ -143,11 +143,28 @@ export function apiManifest() {
       'GET /api/market/price',
       'GET /api/ai/signal',
       'GET /api/ai/analyze',
+      'GET /api/membership/me',
+      'GET /api/membership/requests',
+      'GET /api/membership/plans',
+      'GET /api/membership/stream',
+      'GET /api/trades/open',
+      'GET /api/trades/history',
+      'GET /api/trades/stats',
       'GET /api/stream/prices',
       'GET /api/stream/chat-events',
       'GET /stream',
       'GET /health',
     ],
+    /**
+     * APK account endpoints. These mutate membership metadata only — none of
+     * them can place, size or close a trade.
+     */
+    membershipRoutes: [
+      'POST /api/membership/register',
+      'POST /api/membership/request',
+    ],
+    /** Browser-only operator console; authenticated by a signed cookie. */
+    adminSurface: '/admin/ (login required, ADMIN_PASSWORD in the server env)',
   };
 }
 

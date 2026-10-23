@@ -71,15 +71,19 @@ export class AiAnalystManager {
    * @param {object} deps.dispatcher   shared SSEDispatcher
    * @param {object} deps.env          parsed env (env.ai is the analyst config)
    * @param {object} [deps.news]       EconomicNewsService (shared, cached)
-   * @param {object} [deps.telegram]   Telegram gateway handle
-   * @param {Function} [deps.fetchFn]  injected fetch, for tests
+   * @param {object} [deps.telegram]    Telegram gateway handle
+   * @param {Function} [deps.fetchFn]   injected fetch, for tests
+   * @param {object} [deps.persistence] SupabaseService for the durable trade ledger
    */
-  constructor({ market, dispatcher, env, news = null, telegram = null, fetchFn = null }) {
+  constructor({ market, dispatcher, env, news = null, telegram = null, fetchFn = null, persistence = null }) {
     this.env = env;
     this.cfg = env.ai;
     this.market = market;
     this.dispatcher = dispatcher;
     this.news = news;
+    this.persistence = persistence;
+    /** Symbols whose open trade was recovered from the database this boot. */
+    this.restored = [];
 
     // Only symbols the platform actually trades. An operator typo in
     // AI_SIGNAL_SYMBOLS is dropped here rather than causing four failed
@@ -119,6 +123,7 @@ export class AiAnalystManager {
           telegram,
           fetchFn,
           keyPool: this.keyPool,
+          persistence,
         })
       );
     }
@@ -182,6 +187,65 @@ export class AiAnalystManager {
     return this.services.get(String(symbol).toUpperCase()) ?? null;
   }
 
+  /**
+   * Re-adopt open AI trades after a restart.
+   *
+   * The analyst used to start flat on purpose: without a ledger it could not
+   * verify that a trade it remembered was still real. Now the position IS in
+   * Supabase, so the correct behaviour is to resume managing it instead of
+   * opening a second trade on the same symbol.
+   *
+   * @returns {Promise<{restored:string[], skipped:Array<{symbol:string,reason:string}>}>}
+   */
+  async restoreOpenTrades() {
+    this.restored = [];
+    if (!this.persistence?.listOpenAiTrades) {
+      return { restored: [], skipped: [] };
+    }
+
+    let rows = [];
+    try {
+      rows = await this.persistence.listOpenAiTrades();
+    } catch (e) {
+      log.error('AI trade restore failed:', e.message);
+      return { restored: [], skipped: [{ symbol: '*', reason: e.message }] };
+    }
+
+    const restored = [];
+    const skipped = [];
+    const seen = new Set();
+
+    for (const row of rows) {
+      const symbol = String(row.symbol ?? '').toUpperCase();
+      if (!symbol) continue;
+      if (seen.has(symbol)) {
+        // Defensive: the partial unique index should make this impossible.
+        skipped.push({ symbol, reason: 'duplicate-open-row' });
+        continue;
+      }
+      seen.add(symbol);
+
+      const svc = this.services.get(symbol);
+      if (!svc) {
+        skipped.push({ symbol, reason: 'symbol-not-configured' });
+        continue;
+      }
+      if (svc.restorePosition(row)) restored.push(symbol);
+      else skipped.push({ symbol, reason: 'position-rejected' });
+    }
+
+    this.restored = restored;
+    if (restored.length) {
+      log.ok(`AI trade book restored from the database: ${restored.join(', ')}`);
+    }
+    if (skipped.length) {
+      log.warn(
+        `AI trade restore skipped: ${skipped.map((s) => `${s.symbol}(${s.reason})`).join(', ')}`
+      );
+    }
+    return { restored, skipped };
+  }
+
   /* ----------------------------------------------------------------- status */
 
   /**
@@ -231,6 +295,8 @@ export class AiAnalystManager {
       openTrades: [...this.services.entries()]
         .filter(([, svc]) => Boolean(svc.position))
         .map(([symbol]) => symbol),
+      persisted: Boolean(this.persistence?.saveAiTrade),
+      restoredOpenTrades: [...this.restored],
       ...totals,
       perSymbol,
       news: this.news?.status?.() ?? null,
