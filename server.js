@@ -70,6 +70,7 @@ export {
   APP_STATUS,
   PLAN_DAYS,
   normaliseDeviceId,
+  normaliseEmail,
   effectivePlan,
   planExpired,
 } from './src/services/appUsers.js';

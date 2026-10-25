@@ -395,8 +395,8 @@
 
           <div class="panel">
             <div class="panel-head">
-              <h3>Open AI trades</h3>
-              <span class="hint">one position per symbol</span>
+              <h3>Open positions</h3>
+              <span class="hint">AI + strategy · one per symbol</span>
               <span class="spacer"></span>
               <button class="btn sm" data-goto="trades">Full ledger</button>
             </div>
@@ -775,7 +775,7 @@
       card('APK users', s.users.total, `${s.users.active} active · ${s.users.banned} banned`, ''),
       card('Paid plans', s.users.paid, `${s.users.monthly} monthly · ${s.users.yearly} yearly`, 'accent'),
       card('Pending requests', s.requests.pending, `${s.requests.total} lifetime`, s.requests.pending ? 'warn' : ''),
-      card('Open trades', s.trades.open, `${s.trades.closed} closed`, ''),
+      card('Open trades', s.trades.openTotal ?? s.trades.open, `${s.trades.open} AI · ${(s.strategyOpenTrades || []).length} strategy`, ''),
       card('Win rate', `${fmtNum(s.trades.winRate, 1)}%`, `${s.trades.wins}W / ${s.trades.losses}L`, s.trades.winRate >= 50 ? 'up' : 'down'),
       card('Closed PnL', `${fmtNum(s.trades.pnlPoints, 1)} pts`, 'sum over stored trades', Number(s.trades.pnlPoints) >= 0 ? 'up' : 'down'),
     ].join('');
@@ -797,15 +797,22 @@
         </div>`).join('')}</div>`;
     }
 
-    /* open trades */
-    if (!s.openTrades.length) {
-      $('openTrades').innerHTML = '<div class="empty">No open AI trades.</div>';
+    /* open positions — AI ledger + the engine's durable strategy book */
+    const openAi = (s.openTrades || []).map((t) => ({ ...t, source: 'ai' }));
+    const openStrategy = (s.strategyOpenTrades || []).map((t) => ({ ...t, source: 'strategy' }));
+    const openAll = [...openStrategy, ...openAi];
+    if (!openAll.length) {
+      $('openTrades').innerHTML = '<div class="empty">No open positions.</div>';
     } else {
-      $('openTrades').innerHTML = `<div class="list">${s.openTrades.map((t) => `
+      $('openTrades').innerHTML = `<div class="list">${openAll.map((t) => `
         <div class="list-row">
           <div class="grow">
-            <div class="title"><b>${esc(t.symbol)}</b> ${esc(t.action || '')} · ${badge(t.status)}</div>
-            <div class="sub">entry ${fmtNum(t.entry, 2)} · SL ${fmtNum(t.stopLoss, 2)} · TP1 ${fmtNum(t.takeProfit1, 2)}</div>
+            <div class="title"><b>${esc(t.symbol)}</b> ${esc(t.side || t.action || '')} · ${badge(t.status || 'OPEN')}
+              <span class="tiny muted">${t.source === 'strategy' ? 'strategy' : 'AI'}</span>
+            </div>
+            <div class="sub">${t.source === 'strategy'
+              ? `entry ${fmtNum(t.entry, 2)} · SL ${fmtNum(t.stopLoss, 2)} · lots ${fmtNum(t.volume, 2)}`
+              : `entry ${fmtNum(t.entry, 2)} · SL ${fmtNum(t.stopLoss, 2)} · TP1 ${fmtNum(t.takeProfit1, 2)}`}</div>
           </div>
           <div class="sub">${relTime(t.openedAt)}</div>
         </div>`).join('')}</div>`;
@@ -885,11 +892,11 @@
 
     $('userTable').innerHTML = `<table>
       <thead><tr>
-        <th>Device</th><th>User</th><th>Plan</th><th>Status</th><th>Expires</th><th>Last seen</th><th>Actions</th>
+        <th>Device / email</th><th>User</th><th>Plan</th><th>Status</th><th>Expires</th><th>Last seen</th><th>Actions</th>
       </tr></thead>
       <tbody>${data.items.map((u) => `
         <tr>
-          <td><div class="mono">${esc(u.deviceId)}</div><div class="tiny muted">joined ${fmtDate(u.createdAt, false)}</div></td>
+          <td><div class="mono">${esc(u.deviceId)}</div><div class="tiny muted">${esc(u.email || 'no email')} · joined ${fmtDate(u.createdAt, false)}</div></td>
           <td>${esc(u.displayName || '—')}<div class="tiny muted">${esc(u.contactMethod || '')} ${u.contactValue ? '· ' + esc(u.contactValue) : ''}</div></td>
           <td>${badge(u.plan)}${u.storedPlan && u.storedPlan !== u.plan ? `<div class="tiny warn">stored ${esc(u.storedPlan)}</div>` : ''}</td>
           <td>${badge(u.status)}</td>
@@ -913,11 +920,14 @@
   async function openUserModal(id) {
     const data = await api('/admin/api/users/' + encodeURIComponent(id));
     const u = data.user;
+    const linkedDevices = Array.isArray(u.devices) && u.devices.length ? u.devices : [u.deviceId];
     openModal({
-      title: `Edit ${u.deviceId}`,
+      title: `Edit ${u.email || u.deviceId}`,
       body: `
         <div class="form-grid">
-          <label class="field full"><span>Device id</span><input class="input mono" value="${esc(u.deviceId)}" disabled /></label>
+          <label class="field full"><span>Device id</span><input class="input mono" value="${esc(u.deviceId)}" disabled />
+            <span class="tiny muted">Linked installations: ${linkedDevices.map(esc).join(', ')}</span></label>
+          <label class="field full"><span>Email (same email = one account)</span><input class="input" id="mEmail" type="email" value="${esc(u.email || '')}" maxlength="254" placeholder="user@example.com" /></label>
           <label class="field"><span>Plan</span>
             <select class="select" id="mPlan">
               ${['FREE', 'MONTHLY', 'YEARLY'].map((p) => `<option value="${p}" ${u.storedPlan === p ? 'selected' : ''}>${p}</option>`).join('')}
@@ -951,6 +961,7 @@
       const originalExpiry = u.planExpiresAt ? String(u.planExpiresAt).slice(0, 10) : '';
       const patch = {
         status: $('mStatus').value,
+        email: $('mEmail').value,
         displayName: $('mName').value,
         contactMethod: $('mContactMethod').value,
         contactValue: $('mContactValue').value,

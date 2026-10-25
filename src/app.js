@@ -181,14 +181,15 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
 
   // Recover positions the previous process left open. This runs before the
   // first evaluation so a restart can never double-expose a symbol.
+  // The engine's book is global (the AI/strategy trades are server decisions,
+  // not per-APK rows), so restore even when `userId` is null. Passing the id is
+  // only an extra filter for deployments that later partition the book.
   let restored = 0;
-  if (userId) {
-    try {
-      const openRows = await persistence.listOpenPositions(userId);
-      restored = engine.restorePositions(openRows);
-    } catch (e) {
-      log.error('position recovery failed:', e.message);
-    }
+  try {
+    const openRows = await persistence.listOpenPositions(userId);
+    restored = engine.restorePositions(openRows);
+  } catch (e) {
+    log.error('position recovery failed:', e.message);
   }
 
   /* ===================================================================== */
@@ -400,17 +401,24 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
       by: ctx.by ?? null,
       at: new Date().toISOString(),
     };
-    const sse = membershipEvents.publish(view.deviceId, 'membership', event);
+
+    // One account can have several linked installations. Wake every one of
+    // them up; /api/membership/me is still the authoritative read.
+    const devices = await membership.devicesForUser(row.id);
+    let sse = 0;
+    for (const deviceId of devices) sse += membershipEvents.publish(deviceId, 'membership', event);
 
     let sent = false;
     if (env.membership.TELEGRAM_UPGRADE && telegram?.notifyDevice) {
-      try {
-        sent = Boolean(await telegram.notifyDevice(view.deviceId, text));
-      } catch (e) {
-        log.warn('membership Telegram notify failed:', e.message);
+      for (const deviceId of devices) {
+        try {
+          if (await telegram.notifyDevice(deviceId, text)) sent = true;
+        } catch (e) {
+          log.warn('membership Telegram notify failed:', e.message);
+        }
       }
     }
-    return { sse, telegram: sent, kind, plan: view.plan, status: view.status };
+    return { sse, telegram: sent, kind, plan: view.plan, status: view.status, devices: devices.length };
   }
 
   mountSseRoutes({
@@ -446,6 +454,7 @@ export async function createApplication({ env = ENV, userId = null } = {}) {
     persistence,
     env,
     ai: aiSignal,
+    engine,
     notifyMembership,
     healthProvider: healthPayload,
   });

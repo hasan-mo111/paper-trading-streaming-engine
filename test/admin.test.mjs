@@ -244,6 +244,69 @@ check(
   JSON.stringify(missingRegister.json)
 );
 
+/* ==================================================== 2b. EMAIL IDENTITY */
+section('2b) Same email = one account');
+
+const emailFirst = await request('/api/membership/register', {
+  method: 'POST',
+  headers: { 'X-Device-Id': 'dev-mail-0001' },
+  body: { email: 'Same.Person@Example.com', displayName: 'Email owner' },
+});
+check(
+  'the first email registration creates the account',
+  emailFirst.status === 200 && emailFirst.json?.created === true && emailFirst.json?.user?.email === 'same.person@example.com',
+  JSON.stringify(emailFirst.json?.user)
+);
+const emailUserId = emailFirst.json?.user?.id;
+
+const emailSecond = await request('/api/membership/register', {
+  method: 'POST',
+  headers: { 'X-Device-Id': 'dev-mail-0002' },
+  body: { email: 'same.person@example.com' },
+});
+check(
+  'a second installation with the same email reuses the account',
+  emailSecond.status === 200 &&
+    emailSecond.json?.created === false &&
+    emailSecond.json?.linked === true &&
+    emailSecond.json?.user?.id === emailUserId,
+  JSON.stringify(emailSecond.json?.user)
+);
+check(
+  'each installation still sees its own device id',
+  emailSecond.json?.user?.deviceId === 'DEV-MAIL-0002' &&
+    emailSecond.json?.user?.primaryDeviceId === 'DEV-MAIL-0001'
+);
+
+const emailMe = await request('/api/membership/me', { headers: { 'X-Device-Id': 'dev-mail-0002' } });
+check('the linked device resolves through /me', emailMe.status === 200 && emailMe.json?.user?.id === emailUserId);
+
+const emailUsers = await request('/admin/api/users?q=same.person@example.com', { cookie: adminCookie });
+check(
+  'the admin user list counts one account for the email',
+  emailUsers.status === 200 && emailUsers.json?.total === 1 && emailUsers.json?.items?.[0]?.email === 'same.person@example.com',
+  `total=${emailUsers.json?.total}`
+);
+
+const emailDetail = await request(`/admin/api/users/${emailUserId}`, { cookie: adminCookie });
+check(
+  'the account detail lists both linked installations',
+  emailDetail.status === 200 &&
+    emailDetail.json?.user?.devices?.includes('DEV-MAIL-0001') &&
+    emailDetail.json?.user?.devices?.includes('DEV-MAIL-0002'),
+  JSON.stringify(emailDetail.json?.user?.devices)
+);
+
+const emailConflict = await request('/api/membership/register', {
+  method: 'POST',
+  headers: { 'X-Device-Id': 'dev-test-0001' },
+  body: { email: 'same.person@example.com' },
+});
+check(
+  'a device cannot be stolen by another account email',
+  emailConflict.status === 409 && emailConflict.json?.error?.code === 'email_conflict'
+);
+
 /* =========================================================== 3. REQUEST */
 section('3) Upgrade request and approval');
 
@@ -427,6 +490,45 @@ check('admin ledger lists every closed trade', adminTrades.status === 200 && adm
 const adminOpen = await request('/admin/api/trades?status=OPEN', { cookie: adminCookie });
 check('admin ledger lists the open trade', adminOpen.status === 200 && adminOpen.json?.total === 1);
 
+await persistence.saveStrategyTrade({
+  id: 'st-test-open',
+  signal_id: 'st-test-open',
+  symbol: 'EURUSD',
+  side: 'SHORT',
+  volume: 0.5,
+  entry_price: 1.08,
+  stop_loss: 1.09,
+  atr: 0.0018,
+  risk_amount: 100,
+  legs: [
+    { name: '1', pct: 0.25, volume: 0.12, closed: false },
+    { name: '2', pct: 0.75, volume: 0.38, closed: false },
+  ],
+  status: 'OPEN',
+  broker_id: 'paper-1',
+  mode: 'paper',
+  opened_at: new Date(BASE).toISOString(),
+  opened_ms: BASE,
+});
+const strategyLedger = await request('/admin/api/strategy-trades?status=OPEN', { cookie: adminCookie });
+check(
+  'the strategy position ledger is queryable by the admin',
+  strategyLedger.status === 200 &&
+    strategyLedger.json?.count === 1 &&
+    strategyLedger.json?.items?.[0]?.symbol === 'EURUSD' &&
+    strategyLedger.json?.items?.[0]?.legs?.length === 2,
+  JSON.stringify(strategyLedger.json?.items?.map((x) => x.id))
+);
+
+const persistedOpen = await persistence.listOpenPositions(null);
+check(
+  'boot recovery reads the explicit strategy book',
+  persistedOpen.length === 1 &&
+    persistedOpen[0].signalId === 'st-test-open' &&
+    persistedOpen[0].legs?.length === 2,
+  JSON.stringify(persistedOpen.map((x) => x.signalId))
+);
+
 const adminOverview = await request('/admin/api/overview', { cookie: adminCookie });
 check(
   'overview counters match the ledger',
@@ -469,6 +571,20 @@ check('banned device cannot request an upgrade', bannedRequest.status === 403);
 
 const meBanned = await request('/api/membership/me', { headers: { 'X-Device-Id': deviceId } });
 check('device can still see its own ban state', meBanned.status === 200 && meBanned.json?.user?.status === 'BANNED');
+
+const emailBan = await request(`/admin/api/users/${emailUserId}`, {
+  method: 'PATCH',
+  cookie: adminCookie,
+  body: { status: 'BANNED' },
+});
+check('the shared email account can be banned', emailBan.status === 200 && emailBan.json?.user?.status === 'BANNED');
+const sharedBanned = await request('/api/trades/history', { headers: { 'X-Device-Id': 'dev-mail-0002' } });
+check('a ban applies to every linked installation', sharedBanned.status === 403 && sharedBanned.json?.error?.code === 'banned');
+await request(`/admin/api/users/${emailUserId}`, {
+  method: 'PATCH',
+  cookie: adminCookie,
+  body: { status: 'ACTIVE' },
+});
 
 const unban = await request(`/admin/api/users/${userId}`, {
   method: 'PATCH',

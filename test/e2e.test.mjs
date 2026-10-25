@@ -35,6 +35,11 @@ const APP = `http://127.0.0.1:${APP_PORT}`;
 /* The server child inherits this environment, so both processes agree on the
  * ring size. Keep the fallback in sync with env.js. */
 const RING = Number(process.env.MAX_CANDLES || 300);
+/* The child runs with MARKET_HOURS_OVERRIDE=open so the feed pipeline is
+ * exercisable on any calendar day. That intentionally disables the weekend
+ * filter in this process tree; the weekly close/reopen edges are asserted by
+ * aiSignal.test.mjs instead. */
+const WEEKEND_FILTER_INERT = true;
 
 /* ------------------------------------------------------------------ utils */
 let passed = 0;
@@ -125,6 +130,9 @@ const child = spawn(process.execPath, ['server.js'], {
     ADMIN_SESSION_SECRET: 'e2e-session-secret',
     MEMBERSHIP_ENABLED: 'true',
     FREE_HISTORY_DAYS: '7',
+    // The feed must run even when the real calendar is on a weekend. The unit
+    // suites still exercise the real weekly close/reopen edges.
+    MARKET_HOURS_OVERRIDE: 'open',
     // Keep the log readable — the engine is chatty by design.
     LOG_LEVEL: process.env.LOG_LEVEL ?? 'info',
   },
@@ -170,10 +178,13 @@ check(
   'per-series ring size'
 );
 check(
-  'no series contains a fake weekend candle',
-  Object.values((await get('/api/snapshot')).series).every((s) =>
-    s.candles.every((c) => !isWeekendBar(c.time))
-  )
+  WEEKEND_FILTER_INERT
+    ? 'weekend-bar filtering is covered by the unit suite (E2E is forced-open)'
+    : 'no series contains a fake weekend candle',
+  WEEKEND_FILTER_INERT ||
+    Object.values((await get('/api/snapshot')).series).every((s) =>
+      s.candles.every((c) => !isWeekendBar(c.time))
+    )
 );
 check('D1 series exist for the 50-day Donchian', (await get('/api/snapshot')).series['XAUUSD|86400'] !== undefined);
 
@@ -196,8 +207,10 @@ check(
   `got ${xau.candles.length}`
 );
 check(
-  'REST candles contain no weekend bars',
-  xau.candles.every((c) => !isWeekendBar(c.time))
+  WEEKEND_FILTER_INERT
+    ? 'weekend-bar filtering is covered by the unit suite (E2E is forced-open)'
+    : 'REST candles contain no weekend bars',
+  WEEKEND_FILTER_INERT || xau.candles.every((c) => !isWeekendBar(c.time))
 );
 check('candles are ascending by time', xau.candles.every((c, i, a) => i === 0 || c.time > a[i - 1].time));
 check('candles sit on the 900s grid', xau.candles.every((c) => c.time % 900 === 0));
@@ -414,7 +427,7 @@ check(
   `candle ring still within the ${RING}-candle cap after reconnect`,
   ringAfter.length > 100 &&
     ringAfter.length <= RING &&
-    ringAfter.every((c) => !isWeekendBar(c.time)),
+    (WEEKEND_FILTER_INERT || ringAfter.every((c) => !isWeekendBar(c.time))),
   `got ${ringAfter.length}`
 );
 

@@ -39,6 +39,7 @@
 import { AiSignalService } from './aiSignal.js';
 import { KeyPool } from './keyPool.js';
 import { SYMBOL_SPECS } from '../config/db.js';
+import { isMarketOpen, nextMarketOpenAt } from './marketSession.js';
 import { createLogger } from './logger.js';
 
 const log = createLogger('ai');
@@ -74,14 +75,29 @@ export class AiAnalystManager {
    * @param {object} [deps.telegram]    Telegram gateway handle
    * @param {Function} [deps.fetchFn]   injected fetch, for tests
    * @param {object} [deps.persistence] SupabaseService for the durable trade ledger
+   * @param {Function} [deps.marketOpenFn] injectable market-hours predicate
+   * @param {Function} [deps.nextMarketOpenFn] injectable next-open calculation
    */
-  constructor({ market, dispatcher, env, news = null, telegram = null, fetchFn = null, persistence = null }) {
+  constructor({
+    market,
+    dispatcher,
+    env,
+    news = null,
+    telegram = null,
+    fetchFn = null,
+    persistence = null,
+    marketOpenFn = isMarketOpen,
+    nextMarketOpenFn = nextMarketOpenAt,
+  }) {
     this.env = env;
     this.cfg = env.ai;
     this.market = market;
     this.dispatcher = dispatcher;
     this.news = news;
     this.persistence = persistence;
+    /** Wall-clock gate: no new analysis, signals or trades outside the FX week. */
+    this.marketOpenFn = marketOpenFn;
+    this.nextMarketOpenFn = nextMarketOpenFn;
     /** Symbols whose open trade was recovered from the database this boot. */
     this.restored = [];
 
@@ -266,10 +282,13 @@ export class AiAnalystManager {
     }
 
     const cooldownMs = this.cooldownRemainingMs();
+    const open = this.marketOpenFn();
 
     return {
       enabled: this.enabled,
       configured: this.configured,
+      marketOpen: open,
+      nextMarketOpenAt: open ? null : new Date(this.nextMarketOpenFn()).toISOString(),
       multiSymbol: true,
       symbols: [...this.symbols],
       provider: this.cfg.PROVIDER,
@@ -314,6 +333,19 @@ export class AiAnalystManager {
   async run(reason = 'schedule') {
     if (!this.enabled) return { ok: false, error: 'disabled', reason };
     if (this.running) return { ok: false, error: 'busy', reason };
+
+    // The FX/metals week ends on Friday and resumes on Sunday evening. Skipping
+    // the cycle here stops new trade ideas, Telegram cards and SSE messages
+    // while the market is closed; an already-open position is still managed by
+    // its tick-level stop/target handler.
+    if (!this.marketOpenFn()) {
+      return {
+        ok: false,
+        error: 'market-closed',
+        reason,
+        nextOpenAt: new Date(this.nextMarketOpenFn()).toISOString(),
+      };
+    }
 
     const cooldown = this.cooldownRemainingMs();
     if (cooldown > 0 && reason !== 'manual') {
@@ -372,6 +404,7 @@ export class AiAnalystManager {
   #aggregateError(results) {
     if (results.length === 0) return 'no-symbols';
     if (results.every((r) => r.error === 'disabled')) return 'disabled';
+    if (results.every((r) => r.error === 'market-closed')) return 'market-closed';
     if (results.some((r) => r.error === 'rate-limited')) return 'rate-limited';
     if (results.every((r) => r.error === 'insufficient-data')) return 'insufficient-data';
     return 'all-failed';
@@ -449,6 +482,20 @@ export class AiAnalystManager {
 
   #scheduleNext() {
     if (this.stopped || this.timer) return;
+
+    // While the market is closed there is nothing to analyse and no trade that
+    // should be published. Sleep until the Sunday reopen instead of running a
+    // fruitless catch-up every few minutes for the whole weekend.
+    if (!this.marketOpenFn()) {
+      const nextOpen = this.nextMarketOpenFn();
+      const delay = Math.max(1_000, nextOpen - Date.now() + 5_000);
+      log.info(
+        `AI analyst paused — FX/metals market is closed; resuming at ${new Date(nextOpen).toISOString()}`
+      );
+      this.timer = setTimeout(() => this.#tick('schedule'), delay);
+      this.timer.unref?.();
+      return;
+    }
 
     const failed = this.lastResults.length > 0 && !this.lastResults.some((r) => r.ok);
     const cooling = this.cooldownRemainingMs() > 0;

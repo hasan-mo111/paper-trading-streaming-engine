@@ -33,6 +33,7 @@ export const PLAN_DAYS = Object.freeze({ MONTHLY: 30, YEARLY: 365 });
 export const CONTACT_METHODS = Object.freeze(['telegram', 'whatsapp', 'email', 'other']);
 
 const DEVICE_RE = /^[A-Z0-9._:-]{4,64}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const DAY_MS = 86_400_000;
 
 /** Coerce and validate a device id. Returns null for junk. */
@@ -40,6 +41,18 @@ export function normaliseDeviceId(raw) {
   if (raw == null) return null;
   const value = String(raw).trim().toUpperCase();
   return DEVICE_RE.test(value) ? value : null;
+}
+
+/**
+ * Canonical email identity. Lower-casing is deliberate: `Alice@Example.com`
+ * and `alice@example.com` are the same person and must map to one account.
+ * Returns null for blank/invalid input.
+ */
+export function normaliseEmail(raw) {
+  if (raw == null) return null;
+  const value = String(raw).trim().toLowerCase();
+  if (!value || value.length > 254) return null;
+  return EMAIL_RE.test(value) ? value : null;
 }
 
 /** Allowed plan or the supplied fallback. */
@@ -129,13 +142,21 @@ export class AppUserService {
     };
   }
 
-  /** What the app is allowed to see for this account. */
-  publicUser(user) {
+  /**
+   * What the app is allowed to see for this account.
+   *
+   * `deviceId` is overridden with the installation that made the request when
+   * one account is linked to several devices. `primaryDeviceId` remains the
+   * canonical row value used by the admin console.
+   */
+  publicUser(user, { deviceId = null } = {}) {
     if (!user) return null;
     const plan = effectivePlan(user, this.now());
     return {
       id: user.id,
-      deviceId: user.device_id,
+      deviceId: deviceId ?? user.device_id,
+      primaryDeviceId: user.device_id,
+      email: user.email ?? null,
       displayName: user.display_name ?? null,
       contactMethod: user.contact_method ?? null,
       contactValue: user.contact_value ?? null,
@@ -157,6 +178,8 @@ export class AppUserService {
     return {
       id: null,
       deviceId,
+      primaryDeviceId: deviceId,
+      email: null,
       plan: APP_PLANS.FREE,
       storedPlan: APP_PLANS.FREE,
       status: APP_STATUS.ACTIVE,
@@ -201,13 +224,57 @@ export class AppUserService {
   /** One account by primary key, in the public API shape. */
   async getUser(id) {
     const row = await this.persistence.getAppUser(id);
+    if (!row) return null;
     // `note` is operator-only; publicUser() is also used by /api/membership/me,
     // so it must not leak the internal note into the APK response.
-    return row ? { ...this.publicUser(row), note: row.note ?? null } : null;
+    let devices = null;
+    try {
+      devices = await this.persistence.listAppUserDevices?.(row.id);
+    } catch {
+      devices = null;
+    }
+    return {
+      ...this.publicUser(row),
+      note: row.note ?? null,
+      devices: Array.isArray(devices) && devices.length ? devices : [row.device_id],
+    };
   }
 
-  /** Idempotent registration from the APK. */
-  async register({ deviceId, displayName = null, contactMethod = null, contactValue = null } = {}) {
+  /** Every installation linked to one account. */
+  async devicesForUser(id) {
+    if (!id) return [];
+    let row = null;
+    let devices = null;
+    try {
+      row = await this.persistence.getAppUser?.(id);
+    } catch {
+      row = null;
+    }
+    try {
+      devices = await this.persistence.listAppUserDevices?.(id);
+    } catch {
+      devices = null;
+    }
+    const out = Array.isArray(devices) ? devices.filter(Boolean) : [];
+    if (row?.device_id && !out.includes(row.device_id)) out.unshift(row.device_id);
+    return [...new Set(out)];
+  }
+
+  /**
+   * Idempotent registration from the APK.
+   *
+   * A stable device id is still the transport identity, but an email is a
+   * stronger account identity: two installations that present the same address
+   * resolve to ONE app_users row and share plan/status/history. The second
+   * device is recorded in app_user_devices, so both continue to work.
+   */
+  async register({
+    deviceId,
+    email = null,
+    displayName = null,
+    contactMethod = null,
+    contactValue = null,
+  } = {}) {
     const id = normaliseDeviceId(deviceId);
     if (!id) {
       const error = new Error('deviceId must be 4–64 characters (A–Z, 0–9, . _ : -)');
@@ -222,23 +289,73 @@ export class AppUserService {
     const contact = text(contactValue, 200);
     const name = text(displayName, 80);
 
-    let user = await this.persistence.getAppUserByDevice(id);
-    let created = false;
+    // Accept an explicit `email`, or derive it from the contact fields. The
+    // APK can therefore deduplicate without a new endpoint or field.
+    const rawEmail = email ?? (method === 'email' ? contact : null);
+    const canonicalEmail = rawEmail == null || String(rawEmail).trim() === '' ? null : normaliseEmail(rawEmail);
+    if (rawEmail != null && String(rawEmail).trim() && !canonicalEmail) {
+      const error = new Error('email must be a valid address');
+      error.status = 400;
+      error.code = 'bad_email';
+      throw error;
+    }
 
-    if (!user) {
+    let user = null;
+    let created = false;
+    let linked = false;
+
+    if (canonicalEmail) {
+      user = await this.persistence.getAppUserByEmail(canonicalEmail);
+      if (user) {
+        const sameDevice = await this.persistence.getAppUserByDevice(id);
+        if (sameDevice && sameDevice.id !== user.id) {
+          const error = new Error('this device is already linked to another account');
+          error.status = 409;
+          error.code = 'email_conflict';
+          throw error;
+        }
+        linked = await this.persistence.linkAppUserDevice(user.id, id);
+        if (!linked) {
+          const error = new Error('this device is already linked to another account');
+          error.status = 409;
+          error.code = 'email_conflict';
+          throw error;
+        }
+      }
+    }
+
+    if (!user) user = await this.persistence.getAppUserByDevice(id);
+
+    if (user) {
+      if (
+        canonicalEmail &&
+        user.email &&
+        user.email !== canonicalEmail
+      ) {
+        const error = new Error('this device is already linked to another email');
+        error.status = 409;
+        error.code = 'email_conflict';
+        throw error;
+      }
+      const patch = { last_seen_at: new Date(this.now()).toISOString() };
+      if (name) patch.display_name = name;
+      if (method) patch.contact_method = method;
+      if (contact) patch.contact_value = contact;
+      if (canonicalEmail && !user.email) patch.email = canonicalEmail;
+      user = (await this.persistence.updateAppUser(user.id, patch)) ?? user;
+      if (canonicalEmail) await this.persistence.linkAppUserDevice(user.id, id);
+    } else {
       user = await this.persistence.createAppUser({
         deviceId: id,
+        email: canonicalEmail,
         displayName: name,
         contactMethod: method,
         contactValue: contact,
       });
       created = Boolean(user);
-    } else {
-      const patch = { last_seen_at: new Date(this.now()).toISOString() };
-      if (name) patch.display_name = name;
-      if (method) patch.contact_method = method;
-      if (contact) patch.contact_value = contact;
-      user = (await this.persistence.updateAppUser(user.id, patch)) ?? user;
+      // A concurrent registration can race us to the same email; make sure this
+      // device is linked even when createAppUser returned the winner.
+      if (user && canonicalEmail) await this.persistence.linkAppUserDevice(user.id, id);
     }
 
     if (!user) {
@@ -248,7 +365,7 @@ export class AppUserService {
       throw error;
     }
 
-    return { user, created };
+    return { user, created, linked };
   }
 
   /* -------------------------------------------------------------- requests */
@@ -257,7 +374,14 @@ export class AppUserService {
    * Record an upgrade request. The user contacts the operator out-of-band;
    * this row is what the admin console sees.
    */
-  async requestUpgrade({ deviceId, plan, contactMethod = null, contactValue = null, message = null } = {}) {
+  async requestUpgrade({
+    deviceId,
+    plan,
+    email = null,
+    contactMethod = null,
+    contactValue = null,
+    message = null,
+  } = {}) {
     const id = normaliseDeviceId(deviceId);
     if (!id) {
       const error = new Error('deviceId is required');
@@ -274,7 +398,14 @@ export class AppUserService {
       throw error;
     }
 
-    let user = await this.getByDevice(id, { create: true, touch: true });
+    // Registration is the single place that resolves email/device identity, so
+    // a user can ask for an upgrade from either linked installation without
+    // creating a duplicate account.
+    const registered = await this.register({ deviceId: id, email, contactMethod, contactValue });
+    let user = registered.user;
+    if (user && !registered.created) {
+      user = await this.getByDevice(id, { create: false, touch: true });
+    }
     if (!user) {
       const error = new Error('could not create the device account');
       error.status = 503;
@@ -288,10 +419,10 @@ export class AppUserService {
       throw error;
     }
 
-    // One pending request per device is enough. Return it instead of letting a
-    // double tap create a second row the admin has to reconcile.
+    // One pending request per account is enough, whichever linked device sent
+    // it. Return it instead of letting a double tap create a second row.
     const pending = await this.persistence.listMembershipRequests({ status: 'PENDING', limit: 500 });
-    const existing = pending.find((r) => r.device_id === id);
+    const existing = pending.find((r) => r.user_id === user.id || r.device_id === id);
     if (existing) return { request: existing, duplicate: true, user };
 
     const cooldownKey = `${id}|${requestedPlan}`;
@@ -351,8 +482,11 @@ export class AppUserService {
   async listRequestsForDevice(deviceId, limit = 20) {
     const id = normaliseDeviceId(deviceId);
     if (!id) return [];
+    const user = await this.getByDevice(id, { create: false, touch: false });
     const rows = await this.persistence.listMembershipRequests({ limit: 500 });
-    return rows.filter((r) => r.device_id === id).slice(0, limit);
+    return rows
+      .filter((r) => r.device_id === id || (user?.id && r.user_id === user.id))
+      .slice(0, limit);
   }
 
   /* ------------------------------------------------------------ admin views */
@@ -364,7 +498,7 @@ export class AppUserService {
     let items = rows.map((u) => this.publicUser(u)).filter(Boolean);
     if (needle) {
       items = items.filter((u) =>
-        [u.deviceId, u.displayName, u.contactValue, u.contactMethod]
+        [u.deviceId, u.primaryDeviceId, u.email, u.displayName, u.contactValue, u.contactMethod]
           .filter(Boolean)
           .some((v) => String(v).toLowerCase().includes(needle))
       );
@@ -500,6 +634,26 @@ export class AppUserService {
       out.contact_method = method || null;
     }
     if (patch.contactValue !== undefined) out.contact_value = text(patch.contactValue, 200);
+    if (patch.email !== undefined) {
+      const raw = text(patch.email, 254);
+      const email = raw ? normaliseEmail(raw) : null;
+      if (raw && !email) {
+        const error = new Error('email must be a valid address');
+        error.status = 400;
+        error.code = 'bad_email';
+        throw error;
+      }
+      if (email) {
+        const owner = await this.persistence.getAppUserByEmail(email);
+        if (owner && owner.id !== user.id) {
+          const error = new Error('that email already belongs to another account');
+          error.status = 409;
+          error.code = 'email_in_use';
+          throw error;
+        }
+      }
+      out.email = email;
+    }
     if (patch.note !== undefined) out.note = text(patch.note, 1_000);
     if (patch.status !== undefined) {
       const status = String(patch.status ?? '').trim().toUpperCase();

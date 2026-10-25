@@ -53,6 +53,7 @@ import {
 } from '../config/db.js';
 import { atr as calcAtr, donchian, trailingChannel, profitPoints } from './indicatorCalc.js';
 import { PLANS } from '../middleware/quotaManager.js';
+import { isMarketOpen } from '../services/marketSession.js';
 import { createLogger } from '../services/logger.js';
 
 const log = createLogger('strategy');
@@ -86,6 +87,7 @@ export class StrategyEngine {
     env = ENV,
     onDecision = () => {},
     userId = null,
+    marketOpenFn = isMarketOpen,
   }) {
     this.market = market;
     this.broker = broker;
@@ -96,6 +98,7 @@ export class StrategyEngine {
     this.env = env;
     this.onDecision = onDecision;
     this.userId = userId;
+    this.marketOpenFn = marketOpenFn;
 
     const s = env.strategy;
     this.symbols = (s.SYMBOLS.length ? s.SYMBOLS : SYMBOLS).map(String).map((x) => x.toUpperCase());
@@ -119,6 +122,7 @@ export class StrategyEngine {
       skippedStale: 0,
       skippedCooldown: 0,
       skippedPosition: 0,
+      skippedMarketClosed: 0,
       errors: 0,
       brokerErrors: 0,
     };
@@ -382,6 +386,16 @@ export class StrategyEngine {
       return decision;
     }
 
+    // No new risk while the weekly session is closed. The feed may replay a
+    // Friday quote or the engine may sweep on a Sunday restart; neither is a
+    // reason to publish a trade idea or place an order.
+    if (!this.marketOpenFn()) {
+      decision.reason = 'market closed (weekend)';
+      this.counters.skippedMarketClosed += 1;
+      this.#record(decision);
+      return decision;
+    }
+
     // Cooldown after the last entry on this symbol.
     if (!force && Date.now() - st.lastEntryAt < cfg.COOLDOWN_MS) {
       decision.reason = 'entry cooldown active';
@@ -581,26 +595,33 @@ export class StrategyEngine {
       const totalVolume = Number(row.volume) || 0;
       if (!(totalVolume > 0)) continue;
 
-      this.positions.set(symbol, {
-        signalId: row.signalId ?? row.id,
-        brokerId: String(row.id),
+      const position = {
+        signalId: row.signalId ?? row.signal_id ?? row.id,
+        brokerId: String(row.broker_id ?? row.brokerId ?? row.id),
         symbol,
         side: row.side,
         volume: totalVolume,
-        entryPrice: Number(row.entry_price),
-        currentPrice: Number(row.entry_price),
+        entryPrice: Number(row.entry_price ?? row.entryPrice),
+        currentPrice: Number(row.entry_price ?? row.entryPrice),
         stop: row.stop_loss == null ? null : Number(row.stop_loss),
         atr: row.atr == null ? null : Number(row.atr),
+        riskAmount: row.risk_amount == null ? null : Number(row.risk_amount),
         legs,
-        openedAt: new Date(row.created_at ?? Date.now()).getTime(),
+        openedAt: new Date(row.opened_at ?? row.created_at ?? Date.now()).getTime(),
         unrealised: 0,
         mode: row.mode ?? this.env.broker.MODE,
         restored: true,
-      });
+      };
+      this.positions.set(symbol, position);
+
+      // Backfill the durable position ledger when this row came from the older
+      // execution-audit recovery path. It is idempotent for rows that were
+      // already loaded from strategy_trades.
+      this.#persistStrategy(position);
 
       this.symbolState(symbol).lastEntryAt = Date.now();
       restored += 1;
-      log.warn(`restored open ${symbol} ${row.side} ${totalVolume} from the audit log`);
+      log.warn(`restored open ${symbol} ${row.side} ${totalVolume} from the position ledger`);
     }
 
     if (restored > 0) {
@@ -664,6 +685,7 @@ export class StrategyEngine {
         if (res.ok) {
           st.lastTrailSendAt = now;
           st.lastTrailSl = position.stop;
+          this.#persistStrategy(position);
           this.dispatcher?.trailing({
             symbol,
             side: position.side,
@@ -913,6 +935,7 @@ export class StrategyEngine {
       currentPrice: p.entryPrice,
       stop: p.sl ?? sl,
       atr: payload.atr,
+      riskAmount: payload.riskAmount ?? null,
       legs,
       openedAt: Date.now(),
       unrealised: 0,
@@ -945,6 +968,7 @@ export class StrategyEngine {
       atr: payload.atr,
       risk_amount: payload.riskAmount,
     });
+    this.#persistStrategy(position);
 
     void decision;
     return { ok: true, position, brokerResult: p };
@@ -1006,12 +1030,79 @@ export class StrategyEngine {
 
     if (!(position.volume > 0)) {
       this.positions.delete(symbol);
+      const initialVolume =
+        position.legs?.reduce((sum, l) => sum + (Number(l.volume) || 0), 0) || position.volume;
+      this.#persistStrategy(
+        {
+          ...position,
+          volume: initialVolume,
+          exitPrice: res.exitPrice,
+          exitReason: reason,
+          profit: res.profit,
+          closedAt: Date.now(),
+        },
+        { closed: true }
+      );
       log.info(`${symbol} position fully closed · ${reason} · net ${res.profit}`);
     } else {
+      this.#persistStrategy(position);
       log.info(`${symbol} leg ${leg?.name ?? 'all'} closed ${res.closedVolume} · ${res.remainingVolume} left`);
     }
 
     return res;
+  }
+
+  /* ======================================================================== */
+  /*  DURABLE POSITION LEDGER                                                */
+  /* ======================================================================== */
+
+  /**
+   * Mirror the live position book into `strategy_trades`.
+   *
+   * The execution audit remains append-only. This table is the *current* open
+   * book, so a restart can restore the exact legs/stop it left behind without
+   * reconstructing state from a sequence of audit rows. The write is
+   * fire-and-forget: a database hiccup must never abort a trade the tick
+   * handler is already managing.
+   *
+   * @param {object} position
+   * @param {{closed?: boolean}} [opts]
+   */
+  #persistStrategy(position, { closed = false } = {}) {
+    if (!this.persistence?.saveStrategyTrade || !position) return;
+    const id = String(position.signalId ?? position.brokerId ?? '');
+    if (!id) return;
+    const openedMs = Number(position.openedAt) || Date.now();
+    const closedMs = closed ? Number(position.closedAt) || Date.now() : null;
+
+    const row = {
+      id,
+      signal_id: String(position.signalId ?? id),
+      user_id: this.userId ?? null,
+      symbol: position.symbol,
+      side: position.side,
+      volume: Number(position.volume) || 0,
+      entry_price: Number(position.entryPrice),
+      stop_loss: position.stop == null ? null : Number(position.stop),
+      atr: position.atr == null ? null : Number(position.atr),
+      risk_amount: position.riskAmount == null ? null : Number(position.riskAmount),
+      legs: Array.isArray(position.legs) ? position.legs.map((l) => ({ ...l })) : [],
+      status: closed ? 'CLOSED' : 'OPEN',
+      exit_price: closed && position.exitPrice != null ? Number(position.exitPrice) : null,
+      exit_reason: closed ? position.exitReason ?? null : null,
+      profit: closed && position.profit != null ? Number(position.profit) : null,
+      broker_id: position.brokerId == null ? null : String(position.brokerId),
+      mode: position.mode ?? this.env.broker.MODE,
+      opened_at: new Date(openedMs).toISOString(),
+      opened_ms: openedMs,
+      closed_at: closedMs ? new Date(closedMs).toISOString() : null,
+      closed_ms: closedMs,
+      meta: {},
+    };
+
+    Promise.resolve(this.persistence.saveStrategyTrade(row)).catch((e) =>
+      log.warn('strategy position was not persisted:', e.message)
+    );
   }
 
   /* ======================================================================== */
@@ -1089,6 +1180,7 @@ export class StrategyEngine {
       },
       brokerMode: this.env.broker.MODE,
       executionEnabled: this.env.strategy.EXECUTION_ENABLED,
+      marketOpen: this.marketOpenFn(),
       counters: { ...this.counters },
       positions: this.openPositions(),
       indicators: Object.fromEntries(

@@ -54,6 +54,7 @@ function intParam(raw, fallback, min, max) {
  * @param {import('../services/supabase.js').SupabaseService} deps.persistence
  * @param {object} [deps.env]
  * @param {object} [deps.ai]        AI manager (overview only)
+ * @param {object} [deps.engine]    strategy engine (open position summary)
  * @param {Function} [deps.notifyMembership]  (user, kind, ctx) → notification result
  * @param {Function} [deps.healthProvider]
  */
@@ -64,6 +65,7 @@ export function mountAdminRoutes({
   persistence,
   env = ENV,
   ai = null,
+  engine = null,
   notifyMembership = null,
   healthProvider = null,
 }) {
@@ -156,6 +158,20 @@ export function mountAdminRoutes({
     auth,
     wrap(async (_req, res) => {
       const stats = await membership.stats();
+      const strategyOpenTrades = (engine?.openPositions?.() ?? []).map((p) => ({
+        id: p.signalId ?? p.brokerId ?? null,
+        source: 'strategy',
+        symbol: p.symbol,
+        side: p.side,
+        volume: p.volume,
+        entry: p.entryPrice,
+        stopLoss: p.stop,
+        legs: p.legs,
+        openedAt: p.openedAt ? new Date(p.openedAt).toISOString() : null,
+        restored: Boolean(p.restored),
+      }));
+      stats.strategyOpenTrades = strategyOpenTrades;
+      stats.trades.openTotal = stats.trades.open + strategyOpenTrades.length;
       const health = healthProvider ? healthProvider() : null;
       res.json({
         ok: true,
@@ -325,6 +341,28 @@ export function mountAdminRoutes({
       const offset = intParam(req.query.offset, 0, 0, 100_000);
       const payload = await membership.listTrades({ status, symbol, limit, offset });
       res.json({ ok: true, ...payload, serverTime: new Date().toISOString() });
+    })
+  );
+
+  /** Permanent strategy-position ledger (separate from the AI ledger). */
+  router.get(
+    '/admin/api/strategy-trades',
+    auth,
+    wrap(async (req, res) => {
+      const status = req.query.status ? String(req.query.status).toUpperCase() : null;
+      const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : null;
+      const limit = intParam(req.query.limit, 50, 1, 200);
+      const offset = intParam(req.query.offset, 0, 0, 100_000);
+      const rows = await persistence.listStrategyTrades({ status, symbol, limit, offset });
+      res.json({
+        ok: true,
+        count: rows.length,
+        limit,
+        offset,
+        hasMore: rows.length === limit,
+        items: rows,
+        serverTime: new Date().toISOString(),
+      });
     })
   );
 

@@ -107,6 +107,9 @@ export class SupabaseService {
     this.flushing = false;
     this.stats = { queued: 0, flushed: 0, rows: 0, errors: 0, lastFlushError: null, lastFlushAt: 0 };
 
+    /** id → tail promise: keeps open/trail/close upserts on one row in order. */
+    this.strategyWrites = new Map();
+
     /**
      * Distinct error messages already explained in the log. Prevents the same
      * line repeating every flush interval when a credential is wrong.
@@ -119,9 +122,10 @@ export class SupabaseService {
       daily: new Map(), // `${userId}|${day}` → count
       profiles: new Map(), // userId → profile
       appUsers: new Map(), // id → app user
-      appUsersByDevice: new Map(), // device_id → id
+      appUsersByDevice: new Map(), // device_id → id (primary + linked devices)
       membershipRequests: new Map(), // id → request
       aiTrades: new Map(), // id → AI trade
+      strategyTrades: new Map(), // id → strategy position ledger row
       executions: [],
       chatEvents: [],
     };
@@ -662,6 +666,7 @@ export class SupabaseService {
     return {
       id: String(row.id),
       device_id: String(row.device_id ?? ''),
+      email: row.email ? String(row.email).trim().toLowerCase() : null,
       display_name: row.display_name ?? null,
       contact_method: row.contact_method ?? null,
       contact_value: row.contact_value ?? null,
@@ -688,7 +693,9 @@ export class SupabaseService {
       )[0];
       if (oldest) {
         this.local.appUsers.delete(oldest.id);
-        this.local.appUsersByDevice.delete(oldest.device_id);
+        for (const [device, id] of this.local.appUsersByDevice) {
+          if (id === oldest.id) this.local.appUsersByDevice.delete(device);
+        }
       }
     }
     return user;
@@ -708,7 +715,7 @@ export class SupabaseService {
     return cached ?? null;
   }
 
-  /** One APK account by its stable device id. */
+  /** One APK account by its stable device id (primary or linked device). */
   async getAppUserByDevice(deviceId) {
     if (!deviceId) return null;
     const cachedId = this.local.appUsersByDevice.get(deviceId);
@@ -720,20 +727,122 @@ export class SupabaseService {
       `getAppUserByDevice(${deviceId})`
     );
     if (row) return this.#cacheAppUser(row);
+
+    // A second installation can use the same email. It is linked through
+    // app_user_devices and resolves to the one canonical account row.
+    const link = await this.#query(
+      this.client.from('app_user_devices').select('user_id').eq('device_id', deviceId).maybeSingle(),
+      `getAppUserDeviceLink(${deviceId})`
+    );
+    if (link?.user_id) {
+      const linked = await this.getAppUser(link.user_id);
+      if (linked) this.local.appUsersByDevice.set(deviceId, linked.id);
+      return linked;
+    }
     return cached ?? null;
   }
 
-  /** Insert a new device account. Duplicate device ids return the existing row. */
-  async createAppUser({ deviceId, displayName = null, contactMethod = null, contactValue = null }) {
+  /** One APK account by its normalized email address. */
+  async getAppUserByEmail(email) {
+    const value = String(email ?? '').trim().toLowerCase();
+    if (!value) return null;
+    const local = [...this.local.appUsers.values()].find((u) => u.email === value) ?? null;
+    if (!this.client) return local;
+
+    const row = await this.#query(
+      this.client.from('app_users').select('*').eq('email', value).maybeSingle(),
+      `getAppUserByEmail(${value})`
+    );
+    if (row) return this.#cacheAppUser(row);
+    return local;
+  }
+
+  /**
+   * Link an additional installation to the same account. Returns false when the
+   * device already belongs to a different account, so an email cannot hijack
+   * another user's identity.
+   */
+  async linkAppUserDevice(userId, deviceId) {
+    if (!userId || !deviceId) return false;
+
+    if (!this.client) {
+      const existing = this.local.appUsersByDevice.get(deviceId);
+      if (existing && existing !== userId) return false;
+      this.local.appUsersByDevice.set(deviceId, userId);
+      return true;
+    }
+
+    const existing = await this.#query(
+      this.client.from('app_user_devices').select('user_id').eq('device_id', deviceId).maybeSingle(),
+      `linkAppUserDevice(${deviceId})`
+    );
+    if (existing?.user_id && existing.user_id !== userId) return false;
+
+    const now = new Date().toISOString();
+    const row = await this.#query(
+      this.client
+        .from('app_user_devices')
+        .upsert({ device_id: deviceId, user_id: userId, last_seen_at: now }, { onConflict: 'device_id' })
+        .select('*')
+        .maybeSingle(),
+      `linkAppUserDevice(${deviceId})`
+    );
+    if (row) {
+      this.local.appUsersByDevice.set(deviceId, userId);
+      return true;
+    }
+    return Boolean(existing?.user_id);
+  }
+
+  /** Every installation linked to one account (primary device first). */
+  async listAppUserDevices(userId) {
+    if (!userId) return [];
+    const user = this.local.appUsers.get(userId);
+    const local = [...this.local.appUsersByDevice.entries()]
+      .filter(([, id]) => id === userId)
+      .map(([device]) => device);
+    if (user?.device_id && !local.includes(user.device_id)) local.unshift(user.device_id);
+    if (!this.client) return [...new Set(local)];
+
+    const rows = await this.#query(
+      this.client
+        .from('app_user_devices')
+        .select('device_id')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: true }),
+      `listAppUserDevices(${userId})`
+    );
+    const devices = (rows ?? []).map((r) => String(r.device_id)).filter(Boolean);
+    if (user?.device_id && !devices.includes(user.device_id)) devices.unshift(user.device_id);
+    return [...new Set(devices.length ? devices : local)];
+  }
+
+  /** Insert a new device account. Duplicate device/email returns the existing row. */
+  async createAppUser({
+    deviceId,
+    email = null,
+    displayName = null,
+    contactMethod = null,
+    contactValue = null,
+  }) {
     if (!deviceId) return null;
     const now = new Date().toISOString();
+    const normalisedEmail = email ? String(email).trim().toLowerCase() : null;
 
     if (!this.client) {
       const existing = this.local.appUsersByDevice.get(deviceId);
       if (existing) return this.local.appUsers.get(existing) ?? null;
+      const byEmail = normalisedEmail
+        ? [...this.local.appUsers.values()].find((u) => u.email === normalisedEmail)
+        : null;
+      if (byEmail) {
+        this.local.appUsersByDevice.set(deviceId, byEmail.id);
+        return byEmail;
+      }
       const user = this.#cacheAppUser({
         id: randomUUID(),
         device_id: deviceId,
+        email: normalisedEmail,
         display_name: displayName,
         contact_method: contactMethod,
         contact_value: contactValue,
@@ -746,6 +855,7 @@ export class SupabaseService {
         created_at: now,
         updated_at: now,
       });
+      if (user) this.local.appUsersByDevice.set(deviceId, user.id);
       return user;
     }
 
@@ -754,6 +864,7 @@ export class SupabaseService {
         .from('app_users')
         .insert({
           device_id: deviceId,
+          email: normalisedEmail,
           display_name: displayName,
           contact_method: contactMethod,
           contact_value: contactValue,
@@ -767,10 +878,18 @@ export class SupabaseService {
         .maybeSingle(),
       `createAppUser(${deviceId})`
     );
-    if (row) return this.#cacheAppUser(row);
+    if (row) {
+      const user = this.#cacheAppUser(row);
+      await this.linkAppUserDevice(user.id, deviceId);
+      return user;
+    }
 
-    // The unique constraint means "already registered" is a normal outcome.
-    return this.getAppUserByDevice(deviceId);
+    // The unique constraints (device and email) mean "already registered" is a
+    // normal outcome, including a concurrent registration from another device.
+    const byEmail = normalisedEmail ? await this.getAppUserByEmail(normalisedEmail) : null;
+    const user = byEmail ?? (await this.getAppUserByDevice(deviceId));
+    if (user) await this.linkAppUserDevice(user.id, deviceId);
+    return user;
   }
 
   /** Patch an APK account (plan, ban, contact details, note). */
@@ -1039,6 +1158,141 @@ export class SupabaseService {
   }
 
   /* ======================================================================== */
+  /*  STRATEGY POSITION LEDGER — durable open/closed engine positions        */
+  /* ======================================================================== */
+
+  #normaliseStrategyTrade(row) {
+    if (!row?.id) return null;
+    return {
+      id: String(row.id),
+      signal_id: row.signal_id ? String(row.signal_id) : String(row.id),
+      user_id: row.user_id ?? null,
+      symbol: String(row.symbol ?? '').toUpperCase(),
+      side: String(row.side ?? '').toUpperCase(),
+      volume: Number(row.volume ?? 0),
+      entry_price: Number(row.entry_price),
+      stop_loss: row.stop_loss == null ? null : Number(row.stop_loss),
+      atr: row.atr == null ? null : Number(row.atr),
+      risk_amount: row.risk_amount == null ? null : Number(row.risk_amount),
+      legs: Array.isArray(row.legs) ? row.legs : [],
+      status: row.status === 'CLOSED' ? 'CLOSED' : 'OPEN',
+      exit_price: row.exit_price == null ? null : Number(row.exit_price),
+      exit_reason: row.exit_reason ?? null,
+      profit: row.profit == null ? null : Number(row.profit),
+      broker_id: row.broker_id == null ? null : String(row.broker_id),
+      mode: row.mode ?? null,
+      opened_at: row.opened_at ?? row.created_at ?? null,
+      opened_ms: row.opened_ms == null ? null : Number(row.opened_ms),
+      closed_at: row.closed_at ?? null,
+      closed_ms: row.closed_ms == null ? null : Number(row.closed_ms),
+      meta: row.meta && typeof row.meta === 'object' ? row.meta : {},
+      created_at: row.created_at ?? null,
+      updated_at: row.updated_at ?? null,
+    };
+  }
+
+  #cacheStrategyTrade(row) {
+    const trade = this.#normaliseStrategyTrade(row);
+    if (!trade) return null;
+    this.local.strategyTrades.set(trade.id, trade);
+    return trade;
+  }
+
+  /**
+   * Insert or update one strategy position. Called on open, trail and close.
+   *
+   * The local mirror is updated immediately (the engine reads it for status),
+   * while database writes for the same id are chained. That preserves the
+   * OPEN → trail → CLOSED order even though the tick path never awaits them.
+   */
+  saveStrategyTrade(row) {
+    if (!row?.id) return Promise.resolve(false);
+    const id = String(row.id);
+    const existing = this.local.strategyTrades.get(id);
+    const clean = {
+      ...row,
+      created_at: existing?.created_at ?? row.created_at,
+      updated_at: new Date().toISOString(),
+    };
+    this.#cacheStrategyTrade(clean);
+    if (!this.client) return Promise.resolve(true);
+
+    const previous = this.strategyWrites.get(id) ?? Promise.resolve();
+    const write = previous
+      .catch(() => {})
+      .then(async () => {
+        try {
+          const { created_at, ...payload } = clean;
+          const body = created_at ? { ...payload, created_at } : payload;
+          const { error } = await this.client
+            .from('strategy_trades')
+            .upsert(body, { onConflict: 'id' });
+          if (error) {
+            this.stats.errors += 1;
+            log.error('saveStrategyTrade failed:', error.message);
+            return false;
+          }
+          return true;
+        } catch (e) {
+          this.stats.errors += 1;
+          log.error('saveStrategyTrade failed:', e.message);
+          return false;
+        }
+      });
+    this.strategyWrites.set(id, write);
+    const cleanup = () => {
+      if (this.strategyWrites.get(id) === write) this.strategyWrites.delete(id);
+    };
+    write.then(cleanup, cleanup);
+    return write;
+  }
+
+  /** Open strategy positions, oldest first. */
+  async listOpenStrategyTrades({ userId = null } = {}) {
+    const local = [...this.local.strategyTrades.values()]
+      .filter((t) => t.status === 'OPEN' && (!userId || t.user_id === userId))
+      .sort((a, b) => String(a.opened_at ?? '').localeCompare(String(b.opened_at ?? '')));
+    if (!this.client) return local;
+
+    let q = this.client
+      .from('strategy_trades')
+      .select('*')
+      .eq('status', 'OPEN')
+      .order('opened_at', { ascending: true });
+    if (userId) q = q.eq('user_id', userId);
+    const rows = await this.#query(q, 'listOpenStrategyTrades');
+    if (!rows) return null;
+    return rows.map((r) => this.#cacheStrategyTrade(r)).filter(Boolean);
+  }
+
+  /** True when the ledger table exists and contains at least one row. */
+  async hasStrategyTradeLedger(userId = null) {
+    if (!this.client) return this.local.strategyTrades.size > 0;
+    let q = this.client.from('strategy_trades').select('id').limit(1);
+    if (userId) q = q.eq('user_id', userId);
+    const rows = await this.#query(q, 'hasStrategyTradeLedger');
+    return Array.isArray(rows) && rows.length > 0;
+  }
+
+  /** Closed (or all) strategy trades, newest first — admin/audit use. */
+  async listStrategyTrades({ status = null, symbol = null, limit = 100, offset = 0 } = {}) {
+    const local = [...this.local.strategyTrades.values()]
+      .filter((t) => (!status || t.status === status))
+      .filter((t) => (!symbol || t.symbol === symbol))
+      .sort((a, b) => String(b.opened_at ?? '').localeCompare(String(a.opened_at ?? '')))
+      .slice(offset, offset + limit);
+    if (!this.client) return local;
+
+    let q = this.client.from('strategy_trades').select('*').order('opened_at', { ascending: false });
+    if (status) q = q.eq('status', status);
+    if (symbol) q = q.eq('symbol', symbol);
+    q = q.range(offset, Math.max(offset, offset + limit - 1));
+    const rows = await this.#query(q, 'listStrategyTrades');
+    if (!rows) return local;
+    return rows.map((r) => this.#cacheStrategyTrade(r)).filter(Boolean);
+  }
+
+  /* ======================================================================== */
   /*  AUDIT — executions + chat-ops history                                  */
   /* ======================================================================== */
 
@@ -1062,15 +1316,15 @@ export class SupabaseService {
   /** Recent executions for a user, newest first. */
   async listExecutions(userId, limit = 25) {
     if (!this.client) return this.local.executions.filter((e) => e.user_id === userId).slice(-limit).reverse();
-    const rows = await this.#query(
-      this.client
-        .from('executions')
-        .select('*')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false })
-        .limit(limit),
-      `listExecutions(${userId})`
-    );
+    let q = this.client
+      .from('executions')
+      .select('*')
+      // The global engine records audit rows with user_id = null. PostgREST
+      // needs `is.null` for that case; `eq.null` is not a valid UUID filter.
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    q = userId ? q.eq('user_id', userId) : q.is('user_id', null);
+    const rows = await this.#query(q, `listExecutions(${userId ?? 'global'})`);
     return rows ?? [];
   }
 
@@ -1078,13 +1332,27 @@ export class SupabaseService {
    * Positions that were opened but never fully closed — i.e. what the engine
    * lost when the process restarted.
    *
-   * The audit log is the recovery source of truth:
-   *   • status = 'EXECUTED' + no 'TRAILING_STOP' close  → still open
-   *   • a 'LEG1_ATR' close on the same signal_id           → Leg 1 is done
-   * So a restart resumes managing the trade instead of forgetting it and
-   * opening a second, uncorrelated position on top.
+   * `strategy_trades` is the primary source. It stores the exact open book
+   * (legs, stop, ATR, broker id) so a restart does not have to reconstruct it
+   * from a sequence of audit rows. For a database upgraded while a position was
+   * already open, the table is empty; in that case the older execution-audit
+   * reconstruction is used and the caller backfills the ledger.
    */
   async listOpenPositions(userId) {
+    const ledgerOpen = await this.listOpenStrategyTrades({ userId }).catch(() => null);
+    if (ledgerOpen) {
+      const hasLedger = await this.hasStrategyTradeLedger(userId).catch(() => false);
+      if (hasLedger) {
+        return ledgerOpen.map((row) => ({
+          ...row,
+          signalId: row.signal_id ?? row.id,
+          created_at: row.opened_at ?? row.created_at,
+          leg1Closed: Boolean(Array.isArray(row.legs) && row.legs[0]?.closed),
+        }));
+      }
+    }
+
+    // Legacy fallback: infer the open book from executions.
     const rows = await this.listExecutions(userId, 200);
     const bySignal = new Map();
 

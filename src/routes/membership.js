@@ -181,11 +181,12 @@ export function mountMembershipRoutes({
       const body = req.body ?? {};
       const deviceId = deviceIdFromRequest(req) ?? normaliseDeviceId(body.deviceId);
       if (!deviceId) return fail(res, 400, 'device_required', 'Send X-Device-Id (or deviceId in the body)');
-      const { user, created } = await membership.register({ ...body, deviceId });
+      const { user, created, linked } = await membership.register({ ...body, deviceId });
       return res.json({
         ok: true,
         created,
-        user: membership.publicUser(user),
+        linked,
+        user: membership.publicUser(user, { deviceId }),
         ...plansPayload(),
         serverTime: new Date().toISOString(),
       });
@@ -204,7 +205,7 @@ export function mountMembershipRoutes({
       if (!user) return fail(res, 503, 'storage_unavailable', 'Could not load this device account');
       return res.json({
         ok: true,
-        user: membership.publicUser(user),
+        user: membership.publicUser(user, { deviceId }),
         ...plansPayload(),
         serverTime: new Date().toISOString(),
       });
@@ -225,9 +226,9 @@ export function mountMembershipRoutes({
         ok: true,
         duplicate,
         request,
-        user: membership.publicUser(user),
+        user: membership.publicUser(user, { deviceId }),
         message: duplicate
-          ? 'A request for this device is already waiting for the admin.'
+          ? 'A request for this account is already waiting for the admin.'
           : 'Request saved. Contact support if you have not already done so.',
         support: plansPayload().support,
       });
@@ -276,7 +277,7 @@ export function mountMembershipRoutes({
       res.write(
         `event: hello\ndata: ${JSON.stringify({
           type: 'membership',
-          user: membership.publicUser(user),
+          user: membership.publicUser(user, { deviceId }),
           serverTime: new Date().toISOString(),
         })}\n\n`
       );
@@ -309,7 +310,10 @@ export function mountMembershipRoutes({
     deviceGate({ membership, required: true }),
     wrap(async (req, res) => {
       const positions = engine?.openPositions?.() ?? [];
-      const payload = await membership.openTrades(req.appUser.device_id, { strategyPositions: positions });
+      const deviceId = deviceIdFromRequest(req);
+      const payload = await membership.openTrades(deviceId ?? req.appUser.device_id, {
+        strategyPositions: positions,
+      });
       res.json({ ok: true, ...payload });
     })
   );
@@ -324,7 +328,8 @@ export function mountMembershipRoutes({
       const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
       const offset = Math.max(0, Number(req.query.offset) || 0);
       const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : null;
-      const payload = await membership.history(req.appUser.device_id, { symbol, limit, offset });
+      const deviceId = deviceIdFromRequest(req);
+      const payload = await membership.history(deviceId ?? req.appUser.device_id, { symbol, limit, offset });
       res.json({ ok: true, ...payload, serverTime: new Date().toISOString() });
     })
   );
@@ -336,7 +341,8 @@ export function mountMembershipRoutes({
     requireMembership,
     deviceGate({ membership, required: true }),
     wrap(async (req, res) => {
-      const payload = await membership.history(req.appUser.device_id, { limit: 200, offset: 0 });
+      const deviceId = deviceIdFromRequest(req);
+      const payload = await membership.history(deviceId ?? req.appUser.device_id, { limit: 200, offset: 0 });
       const wins = payload.items.filter((t) => Number(t.pnlPoints) >= 0).length;
       const pnlPoints = payload.items.reduce((sum, t) => sum + (Number(t.pnlPoints) || 0), 0);
       res.json({

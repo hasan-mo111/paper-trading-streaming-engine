@@ -119,15 +119,16 @@ is acceptable while losing a closed one is not.
 
 Run [`supabase/schema.sql`](supabase/schema.sql) once in the Supabase SQL editor
 (it is idempotent). It creates `candles`, `profiles`, `daily_executions`,
-`executions`, `chat_events`, `app_users`, `membership_requests` and `ai_trades`,
-enables **row-level security with zero policies** — the service-role key in this
-process is the only thing that can read or write them — and installs the atomic
-quota function plus a new-user trigger that gives every signup a FREE profile
-automatically.
+`executions`, `chat_events`, `app_users`, `app_user_devices`,
+`membership_requests`, `ai_trades` and `strategy_trades`, enables **row-level
+security with zero policies** — the service-role key in this process is the only
+thing that can read or write them — and installs the atomic quota function plus
+a new-user trigger that gives every signup a FREE profile automatically.
 
 Upgrading an existing deployment? Run
 [`supabase/admin-membership.sql`](supabase/admin-membership.sql) once as well.
-It adds only the three new tables, indexes and RLS, and is safe to re-run.
+It is idempotent, adds the email/device identity and strategy ledger, backfills
+legacy email contacts, merges duplicate email accounts and is safe to re-run.
 
 ---
 
@@ -164,16 +165,25 @@ Two design points worth stating explicitly:
 
 ## APK membership and the operator console
 
-The Android app has **no email/password signup and no database credentials**.
-An installation is identified by the same stable device id it already uses for
-Telegram pairing:
+The Android app has **no password signup and no database credentials**. An
+installation is identified by the same stable device id it already uses for
+Telegram pairing. If the app also sends an email, that address is a **stronger
+account identity**: the same email on a second installation resolves to the
+same account instead of creating a duplicate user. Matching is case-insensitive
+(`Alice@Example.com` = `alice@example.com`).
 
 ```
-install → POST /api/membership/register → FREE account
+install → POST /api/membership/register {email?} → FREE account
 launch/resume → GET /api/membership/me → plan, status, retention window
 upgrade → POST /api/membership/request → operator sees it in /admin/
-operator approves → plan_expires_at is set → APK is notified
+operator approves → plan_expires_at is set → every linked device is notified
 ```
+
+The server keeps one `app_users` row per email and one `app_user_devices` row
+per installation. Plan, ban state and history are shared; `/me` still returns
+the calling installation's own `deviceId` plus the primary one. A device that is
+already linked to another account cannot be claimed by a different email
+(`409 email_conflict`).
 
 ### Plans
 
@@ -198,9 +208,9 @@ plan uses that plan's default period unless you enter an explicit expiry.
 When an operator approves a request or edits a plan, the **server**:
 
 1. persists the new plan and expiry in `app_users`;
-2. pushes a `membership` event to that device's
-   `GET /api/membership/stream` listeners;
-3. sends a Telegram DM if the device was paired with `/start <deviceId>`;
+2. pushes a `membership` event to the
+   `GET /api/membership/stream` listeners of **every linked installation**;
+3. sends a Telegram DM to any linked device paired with `/start <deviceId>`;
 4. returns the notification counts to the admin console.
 
 `GET /api/membership/me` remains the **source of truth**. The SSE frame and the
@@ -223,7 +233,8 @@ identified request.
 ### Admin console
 
 `/admin/` is a self-contained page served by this process. It has an overview,
-APK-user search/edit, the upgrade-request queue and the permanent AI ledger.
+APK-user search/edit (including email and linked installations), the
+upgrade-request queue, the permanent AI ledger and the strategy position book.
 Authentication is a single operator account from the environment:
 
 ```bash
@@ -239,13 +250,31 @@ same-origin `Origin`. No admin secret is stored in Supabase. Without
 `ADMIN_PASSWORD` or `ADMIN_PASSWORD_HASH`, `/admin/` shows a setup message and
 every admin API answers `503 admin_disabled`.
 
-### Permanent AI trade ledger
+### Permanent trade books
 
 Every AI trade is written to `ai_trades` when it opens, when TP1 moves the stop
 to breakeven, and when it closes. A partial unique index enforces **one OPEN
 row per symbol**, so a restart can never open a second trade on the same
 instrument. At boot the analyst re-adopts those OPEN rows and resumes managing
 their stop/targets; the APK reads them through the API, never through Supabase.
+
+The strategy engine has the same durable book in `strategy_trades`: the exact
+entry, stop, ATR, legs and broker ticket are upserted on open and on every trail
+or leg change, then the row flips to `CLOSED` permanently when the final leg
+exits. Writes for one position are serialized so a fast trail/close cannot land
+out of order. On boot the open rows are restored before the feed starts; an old
+database with no ledger falls back to the execution audit and backfills it.
+`GET /admin/api/strategy-trades` exposes the book to the operator.
+
+### Weekend / market-closed gate
+
+The FX/metals week closes on Friday at 21:00 UTC (22:00 in winter) and reopens
+on Sunday at the same hour. New entries, AI analysis cycles and trade cards are
+suppressed during that window: the strategy engine returns `market closed
+(weekend)` and the AI manager returns `market-closed` without calling the model
+or publishing SSE/Telegram. The scheduler sleeps until the Sunday reopen rather
+than retrying all weekend. Existing positions keep their stops and exit logic —
+risk management is never abandoned.
 
 ---
 
@@ -266,7 +295,7 @@ their stop/targets; the APK reads them through the API, never through Supabase.
 | `GET` | `/api/user/positions` | ✔ | open positions with their leg split |
 | `GET` | `/api/user/executions` | ✔ | audit trail |
 | `GET` | `/api/user/engine` | ✔ | live strategy state + indicators |
-| `POST` | `/api/membership/register` | device | install → FREE account (idempotent) |
+| `POST` | `/api/membership/register` | device | install → FREE account; same `email` = same account |
 | `GET` | `/api/membership/me` | device | plan, status, expiry, retention, support handles |
 | `POST` | `/api/membership/request` | device | ask the operator for MONTHLY / YEARLY |
 | `GET` | `/api/membership/requests` | device | that device's own request history |
@@ -281,6 +310,7 @@ their stop/targets; the APK reads them through the API, never through Supabase.
 | `GET`/`PATCH` | `/admin/api/users…` | cookie | list, inspect, edit plan/ban/contact |
 | `GET`/`POST` | `/admin/api/requests…` | cookie | queue and approve/reject upgrades |
 | `GET` | `/admin/api/trades` | cookie | permanent AI ledger |
+| `GET` | `/admin/api/strategy-trades` | cookie | permanent strategy position book |
 | `GET` | `/api/stream` | — | connectors index |
 
 `device` means `X-Device-Id: <installation id>` (or `?deviceId=` for
@@ -487,8 +517,11 @@ identity, not a secret, and it must be stable across app restarts.
 ```kotlin
 // 1) Register once (idempotent — safe to call on every launch)
 // The device id may go in the header or the JSON body; the header is preferred.
+// Email is optional. When present it is the account identity: the same email
+// on another phone links to this account, and one plan/ban applies to both.
 val body = """
-  {"displayName":"$name",
+  {"email":"$email",
+   "displayName":"$name",
    "contactMethod":"telegram","contactValue":"$handle"}
 """.trimIndent().toRequestBody("application/json".toMediaType())
 
@@ -525,6 +558,28 @@ val open = Request.Builder()
     .build()
 ```
 
+Registration is idempotent and returns the identity the app should keep using:
+
+```jsonc
+{
+  "ok": true,
+  "created": false,          // false on every later launch / linked phone
+  "linked": true,            // this installation joined an existing email account
+  "user": {
+    "deviceId": "…",         // the installation that made this request
+    "primaryDeviceId": "…",  // the first installation on the account
+    "email": "alice@example.com",
+    "plan": "FREE", "status": "ACTIVE"
+  }
+}
+```
+
+`409 email_conflict` means this installation is already attached to a different
+email account. Do not silently replace the local account: show the conflict and
+ask the operator to resolve it. A registration without an email keeps the
+existing per-installation account, and an email can be added later from the same
+device.
+
 `GET /api/membership/me` returns `plan`, `storedPlan`, `status`, `expired`,
 `planExpiresAt`, `retentionDays` and `features`. Handle the two important
 errors explicitly:
@@ -532,13 +587,25 @@ errors explicitly:
 - `401 unregistered` → call `/api/membership/register` first.
 - `403 banned` → show the suspension screen; do not retry in a loop.
 
+`GET /api/trades/open` returns both books in one payload:
+
+```jsonc
+{
+  "ok": true,
+  "plan": "FREE",
+  "ai":       [ /* AI analyst open trades */ ],
+  "strategy": [ /* engine positions: symbol, side, volume, entry, stop, legs */ ],
+  "serverTime": "…"
+}
+```
+
 To receive the upgrade immediately instead of waiting for the next `/me`, keep
 an EventSource open on
 `$BASE/api/membership/stream?deviceId=$deviceId` and refresh `/me` when a
 `membership` event arrives. The stream is optional; `/me` is authoritative.
 
 **Do not put a Supabase URL, service-role key or database driver in the APK.**
-The app cannot query `ai_trades` directly, by design. It sends its device id to
+The app cannot query `ai_trades` or `strategy_trades` directly, by design. It sends its device id to
 this Node process, which uses the service-role key server-side and returns only
 the rows that device's plan is allowed to see. That is the complete answer to
 "how does the app show the trade history without database access?" — it calls

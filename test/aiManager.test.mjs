@@ -159,8 +159,24 @@ function modelFetch(mode = () => 'ok') {
   return fn;
 }
 
-const makeManager = (cfg, { fetchFn = modelFetch(), dispatcher = fakeDispatcher(), market = marketStub() } = {}) =>
-  new AiAnalystManager({ market, dispatcher, env: { ai: cfg }, fetchFn });
+const makeManager = (
+  cfg,
+  {
+    fetchFn = modelFetch(),
+    dispatcher = fakeDispatcher(),
+    market = marketStub(),
+    marketOpenFn = () => true,
+    nextMarketOpenFn = () => Date.now(),
+  } = {}
+) =>
+  new AiAnalystManager({
+    market,
+    dispatcher,
+    env: { ai: cfg },
+    fetchFn,
+    marketOpenFn,
+    nextMarketOpenFn,
+  });
 
 console.log('\nAI analyst manager — multi-symbol + quota unit tests\n');
 
@@ -206,6 +222,26 @@ await test('a disabled analyst refuses to run its cycle', async () => {
   const res = await mgr.run('manual');
   assert.equal(res.ok, false);
   assert.equal(res.error, 'disabled');
+});
+
+await test('a closed weekend market sends no analysis, signal or trade', async () => {
+  const fetchFn = modelFetch();
+  const dispatcher = fakeDispatcher();
+  const nextOpen = Date.UTC(2026, 9, 25, 21, 0, 0);
+  const mgr = makeManager(baseCfg(), {
+    fetchFn,
+    dispatcher,
+    marketOpenFn: () => false,
+    nextMarketOpenFn: () => nextOpen,
+  });
+
+  const res = await mgr.run('manual');
+  assert.equal(res.ok, false);
+  assert.equal(res.error, 'market-closed');
+  assert.equal(fetchFn.calls.length, 0, 'the model must not be called on a weekend');
+  assert.equal(dispatcher.pushed.length, 0, 'no SSE trade card may be published');
+  assert.equal(mgr.status().marketOpen, false);
+  assert.equal(mgr.status().nextMarketOpenAt, new Date(nextOpen).toISOString());
 });
 
 await test('a tick only reaches the analyst that owns the symbol', async () => {

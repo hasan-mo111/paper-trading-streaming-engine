@@ -21,6 +21,16 @@
 
 const HOUR_MS = 3_600_000;
 
+/**
+ * Test-only seam for the end-to-end harness. Unit tests exercise the real
+ * weekend edges; the E2E suite needs the feed pipeline to run on any calendar
+ * day, so it sets this flag in the spawned server. Production ignores it even
+ * if someone exports it.
+ */
+const TEST_ALWAYS_OPEN =
+  process.env.NODE_ENV === 'test' &&
+  /^(1|true|open)$/i.test(process.env.MARKET_HOURS_OVERRIDE ?? '');
+
 /** UTC timestamp of the nth Sunday of a month (n is 1-based). */
 function nthSundayUtc(year, month, n) {
   const firstDow = new Date(Date.UTC(year, month, 1)).getUTCDay();
@@ -55,6 +65,7 @@ export function weeklySessionEdgeHour(ms = Date.now()) {
  * @returns {boolean}
  */
 export function isWeekendBar(timeSec) {
+  if (TEST_ALWAYS_OPEN) return false;
   const ms = Number(timeSec) * 1000;
   if (!Number.isFinite(ms)) return false;
   const d = new Date(ms);
@@ -80,4 +91,54 @@ export function filterTradableBars(candles) {
   return candles.filter((c) => c && !isWeekendBar(c.time));
 }
 
-export default { isUsDst, weeklySessionEdgeHour, isWeekendBar, filterTradableBars };
+/**
+ * Is the FX/metals market open right now?
+ *
+ * `isWeekendBar` is intentionally reused: the weekly close is the same window
+ * for bars and for placing a trade, so there is only one source of truth for
+ * "the weekend". Callers that evaluate entries or publish new trade ideas use
+ * this predicate; exits keep running because a stop must never be abandoned.
+ *
+ * @param {number} ms epoch milliseconds
+ * @returns {boolean}
+ */
+export function isMarketOpen(ms = Date.now()) {
+  return !isWeekendBar(Math.floor(Number(ms) / 1000));
+}
+
+/**
+ * First instant at/after `ms` at which the market reopens.
+ *
+ * Spot FX/metals reopen on Sunday at 21:00 UTC (DST) or 22:00 UTC (standard).
+ * The search walks the UTC calendar rather than assuming a fixed day offset, so
+ * it remains correct across DST change weekends.
+ *
+ * @param {number} ms epoch milliseconds
+ * @returns {number} epoch milliseconds of the next open (or `ms` when open)
+ */
+export function nextMarketOpenAt(ms = Date.now()) {
+  if (isMarketOpen(ms)) return Number(ms);
+
+  let cursor = Math.floor(Number(ms) / HOUR_MS) * HOUR_MS;
+  for (let i = 0; i < 24 * 9; i += 1) {
+    const d = new Date(cursor);
+    if (d.getUTCDay() === 0) {
+      const edge = weeklySessionEdgeHour(cursor);
+      const open = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), edge, 0, 0, 0);
+      if (open >= cursor && isMarketOpen(open)) return open;
+    }
+    cursor += HOUR_MS;
+  }
+
+  // Defensive fallback: never return a time in the past or return NaN.
+  return Number(ms) + 7 * 24 * HOUR_MS;
+}
+
+export default {
+  isUsDst,
+  weeklySessionEdgeHour,
+  isWeekendBar,
+  filterTradableBars,
+  isMarketOpen,
+  nextMarketOpenAt,
+};

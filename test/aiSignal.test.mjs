@@ -23,7 +23,7 @@ import assert from 'node:assert/strict';
 import { AiSignalService, SYSTEM_PROMPT, formatChat, formatTelegram, JSON_CORRECTION, buildUserMessage } from '../src/services/aiSignal.js';
 import { CHAT_TYPES } from '../src/services/sseDispatcher.js';
 import { KeyPool, cooldownForMessage } from '../src/services/keyPool.js';
-import { isWeekendBar, filterTradableBars } from '../src/services/marketSession.js';
+import { isWeekendBar, filterTradableBars, isMarketOpen, nextMarketOpenAt } from '../src/services/marketSession.js';
 
 /* ------------------------------------------------------------ test harness */
 
@@ -229,6 +229,19 @@ await test('the weekly session predicate is DST-aware', () => {
   assert.equal(isWeekendBar(ts(2026, 0, 16, 22)), true, 'Friday at the winter close');
   assert.equal(isWeekendBar(ts(2026, 0, 18, 21)), true, 'Sunday before the winter open');
   assert.equal(isWeekendBar(ts(2026, 0, 18, 22)), false, 'Sunday at the winter open');
+
+  // The trade gate is the same predicate expressed in milliseconds.
+  assert.equal(isMarketOpen(ts(2026, 6, 17, 20) * 1000), true, 'Friday before the close');
+  assert.equal(isMarketOpen(ts(2026, 6, 17, 21) * 1000), false, 'Friday after the close');
+  assert.equal(isMarketOpen(ts(2026, 6, 18, 12) * 1000), false, 'Saturday');
+  assert.equal(isMarketOpen(ts(2026, 6, 19, 20) * 1000), false, 'Sunday before the open');
+  assert.equal(isMarketOpen(ts(2026, 6, 19, 21) * 1000), true, 'Sunday at the open');
+
+  // nextMarketOpenAt walks to the Sunday reopen instead of guessing "+2 days".
+  assert.equal(nextMarketOpenAt(ts(2026, 6, 17, 21) * 1000), Date.UTC(2026, 6, 19, 21));
+  assert.equal(nextMarketOpenAt(ts(2026, 0, 16, 22) * 1000), Date.UTC(2026, 0, 18, 22));
+  const alreadyOpen = ts(2026, 6, 17, 20) * 1000;
+  assert.equal(nextMarketOpenAt(alreadyOpen), alreadyOpen);
 });
 
 await test('filterTradableBars keeps real session bars and drops the closed window', () => {

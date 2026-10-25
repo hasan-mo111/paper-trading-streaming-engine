@@ -106,6 +106,7 @@ function harness({
   hourlyCount = 120,
   strategyOverrides = {},
   brokerMode = 'paper',
+  marketOpenFn = () => true,
 } = {}) {
   const env = {
     ...ENV,
@@ -142,7 +143,17 @@ function harness({
   }
 
   const market = new MarketAggregator({ env, persistence: null });
-  const engine = new StrategyEngine({ market, broker, quota, dispatcher, auth, persistence: null, env, userId: 'test-user' });
+  const engine = new StrategyEngine({
+    market,
+    broker,
+    quota,
+    dispatcher,
+    auth,
+    persistence: store,
+    env,
+    userId: 'test-user',
+    marketOpenFn,
+  });
 
   return { env, store, auth, quota, hub, dispatcher, broker, market, engine, chat, balance, riskPct };
 }
@@ -351,6 +362,11 @@ section('3) Entry rules — 50-day Donchian breakout');
   check('a signal chat message was published', h2.chat.some((c) => c.fn === 'signal'));
   check('an execution chat message was published', h2.chat.some((c) => c.fn === 'execution'));
 
+  const ledgerOpen = [...h2.store.local.strategyTrades.values()];
+  check('the open strategy book is persisted', ledgerOpen.length === 1 && ledgerOpen[0].status === 'OPEN', `${ledgerOpen.length} row(s)`);
+  check('the persisted row keeps the exact entry and stop', ledgerOpen[0]?.entry_price === pos.entryPrice && ledgerOpen[0]?.stop_loss === pos.stop);
+  check('the persisted row keeps both legs', ledgerOpen[0]?.legs?.length === 2);
+
   // ---- 3c. no pyramiding on the same symbol ------------------------------
   d = await h2.engine.evaluateEntry('XAUUSD');
   check('the engine refuses to double up on one symbol', d.reason === 'position already open', d.reason);
@@ -372,6 +388,19 @@ section('3) Entry rules — 50-day Donchian breakout');
   check('a short stop sits above the entry (20-day high)', shortPos && shortPos.stop > shortPos.entryPrice, `stop ${shortPos?.stop} vs entry ${shortPos?.entryPrice}`);
   check('the broker recorded the canonical SELL direction', h3.broker.listPositions()[0]?.side === 'SELL', h3.broker.listPositions()[0]?.side);
   check('the broker remembers the strategy\'s LONG/SHORT vocabulary', h3.broker.listPositions()[0]?.requestedSide === 'SHORT');
+
+  // ---- 3e. no weekend entries even on a genuine breakout ------------------
+  const h4 = harness({ marketOpenFn: () => false });
+  seed(h4.market, 'XAUUSD', 86_400, buildCandles({ count: 120, start: 2000, step: 1 }));
+  seed(h4.market, 'XAUUSD', 3600, buildCandles({ count: 120, start: 2000, step: 1 }));
+  const weekendSlot = h4.market.store.get(seriesKey('XAUUSD', 3600));
+  weekendSlot.current.close = donchian(h4.market.closedCandles('XAUUSD', 86_400), 50).high + 5;
+  weekendSlot.lastUpdate = Date.now();
+  d = await h4.engine.evaluateEntry('XAUUSD');
+  check('a closed market suppresses the breakout', d.action === 'HOLD' && /market closed/i.test(d.reason ?? ''), `${d.action}: ${d.reason}`);
+  check('no position is opened on the weekend', h4.engine.openPositions().length === 0);
+  check('no strategy row is written for a suppressed entry', h4.store.local.strategyTrades.size === 0);
+  check('the counter names the weekend block', h4.engine.status().counters.skippedMarketClosed === 1);
 }
 
 /* =============================================================================
@@ -476,6 +505,10 @@ section('4) Split exit logic — Leg 1 at +1×ATR(20), Leg 2 on the trail');
   check('the whole remaining size was closed', res2 && near(res2.closedVolume, remaining, 0.011), `${res2?.closedVolume} of ${remaining}`);
   check('the position is fully closed', h.engine.openPositions().length === 0);
   check('a stop-hit chat message was published', h.chat.some((c) => c.fn === 'stopHit'));
+
+  const ledgerClosed = [...h.store.local.strategyTrades.values()][0];
+  check('the strategy row flips to CLOSED permanently', ledgerClosed?.status === 'CLOSED');
+  check('the closed row keeps its exit and original size', ledgerClosed?.exit_price === res2.exitPrice && ledgerClosed?.volume > 0, `${ledgerClosed?.volume} lots @ ${ledgerClosed?.exit_price}`);
 
   /* ---- 4e. exits never consume the daily quota ------------------------ */
   const q = await h.quota.usageFor('test-user', 'FREE');

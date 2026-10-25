@@ -60,15 +60,18 @@ create table if not exists public.profiles (
 );
 
 -- =============================================================================
---  app_users — device-based accounts for the Android APK
+--  app_users — one account per email (or per device when no email)
 -- =============================================================================
 --  The APK does not require an email/password signup. Each installation sends
 --  a stable device id; the admin console upgrades, extends or bans that row.
---  A plan is a label plus a history-retention window — it never changes what
---  the strategy engine is allowed to execute.
+--  When an installation also supplies an email, that address is the canonical
+--  account identity: the same email on a second phone resolves to the same row.
+--  A plan is a label plus a history-retention window — it never changes what the
+--  strategy engine is allowed to execute.
 create table if not exists public.app_users (
   id              uuid primary key default gen_random_uuid(),
   device_id       text        not null unique,
+  email           text,
   display_name    text,
   contact_method  text        check (contact_method is null or contact_method in ('telegram','whatsapp','email','other')),
   contact_value   text,
@@ -84,6 +87,21 @@ create table if not exists public.app_users (
 
 create index if not exists app_users_status_idx    on public.app_users (status, plan);
 create index if not exists app_users_last_seen_idx on public.app_users (last_seen_at desc);
+create unique index if not exists app_users_email_unique
+  on public.app_users (lower(email)) where email is not null;
+
+-- =============================================================================
+--  app_user_devices — every installation linked to one account
+-- =============================================================================
+create table if not exists public.app_user_devices (
+  device_id    text primary key,
+  user_id      uuid not null references public.app_users (id) on delete cascade,
+  created_at   timestamptz not null default now(),
+  last_seen_at timestamptz not null default now()
+);
+
+create index if not exists app_user_devices_user_idx
+  on public.app_user_devices (user_id, created_at);
 
 -- =============================================================================
 --  membership_requests — "please upgrade me" from the APK
@@ -157,6 +175,49 @@ create unique index if not exists ai_trades_one_open_per_symbol
 create index if not exists ai_trades_status_idx on public.ai_trades (status, opened_at desc);
 create index if not exists ai_trades_symbol_idx on public.ai_trades (symbol, opened_at desc);
 create index if not exists ai_trades_closed_idx on public.ai_trades (closed_at desc) where status = 'CLOSED';
+
+-- =============================================================================
+--  strategy_trades — the engine's durable open/closed position book
+-- =============================================================================
+--  A strategy position used to live only in `StrategyEngine.positions`. This
+--  table stores the exact legs, stop, ATR and broker id so a restart resumes the
+--  trade instead of reconstructing it from the audit log. Rows are updated in
+--  place while open and flip to CLOSED when the final leg exits.
+create table if not exists public.strategy_trades (
+  id              text primary key,
+  signal_id       text,
+  user_id         uuid,
+  symbol          text        not null,
+  side            text        not null check (side in ('LONG','SHORT')),
+  volume          numeric(14,4) not null default 0,
+  entry_price     double precision not null,
+  stop_loss       double precision,
+  atr             double precision,
+  risk_amount     numeric(14,2),
+  legs            jsonb       not null default '[]'::jsonb,
+  status          text        not null default 'OPEN' check (status in ('OPEN','CLOSED')),
+  exit_price      double precision,
+  exit_reason     text,
+  profit          numeric(14,2),
+  broker_id       text,
+  mode            text,
+  opened_at       timestamptz not null default now(),
+  opened_ms       bigint,
+  closed_at       timestamptz,
+  closed_ms       bigint,
+  meta            jsonb       not null default '{}'::jsonb,
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now()
+);
+
+create unique index if not exists strategy_trades_one_open_per_symbol
+  on public.strategy_trades (symbol) where status = 'OPEN';
+create index if not exists strategy_trades_status_idx
+  on public.strategy_trades (status, opened_at desc);
+create index if not exists strategy_trades_symbol_idx
+  on public.strategy_trades (symbol, opened_at desc);
+create index if not exists strategy_trades_closed_idx
+  on public.strategy_trades (closed_at desc) where status = 'CLOSED';
 
 -- =============================================================================
 --  daily_executions — the freemium counter
@@ -279,8 +340,10 @@ as $$ select now() $$;
 alter table public.candles             enable row level security;
 alter table public.profiles            enable row level security;
 alter table public.app_users           enable row level security;
+alter table public.app_user_devices    enable row level security;
 alter table public.membership_requests enable row level security;
 alter table public.ai_trades           enable row level security;
+alter table public.strategy_trades     enable row level security;
 alter table public.daily_executions    enable row level security;
 alter table public.executions          enable row level security;
 alter table public.chat_events         enable row level security;

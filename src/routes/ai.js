@@ -46,9 +46,11 @@ export function mountAiRoutes({ app, ai, tradeGuard = null, deviceGate = null })
       const code =
         result.error === 'cooldown' || result.error === 'busy' || result.error === 'rate-limited'
           ? 429
-          : result.error === 'disabled' || result.error === 'insufficient-data'
-            ? 503
-            : 502;
+          : result.error === 'market-closed'
+            ? 409
+            : result.error === 'disabled' || result.error === 'insufficient-data'
+              ? 503
+              : 502;
       return res.status(code).json(result);
     } catch (err) {
       return next(err);
